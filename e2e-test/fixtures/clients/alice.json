@@ -1,0 +1,5 @@
+{
+  "role": "requester",
+  "principal": "alice",
+  "skill": "../agent-skills/arcade/SKILL.md"
+}

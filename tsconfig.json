@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": ["ES2022"],
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": [
+    "src/**/*",
+    "__tests__/**/*",
+    "web/__tests__/**/*",
+    "e2e-test/**/*",
+    "examples/**/*",
+    "eval/**/*"
+  ],
+  "exclude": ["node_modules", "web/__tests__/**/*.tsx"]
+}

@@ -1,0 +1,18 @@
+{
+  "workers": {
+    "default": { "backend": "claude-sdk" },
+    "fastTrigger": {
+      "backend": "pi-agent",
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5",
+    },
+    "roles": {
+      "researcher": {
+        "backend": "pi-agent",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+      },
+      "writer": { "backend": "claude-sdk" },
+    },
+  },
+}

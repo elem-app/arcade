@@ -1,0 +1,9 @@
+{
+  "workers": {
+    "fastTrigger": {
+      "backend": "pi-agent",
+      "provider": "fake-provider",
+      "model": "some-model",
+    },
+  },
+}

@@ -1,0 +1,115 @@
+{
+  // Recommended local-machine deployment template. Copy and adjust it for the
+  // service environment; omitted settings use Arcade's built-in defaults.
+
+  // -- Paths --
+  // Root for durable run state, generated artifacts, and diagnostics. Mount or
+  // back up this directory when state must survive service replacement.
+  // "dataDir": ".arcade-data",
+
+  // Arc bundle path. Relative paths are searched under the service working
+  // directory and under workspaces supplied by connecting clients.
+  // "arcsDir": ".arcade/arcs",
+
+  // -- Workers --
+  // Each slot selects an available backend; fields beside "backend" configure
+  // that backend.
+  // "default" applies to roles without an explicit entry in "roles".
+  // "fastTrigger" handles trigger-stage semantic checks; use a low-latency backend.
+  "workers": {
+    "default": {
+      "backend": "openai-sdk",
+      "timeoutMs": 43200000,
+      "apiKeySecret": "openai.api_key",
+      // "sessionCache": {
+      //   "enabled": true,
+      //   "maxLiveSessions": 16,
+      //   "maxPreparedStarts": 4,
+      //   "idleTtlMs": 300000,
+      //   "initializeTimeoutMs": 30000,
+      // },
+    },
+    "fastTrigger": { "backend": "claude-sdk-tst" },
+    // "roles": {
+    //   "researcher": { "backend": "researcher-custom", "model": "..." },
+    // },
+  },
+
+  // -- Hub scheduling --
+  // Cap active and waiting work per role to protect backend capacity. "default"
+  // applies to every role; add "roles" overrides where different limits are needed.
+  "workerHub": {
+    "scheduling": {
+      "default": { "concurrency": 2, "maxQueueSize": 64 },
+      "roles": {},
+    },
+  },
+
+  // -- Secrets --
+  // Map logical secret names used by worker slots to environment variable names;
+  // secret values stay out of this file. Local "pnpm start" and "pnpm test" load
+  // the gitignored .env file. Other launchers should provide process environment variables.
+  "secrets": {
+    "provider": "env",
+    "env": {
+      "openai.api_key": "ARCADE_OPENAI_API_KEY",
+    },
+  },
+
+  // -- Connectors --
+  // Adding a connector section enables its listener.
+  "connectors": {
+    "web": {
+      "host": "127.0.0.1", // Use "0.0.0.0" only to accept non-loopback traffic.
+      "port": 3180, // Bind port.
+    },
+
+    "mcp": {
+      "host": "127.0.0.1", // Use "0.0.0.0" only to accept non-loopback traffic.
+      "port": 3177, // Bind port.
+      "path": "/mcp", // HTTP path for the MCP endpoint.
+      "requirePrincipal": false, // Require arcade.principal metadata on submissions.
+    },
+  },
+
+  // -- Arc host --
+  // "arcHost": {
+  //   "snapshotRuntimeCacheSize": 32    // Max Arc runtime snapshots cached in memory (0 disables).
+  // },
+
+  // -- Logging --
+  // "logging": {
+  //   "level": "info",                  // "silent" | "info" | "debug"
+  //   "format": "json"                  // "json" | "pretty"
+  // },
+
+  // -- Delivery rules --
+  // Route outbound messages by matching role, audience, and cause.
+  // "elicitation" asks a connected client synchronously; "inbox" stores the message
+  // for asynchronous delivery. Target "activator" selects the connection that started
+  // the run; target "principal" selects a fixed principal id.
+  "deliveryRules": [
+    // Ask the activating client to approve worker permission requests.
+    {
+      "situation": {
+        "role": "*",
+        "audience": "permissionApprover",
+        "cause": "permission-ask",
+      },
+      "delivery": "elicitation",
+      "target": { "kind": "activator" },
+    },
+    // Ask the activating client to answer agent questions.
+    {
+      "situation": { "role": "*", "audience": "*", "cause": "question" },
+      "delivery": "elicitation",
+      "target": { "kind": "activator" },
+    },
+    // Store agent replies in the activating client's inbox.
+    {
+      "situation": { "role": "*", "audience": "*", "cause": "reply" },
+      "delivery": "inbox",
+      "target": { "kind": "activator" },
+    },
+  ],
+}
