@@ -160,7 +160,7 @@ describe("committed control occurrences", () => {
       dialog,
       input: {
         instructionCoverage: {},
-        reports: [{ outcome: "deflected" }],
+        reports: [{ outcome: "disposition", deflect: {} }],
       },
     });
     expect((await events.list(driver.arcRunId)).map((e) => e.kind)).toEqual([
@@ -308,7 +308,7 @@ describe("committed control occurrences", () => {
           dialog,
           input: {
             instructionCoverage: {},
-            reports: [{ outcome: "deflected" }],
+            reports: [{ outcome: "disposition", deflect: {} }],
           },
         });
       else await driver.deliverEffects({ dialog });
@@ -483,6 +483,34 @@ describe("committed control occurrences", () => {
       await workerHub.stop();
     }
   });
+  it("control-occurrences.worker records one occurrence for an interrupt disposition", async () => {
+    const { host, events } = fixture();
+    await host.registerArc("control", parse(source("$instruct(`work`);")));
+    const driver = await beginActivatedDriver(host, dialog);
+    await driver.advance({
+      dialog,
+      input: {
+        reports: [
+          {
+            outcome: "disposition",
+            interrupt: { id: "external", reason: "ping" },
+          },
+        ],
+        instructionCoverage: {
+          [taskId(driver.frontier.tasks[0]!)]: "ignored",
+        },
+      },
+    });
+    expect(occurrences(await events.list(driver.arcRunId))).toEqual([
+      expect.objectContaining({
+        kind: "run:interruption-occurred",
+        origin: toNodeRef("control", ["Main"]),
+        interruption: { id: "external", reason: "ping" },
+      }),
+    ]);
+    host.stop();
+  });
+
   it("control-occurrences.coverage records fresh deflections at the same eligible frontier", async () => {
     const { host, events } = fixture();
     await host.registerArc(
@@ -586,7 +614,7 @@ describe("committed control occurrences", () => {
               dialog,
               input: {
                 instructionCoverage: {},
-                reports: [{ outcome: "deflected" }],
+                reports: [{ outcome: "disposition", deflect: {} }],
               },
             })
           : await driver.deliverEffects({ dialog })
@@ -673,7 +701,7 @@ describe("committed control occurrences", () => {
         dialog,
         input: {
           instructionCoverage: {},
-          reports: [{ outcome: "deflected" }],
+          reports: [{ outcome: "disposition", deflect: {} }],
         },
       });
       const historical = await events.list(driver.arcRunId);

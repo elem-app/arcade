@@ -5,7 +5,11 @@ import {
   executionControlFor,
 } from "./work-event-fixtures.js";
 
-import { validateRoutineReport, type RoutineReport } from "../src/index.js";
+import {
+  AgentRoutineReportSchema,
+  validateRoutineReport,
+  type RoutineReport,
+} from "../src/index.js";
 import {
   DEFAULT_WORKER_ROLE,
   InMemoryArcHostStore,
@@ -242,7 +246,8 @@ describe("Routines, dialog projection, and work events", () => {
   it("applies every flat routine report variant exhaustively", async () => {
     const reports: RoutineReport[] = [
       { outcome: "completed" },
-      { outcome: "deflected" },
+      { outcome: "disposition", deflect: {} },
+      { outcome: "disposition", interrupt: { id: "external", reason: "ping" } },
       { error: "failed", code: "agent-failed", message: "failed" },
       {
         error: "unavailable",
@@ -289,6 +294,56 @@ describe("Routines, dialog projection, and work events", () => {
         });
       }
     }
+  });
+
+  it("accepts exactly one disposition payload and keeps dispositions out of agent reports", () => {
+    for (const report of [
+      { outcome: "disposition", deflect: {} },
+      { outcome: "disposition", interrupt: { id: "external" } },
+      { outcome: "disposition", interrupt: { id: "external", reason: "ping" } },
+      { outcome: "disposition", deflect: {}, backendDetails: { step: 1 } },
+    ]) {
+      expect(validateRoutineReport(report)).toEqual(report);
+      expect(AgentRoutineReportSchema.safeParse(report).success).toBe(false);
+    }
+    for (const report of [
+      { outcome: "disposition" },
+      { outcome: "disposition", deflect: {}, interrupt: { id: "external" } },
+      { outcome: "disposition", deflect: true },
+      { outcome: "disposition", deflect: { reason: "misplaced" } },
+      { outcome: "disposition", interrupt: {} },
+      { outcome: "disposition", interrupt: { id: "" } },
+      {
+        outcome: "disposition",
+        interrupt: { id: "external", reason: undefined },
+      },
+      { outcome: "disposition", deflect: {}, semantic: {} },
+      { outcome: "completed", deflect: {} },
+      { outcome: "deflected" },
+    ]) {
+      expect(() => validateRoutineReport(report)).toThrow("failed validation");
+    }
+  });
+
+  it("passes a disposition on a semantic task through without semantic results", async () => {
+    const { arcHost, task: instruction } = await firstTaskWithArcHost();
+    const task = semanticTaskFor(instruction);
+    const report = {
+      outcome: "disposition",
+      interrupt: { id: "external" },
+    } as const;
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: { researcher: async () => report },
+    });
+
+    await expect(workerHub.handleTask(task, routineContext())).resolves.toEqual(
+      {
+        status: "finished",
+        routineId: expect.any(String),
+        report,
+      },
+    );
   });
 
   it("rejects status-shaped and multiply discriminated routine reports", async () => {
@@ -602,6 +657,7 @@ describe("Routines, dialog projection, and work events", () => {
 function semanticTaskFor(instruction: InstructionTask): Task {
   return {
     kind: "semantic",
+    allowedDispositions: [],
     batchId: "semantic:central-validation",
     role: instruction.role,
     stage: "action",

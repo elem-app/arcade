@@ -173,6 +173,7 @@ describe("OpenAiSdkTstWorker", () => {
     const request = {
       ...base.requests[0]!,
       question: "trigger-question-openai-marker",
+      guidance: "trigger-guidance-openai-marker",
     };
     const task: SemanticTask = {
       ...base,
@@ -188,6 +189,11 @@ describe("OpenAiSdkTstWorker", () => {
     const prompt = run.mock.calls[0]![0].prompt;
     expect(prompt).toContain("held-inbound-openai-marker");
     expect(prompt).toContain("trigger-question-openai-marker");
+    expect(prompt).not.toContain("trigger-guidance-openai-marker");
+    expect(prompt).not.toContain('"guidance"');
+    expect(run.mock.calls[0]![0].agent.instructions).not.toContain(
+      "Apply each request's standing guidance",
+    );
   });
 
   it("writes semantic prompt and SDK result diagnostics", async () => {
@@ -268,6 +274,7 @@ function routineForTask(task: Task): RoutineDescriptor {
 function judgmentTask(): SemanticTask {
   return {
     kind: "semantic",
+    allowedDispositions: [],
     batchId: "semantic:1",
     role: "researcher",
     stage: "trigger",
@@ -340,6 +347,7 @@ function mixedTask(): SemanticTask {
 function instructionTask(): InstructionTask {
   return {
     kind: "instruction",
+    allowedDispositions: [],
     briefIds: ["instruction:1"],
     role: "researcher",
     texts: ["Do work."],

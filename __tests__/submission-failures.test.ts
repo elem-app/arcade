@@ -246,19 +246,16 @@ describe("Submission failure settlement and executor boundaries", () => {
     }
   });
 
-  it("keeps genuine limiter rejection distinct from reported worker failure", async () => {
+  it("preserves reported failures from concurrent independent contexts in both stages", async () => {
     for (const stage of ["trigger", "action"] as const) {
       const entered = barrier();
       const release = barrier();
-      const setup = await fixture(
-        stage,
-        async () => {
-          entered.resolve();
-          await release.promise;
-          return failure;
-        },
-        { maxQueueSize: 0 },
-      );
+      let calls = 0;
+      const setup = await fixture(stage, async () => {
+        if (++calls === 2) entered.resolve();
+        await release.promise;
+        return failure;
+      });
       const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
       const [step] = await setup.arcHost.begin({
         dialog,
@@ -270,28 +267,27 @@ describe("Submission failure settlement and executor boundaries", () => {
         throw new Error("Expected work.");
       const task = step.frontier.tasks[0]!;
       const context = await setup.arcHost.getRunWorkspaceContext(task.arcRunId);
+      const independent =
+        task.kind === "semantic" && task.stage === "trigger"
+          ? { ...task, batchId: task.batchId + ":independent" }
+          : { ...task, contextIsolation: "node" as const };
+      const pending = [
+        setup.workerHub.handleTask(task, context),
+        setup.workerHub.handleTask(independent, context),
+      ];
       try {
-        const active = setup.workerHub.handleTask(task, context);
         await entered.promise;
-        await expect(
-          setup.workerHub.handleTask(
-            task.kind === "semantic" && task.stage === "trigger"
-              ? { ...task, batchId: `${task.batchId}:independent` }
-              : { ...task, contextIsolation: "node" },
-            context,
-          ),
-        ).resolves.toMatchObject({
-          status: "skipped",
-          error: { code: "queue-full" },
-        });
         release.resolve();
-        await expect(active).resolves.toEqual({
-          status: "finished",
-          routineId: expect.any(String),
-          report: failure,
-        });
+        for (const result of await Promise.all(pending))
+          expect(result).toEqual({
+            status: "finished",
+            routineId: expect.any(String),
+            report: failure,
+          });
+        expect(calls).toBe(2);
       } finally {
         release.resolve();
+        await Promise.allSettled(pending);
         await setup.workerHub.stop();
       }
     }
@@ -533,7 +529,7 @@ function Main() { this.trigger = () => judge("start"); $enter(Wait); function Wa
               return failure;
             },
           },
-          defaultConcurrency: 2,
+
           logger: capture.logger,
           capacityRetry: {
             enabled: true,
@@ -684,7 +680,7 @@ function Main() { this.trigger = () => judge("start"); $enter(Wait); function Wa
     const cancel = vi.fn();
     const setup = makeWorkerHub({
       arcHost: host,
-      defaultConcurrency: 2,
+
       workers: {
         [DEFAULT_WORKER_ROLE]: async (task) => {
           if (seed) return completed(task);
@@ -750,7 +746,7 @@ function Main() { this.trigger = () => judge("start"); $enter(Wait); function Wa
     const setup = makeWorkerHub({
       arcHost: host,
       logger: capture.logger,
-      defaultConcurrency: 2,
+
       workers: {
         [DEFAULT_WORKER_ROLE]: async (task) => {
           if (seed) return completed(task);

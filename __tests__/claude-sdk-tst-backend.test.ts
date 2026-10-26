@@ -24,8 +24,90 @@ import {
   sdkTextMessages as sdkMessages,
   semanticTool,
 } from "./backend-helpers.js";
+import { deferred } from "./helpers.js";
 
 describe("ClaudeSdkTstWorker", () => {
+  it("preserves a consumed Claude trigger start across pool replenishment and expiry", async () => {
+    const entered = deferred();
+    const release = deferred();
+    const closes: ReturnType<typeof vi.fn>[] = [];
+    const completed = new Set<number>();
+    const startup = vi.fn(
+      async (params: Parameters<ClaudeSdkTstStartupFn>[0]) => {
+        const index = closes.length;
+        const close = vi.fn();
+        closes.push(close);
+        return {
+          close,
+          query: (_prompt: string) =>
+            (async function* () {
+              try {
+                if (index === 0) {
+                  entered.resolve();
+                  await release.promise;
+                  expect(params?.options?.abortController?.signal.aborted).toBe(
+                    false,
+                  );
+                }
+                yield* semanticMessages(true);
+              } finally {
+                completed.add(index);
+              }
+            })(),
+        };
+      },
+    );
+    vi.useFakeTimers();
+    const worker = new ClaudeSdkTstWorker({
+      startup: startup as unknown as ClaudeSdkTstStartupFn,
+      query: queryReturning({
+        outcome: "completed",
+        semantic: { judgments: { "judge:1": true } },
+      }),
+      fastStarts: { enabled: true, maxPreparedStarts: 1, idleTtlMs: 10 },
+    });
+    let pending: ReturnType<typeof runSemantic> | undefined;
+    try {
+      warmBackend(worker);
+      expect(startup).toHaveBeenCalledTimes(1);
+      await flushMicrotasks();
+      pending = runSemantic(worker, judgmentTask());
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(25);
+      expect(closes.length).toBeGreaterThan(2);
+      expect(closes[0]).not.toHaveBeenCalled();
+      expect(
+        closes.slice(1).some((close) => close.mock.calls.length === 1),
+      ).toBe(true);
+      await expect(
+        runBackend(
+          worker,
+          {
+            ...semanticRoutine(judgmentTask()),
+            id: "other-trigger",
+            contextKey: "other-context",
+          },
+          context(),
+          noopRoutineEffects(),
+          noopDiagnostics,
+        ),
+      ).resolves.toMatchObject({ outcome: "completed" });
+      expect(closes[0]).not.toHaveBeenCalled();
+      release.resolve();
+      await expect(pending).resolves.toMatchObject({
+        outcome: "completed",
+        backendDetails: { preparedStartUsed: true },
+      });
+      expect(completed.has(0)).toBe(true);
+      expect(closes[0]).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await pending;
+      worker.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("resolves judgment-only semantic reports through the Claude tst backend", async () => {
     const backend = new ClaudeSdkTstWorker({
       query: queryReturning({
@@ -177,6 +259,7 @@ describe("ClaudeSdkTstWorker", () => {
     const request = {
       ...base.requests[0]!,
       question: "trigger-question-claude-marker",
+      guidance: "trigger-guidance-claude-marker",
     };
     const task: SemanticTask = {
       ...base,
@@ -192,6 +275,11 @@ describe("ClaudeSdkTstWorker", () => {
     const prompt = String(query.mock.calls[0]![0].prompt);
     expect(prompt).toContain("held-inbound-claude-marker");
     expect(prompt).toContain("trigger-question-claude-marker");
+    expect(prompt).not.toContain("trigger-guidance-claude-marker");
+    expect(prompt).not.toContain('"guidance"');
+    expect(query.mock.calls[0]![0].options?.systemPrompt).not.toContain(
+      "Apply each request's standing guidance",
+    );
   });
 
   it("rejects non-semantic routines clearly in the Claude tst backend", async () => {
@@ -717,6 +805,7 @@ function delay(ms: number): Promise<void> {
 function judgmentTask(): SemanticTask {
   return {
     kind: "semantic",
+    allowedDispositions: [],
     batchId: "semantic:test",
     role: "default",
     stage: "trigger",
@@ -765,6 +854,7 @@ function mixedTask(): SemanticTask {
 function instructionTask(): InstructionTask {
   return {
     kind: "instruction",
+    allowedDispositions: [],
     briefIds: ["instruction:test"],
     role: "default",
     texts: ["Do the thing."],

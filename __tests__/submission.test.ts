@@ -69,6 +69,154 @@ async function stageActiveRunChoice(workerHub: WorkerHubService): Promise<{
 }
 
 describe("Inbound submission and messaging", () => {
+  it("accepts decline on the original submission and closes its only pending branch once", async () => {
+    const arcHost = makeArcHost();
+    await arcHost.registerArc("decline-only", parse(GREET_SOURCE), {
+      workspaceScope: "arc",
+      bundle: {},
+      contextIsolation: "role",
+    });
+    const { workerHub } = makeWorkerHub({ arcHost });
+    try {
+      const channel = workerHub.submitInbound({
+        content: "start",
+        metadata: { principal: ALICE_OWNER },
+      });
+      const iterator = channel[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      if (first.done || first.value.kind !== "handshake-required")
+        throw new Error("Expected handshake");
+      const gate = first.value;
+      await expect(
+        workerHub.handshake(gate.handshakeId, { decline: true }),
+      ).resolves.toEqual({ status: "ok" });
+      await expect(iterator.next()).resolves.toEqual({
+        done: false,
+        value: {
+          kind: "rejected",
+          arcRef: gate.arcRef,
+          reason: "Arc activation declined by client.",
+        },
+      });
+      await expect(iterator.next()).resolves.toEqual({
+        done: true,
+        value: undefined,
+      });
+      await expect(
+        workerHub.handshake(gate.handshakeId, { decline: true }),
+      ).resolves.toEqual({ status: "missing" });
+      await expect(iterator.next()).resolves.toEqual({
+        done: true,
+        value: undefined,
+      });
+      expect(await arcHost.listRunViews()).toEqual([]);
+      expect(
+        (await workerHub.listWorkEvents(gate.arcRunId)).filter(
+          (event) => event.kind === "run:handshake-resolved",
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          handshakeId: gate.handshakeId,
+          outcome: { kind: "declined" },
+        }),
+      ]);
+    } finally {
+      await workerHub.stop();
+    }
+  });
+
+  it("settles a declined branch while activated work and a pending sibling continue", async () => {
+    const arcHost = makeArcHost();
+    const source = `"arc"; function Main() { this.hostParams = { workerRole: "researcher" }; this.trigger = () => true; $instruct("Work"); }`;
+    for (const name of ["running", "declined", "pending"]) {
+      await arcHost.registerArc(name, parse(source), {
+        workspaceScope: name === "running" ? "run" : "arc",
+        bundle: {},
+        contextIsolation: "role",
+      });
+    }
+    let release!: () => void;
+    const work = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const worker = vi.fn<RoleWorker>(async () => {
+      await work;
+      return { outcome: "completed" };
+    });
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: { researcher: worker },
+    });
+    try {
+      const iterator = workerHub
+        .submitInbound({
+          content: "start all",
+          metadata: { principal: ALICE_OWNER, activationPolicy: "all" },
+        })
+        [Symbol.asyncIterator]();
+      const initial: InboundLifecycleEvent[] = [];
+      for (let index = 0; index < 3; index++) {
+        const item = await iterator.next();
+        if (item.done) throw new Error("Submission closed before all branches");
+        initial.push(item.value);
+      }
+      const activated = initial.find((event) => event.kind === "activated");
+      const declined = initial.find(
+        (event) =>
+          event.kind === "handshake-required" &&
+          event.arcRef === "arc:declined:Main",
+      );
+      const pending = initial.find(
+        (event) =>
+          event.kind === "handshake-required" &&
+          event.arcRef === "arc:pending:Main",
+      );
+      if (
+        activated?.kind !== "activated" ||
+        declined?.kind !== "handshake-required" ||
+        pending?.kind !== "handshake-required"
+      )
+        throw new Error("Expected activation and two gated siblings");
+      await waitFor(() => worker.mock.calls.length === 1);
+      const runningBefore = await arcHost.getRunView(activated.arcRunId);
+      await expect(
+        workerHub.handshake(declined.handshakeId, { decline: true }),
+      ).resolves.toEqual({ status: "ok" });
+      await expect(iterator.next()).resolves.toMatchObject({
+        done: false,
+        value: { kind: "rejected", arcRef: declined.arcRef },
+      });
+      expect(await arcHost.getRunView(activated.arcRunId)).toEqual(
+        runningBefore,
+      );
+      expect(await arcHost.getRunView(pending.arcRunId)).toMatchObject({
+        stage: "handshaking",
+      });
+      const next = iterator.next();
+      await expect(
+        workerHub.handshake(pending.handshakeId, {
+          workspace: "/tmp/decline-sibling",
+        }),
+      ).resolves.toEqual({ status: "ok" });
+      await expect(next).resolves.toMatchObject({
+        done: false,
+        value: { kind: "activated" },
+      });
+      await expect(iterator.next()).resolves.toEqual({
+        done: true,
+        value: undefined,
+      });
+      release();
+      await waitFor(async () => {
+        const view = await arcHost.getRunView(activated.arcRunId);
+        return view?.stage === "actioning" && view.lifecycle === "completed";
+      });
+    } finally {
+      release();
+      await workerHub.stop();
+    }
+  });
+
   it("fails trigger admission with the original worker error and retires the probe", async () => {
     for (const mode of ["missing", "failed", "throws"] as const) {
       const arcHost = await makeArcHostWithSource(
@@ -1208,7 +1356,7 @@ function Main() {
     });
     const { workerHub } = makeWorkerHub({
       arcHost,
-      defaultConcurrency: 2,
+
       workers: {
         researcher: async (task) => {
           starts.push(task.arcRunId);
@@ -1238,7 +1386,7 @@ function Main() {
     expect(runIds.sort()).toEqual([...starts].sort());
   });
 
-  it("accepts inbound messages even when handler execution later fails or the handler queue is full", async () => {
+  it("accepts inbound messages even when handler execution later fails", async () => {
     const failedArcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const failedWorkerHub = makeWorkerHub({
       arcHost: failedArcHost,
@@ -1252,43 +1400,6 @@ function Main() {
     await expect(submitActivation(failedWorkerHub, "hi")).resolves.toEqual(
       expect.stringMatching(/^arc-run:/),
     );
-
-    let releaseFirst!: () => void;
-    let resolveStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      resolveStarted = resolve;
-    });
-    const queueArcHost = await makeArcHostWithSource(
-      "watch-queue",
-      WATCH_SOURCE,
-    );
-    const queueLimited = makeWorkerHub({
-      arcHost: queueArcHost,
-      defaultConcurrency: 1,
-      maxQueueSize: 0,
-      roleConcurrency: { researcher: 1 },
-      workers: {
-        researcher: async () => {
-          resolveStarted();
-          await new Promise<void>((resolve) => {
-            releaseFirst = resolve;
-          });
-          return { outcome: "completed" };
-        },
-      },
-    }).workerHub;
-
-    const first = submitActivation(queueLimited, "one", ALICE_OWNER);
-    await started;
-    const secondArcRunId = await submitActivation(
-      queueLimited,
-      "two",
-      BOB_OWNER,
-    );
-    releaseFirst();
-    await first;
-
-    expect(secondArcRunId).toEqual(expect.stringMatching(/^arc-run:/));
   });
 
   it("continues background drains after the driver step budget yields", async () => {

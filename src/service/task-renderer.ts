@@ -31,11 +31,13 @@ export type RenderedJudgmentRequestForPrompt = {
   id: SemanticRequest["briefId"];
   kind: "judgment";
   question: string;
+  guidance?: string;
 };
 
 export type RenderedObservationRequestForPrompt = {
   id: SemanticRequest["briefId"];
   kind: "observation";
+  guidance?: string;
   cell: Extract<SemanticRequest, { kind: "observation" }>["cell"];
   mode: Extract<SemanticRequest, { kind: "observation" }>["mode"];
   question: string;
@@ -59,6 +61,7 @@ export type RenderedObservationGroupFieldForPrompt = {
 export type RenderedObservationGroupRequestForPrompt = {
   id: SemanticRequest["briefId"];
   kind: "observation-group";
+  guidance?: string;
   mode: Extract<SemanticRequest, { kind: "observation-group" }>["mode"];
   fields: RenderedObservationGroupFieldForPrompt[];
 };
@@ -144,9 +147,10 @@ export type RenderedSemanticRequestForPrompt =
 
 export type RenderedInstructionTaskForPrompt = Omit<
   InstructionTask,
-  "texts"
+  "texts" | "guidance"
 > & {
   text: string;
+  guidance?: string;
   audienceReferences?: readonly PromptAudienceReference[];
 };
 
@@ -166,6 +170,7 @@ export type RenderedActiveInstructionForPrompt = {
   ids: InstructionBriefIds;
   role: string;
   text: string;
+  guidance?: string;
   phase: InstructionTask["phase"];
   cells?: CellSnapshot;
   audienceReferences?: readonly PromptAudienceReference[];
@@ -227,14 +232,39 @@ export function renderInstructionTaskTextForPrompt(
   task: InstructionTask,
   context: RoutineContext,
   target: ArtifactPathRenderTarget,
-): { text: string; audienceReferences: readonly PromptAudienceReference[] } {
-  assertInstructionTextAlignment(task);
+): {
+  text: string;
+  guidance?: string;
+  audienceReferences: readonly PromptAudienceReference[];
+} {
+  assertInstructionAlignment(task);
   const rendered = task.texts.map((text) =>
     renderAgentSemanticText(text, context, target),
   );
-  const audienceReferences = collectAudienceReferences(rendered);
+  const renderedGuidance = task.briefIds.flatMap((id, index) => {
+    const guidance = task.guidance?.[index];
+    if (guidance == null) return [];
+    const rendered = renderAgentSemanticText(guidance, context, target);
+    return [
+      {
+        ...rendered,
+        text:
+          task.briefIds.length === 1
+            ? rendered.text
+            : `Instruction ${index + 1} (${id}):\n${rendered.text}`,
+      },
+    ];
+  });
+  const guidance =
+    renderedGuidance.length > 0
+      ? { guidance: renderedGuidance.map((item) => item.text).join("\n\n") }
+      : {};
+  const audienceReferences = collectAudienceReferences([
+    ...rendered,
+    ...renderedGuidance,
+  ]);
   if (rendered.length === 1) {
-    return { text: rendered[0]!.text, audienceReferences };
+    return { text: rendered[0]!.text, ...guidance, audienceReferences };
   }
   return {
     text: rendered
@@ -244,6 +274,7 @@ export function renderInstructionTaskTextForPrompt(
         ),
       )
       .join("\n\n"),
+    ...guidance,
     audienceReferences,
   };
 }
@@ -290,12 +321,14 @@ function renderedInstructionTaskFields(
   target: ArtifactPathRenderTarget,
 ): {
   text: string;
+  guidance?: string;
   audienceReferences?: readonly PromptAudienceReference[];
   cells?: CellSnapshot;
 } {
   const rendered = renderInstructionTaskTextForPrompt(task, context, target);
   return {
     text: rendered.text,
+    ...(rendered.guidance !== undefined ? { guidance: rendered.guidance } : {}),
     ...optionalAudienceReferences(rendered.audienceReferences),
     ...optionalCells(task.cells),
   };
@@ -305,11 +338,20 @@ export function renderSemanticRequestForPrompt(
   request: SemanticRequest,
   context: RoutineContext,
   target: ArtifactPathRenderTarget,
+  stage: SemanticTask["stage"],
 ): RenderedSemanticRequestForPrompt {
+  const guidance =
+    stage === "trigger" || request.guidance === undefined
+      ? {}
+      : {
+          guidance: renderAgentSemanticText(request.guidance, context, target)
+            .text,
+        };
   if (request.kind === "observation-group") {
     return {
       id: request.briefId,
       kind: request.kind,
+      ...guidance,
       mode: request.mode,
       fields: request.fields.map((field) => ({
         cell: field.cell,
@@ -329,6 +371,7 @@ export function renderSemanticRequestForPrompt(
       id: request.briefId,
       kind: request.kind,
       question,
+      ...guidance,
     };
   }
   return {
@@ -337,6 +380,7 @@ export function renderSemanticRequestForPrompt(
     cell: request.cell,
     mode: request.mode,
     question,
+    ...guidance,
     currentValue: request.currentValue,
     meta: request.meta,
   };
@@ -354,9 +398,9 @@ export function renderTaskForPrompt(
   return {
     ...rest,
     requests: task.requests.map((request) =>
-      renderSemanticRequestForPrompt(request, context, target),
+      renderSemanticRequestForPrompt(request, context, target, task.stage),
     ),
-    ...(activeInstruction
+    ...(task.stage === "action" && activeInstruction
       ? {
           activeInstruction: renderInstructionTaskForPrompt(
             activeInstruction,
@@ -373,7 +417,7 @@ export function renderInstructionTaskForPrompt(
   context: RoutineContext,
   target: ArtifactPathRenderTarget,
 ): RenderedInstructionTaskForPrompt {
-  const { texts: _texts, ...rest } = task;
+  const { texts: _texts, guidance: _guidance, ...rest } = task;
   return {
     ...rest,
     ...renderedInstructionTaskFields(task, context, target),
@@ -393,10 +437,15 @@ export function renderActiveInstructionForPrompt(
   };
 }
 
-function assertInstructionTextAlignment(task: InstructionTask): void {
+function assertInstructionAlignment(task: InstructionTask): void {
   if (task.texts.length !== task.briefIds.length) {
     throw new Error(
       `Instruction task text/brief id mismatch: ${task.texts.length} text item(s) for ${task.briefIds.length} brief id(s).`,
+    );
+  }
+  if (task.guidance && task.guidance.length !== task.briefIds.length) {
+    throw new Error(
+      `Instruction task guidance/brief id mismatch: ${task.guidance.length} guidance item(s) for ${task.briefIds.length} brief id(s).`,
     );
   }
 }

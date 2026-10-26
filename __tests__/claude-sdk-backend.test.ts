@@ -33,16 +33,362 @@ import {
 import {
   ARC_RUN_ID,
   createCapturingLogger,
+  deferred,
   firstTask,
   firstTaskWithArcHost,
+  makeArcHostWithSource,
   makeWorkerHub,
   waitFor,
 } from "./helpers.js";
-import { drainLifecycle } from "./worker-hub-helpers.js";
+import { drainLifecycle, submitActivation } from "./worker-hub-helpers.js";
 
 const execFileAsync = promisify(execFile);
 
 describe("ClaudeSdkWorker", () => {
+  it("times out only the captured Claude query while another context completes", async () => {
+    const task = await firstTask();
+    const entered = [deferred(), deferred()];
+    const release = [deferred(), deferred()];
+    const closed = [vi.fn(), vi.fn()];
+    let queries = 0;
+    const query = ((params: Parameters<ClaudeSdkQueryFn>[0]) => {
+      const index = queries++;
+      const signal = params.options!.abortController!.signal;
+      const messages = (async function* () {
+        for await (const _ of params.prompt as AsyncIterable<unknown>) {
+          entered[index]!.resolve();
+          await Promise.race([
+            release[index]!.promise,
+            new Promise<never>((_resolve, reject) => {
+              signal.addEventListener(
+                "abort",
+                () => reject(new Error("query aborted")),
+                { once: true },
+              );
+            }),
+          ]);
+          await callSdkReport(params, { outcome: "completed" });
+          yield {
+            type: "result",
+            subtype: "success",
+            session_id: `session:${index}`,
+            is_error: false,
+          };
+        }
+      })();
+      return Object.assign(messages, {
+        close: closed[index],
+        setModel: async () => {},
+      });
+    }) as unknown as ClaudeSdkQueryFn;
+    vi.useFakeTimers();
+    const worker = new ClaudeSdkWorker({
+      query,
+      timeoutMs: 1000,
+      sessionCache: { maxPreparedStarts: 0 },
+    });
+    const inputs = [0, 1].map((index) => ({
+      routine: routine(
+        { ...task, arcRunId: `run:${index}` },
+        { id: `routine:${index}`, contextKey: `context:${index}` },
+      ),
+      context: context(),
+      effects: noopRoutineEffects(),
+      diagnostics: noopDiagnostics,
+    }));
+    const pending = [worker.run(inputs[0]!)];
+    try {
+      await entered[0]!.promise;
+      await vi.advanceTimersByTimeAsync(500);
+      pending.push(worker.run(inputs[1]!));
+      await entered[1]!.promise;
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(pending[0]).resolves.toMatchObject({
+        suspension: "transport-lost",
+        reason: { reason: "sdk timeout" },
+      });
+      expect(closed[0]).toHaveBeenCalledTimes(1);
+      expect(closed[1]).not.toHaveBeenCalled();
+      release[1]!.resolve();
+      await expect(pending[1]).resolves.toMatchObject({ outcome: "completed" });
+      await worker.disposeRoutine({
+        arcRunId: "run:0",
+        routineId: "routine:0",
+      });
+      expect(closed[1]).not.toHaveBeenCalled();
+      await worker.disposeRoutine({
+        arcRunId: "run:1",
+        routineId: "routine:1",
+      });
+      expect(closed[1]).toHaveBeenCalledTimes(1);
+    } finally {
+      release.forEach((gate) => gate.resolve());
+      await Promise.allSettled(pending);
+      await worker.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("disposes completed production Claude queries while preserving the next routine conversation", async () => {
+    const arcHost = await makeArcHostWithSource(
+      "owned-conversation",
+      `"arc";
+      function Main() {
+        this.trigger = () => true;
+        this.hostParams = { workerRole: "researcher" };
+        $instruct("First work.");
+        $instruct("Second work.");
+      }`,
+    );
+    const { query, states } = streamingQueryReturning([
+      { outcome: "completed" },
+    ]);
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workerSlots: { default: "claude-sdk" },
+      claudeSdk: {
+        query,
+        sessionCache: { maxPreparedStarts: 0 },
+        resolveContinuityIdentity: async () => identity("test"),
+      },
+    });
+    try {
+      const run = await submitActivation(workerHub, "start");
+      await expect
+        .poll(
+          async () =>
+            (await workerHub.listWorkEvents(run)).filter(
+              (event) => event.kind === "routine:finished",
+            ).length,
+        )
+        .toBe(2);
+      await expect
+        .poll(
+          () =>
+            states.filter((state) => state.close.mock.calls.length === 1)
+              .length,
+        )
+        .toBe(2);
+      expect(query).toHaveBeenCalledTimes(2);
+      expect(query.mock.calls[0]![0].options.resume).toBeUndefined();
+      expect(query.mock.calls[1]![0].options.resume).toBe("session-live-0");
+      expect(states[0]!.prompts[0]).toContain("First work.");
+      expect(states[1]!.prompts[0]).toContain("Second work.");
+      expect(states[1]!.prompts).toHaveLength(1);
+    } finally {
+      await workerHub.stop();
+    }
+  });
+
+  it("keeps consumed Claude starts alive while unused starts expire or exceed capacity", async () => {
+    const task = await firstTask();
+    const descriptor = routine(task);
+    const entered = deferred();
+    const release = deferred<string>();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1000);
+    const { query, states } = streamingQueryReturning(
+      [{ outcome: "completed" }],
+      async (params) => {
+        await callSdkDiscuss(params, { question: "Continue?" });
+      },
+    );
+    const unusedClose: ReturnType<typeof vi.fn>[] = [];
+    const startup = vi.fn(async (params: Parameters<ClaudeSdkStartupFn>[0]) => {
+      const close = vi.fn();
+      unusedClose.push(close);
+      return {
+        query: (prompt: Parameters<ClaudeSdkQueryFn>[0]["prompt"]) =>
+          query({ prompt, options: params?.options }),
+        close,
+      };
+    });
+    const worker = new ClaudeSdkWorker({
+      query,
+      startup: startup as unknown as ClaudeSdkStartupFn,
+      sessionCache: { maxPreparedStarts: 1, idleTtlMs: 10 },
+    });
+    const warm = (contextKey: string) =>
+      worker.prepareWarmStart({
+        arcRunId: task.arcRunId,
+        role: task.role,
+        contextKey,
+        workspacePath: context().workspacePath,
+      });
+    await warm(descriptor.contextKey);
+    const pending = runBackend(
+      worker,
+      descriptor,
+      context(),
+      noopRoutineEffects({
+        emit: async () => {
+          entered.resolve();
+          return release.promise;
+        },
+      }),
+      noopDiagnostics,
+    );
+    try {
+      await entered.promise;
+      await warm("unused:1");
+      await warm("unused:2");
+      expect(unusedClose[1]).toHaveBeenCalledTimes(1);
+      expect(unusedClose[0]).not.toHaveBeenCalled();
+      expect(states[0]!.close).not.toHaveBeenCalled();
+      clock.mockReturnValue(2000);
+      await warm("unused:3");
+      expect(unusedClose[2]).toHaveBeenCalledTimes(1);
+      expect(states[0]!.close).not.toHaveBeenCalled();
+      release.resolve("yes");
+      await expect(pending).resolves.toMatchObject({
+        outcome: "completed",
+        backendDetails: { preparedStartUsed: true },
+      });
+      await worker.disposeRoutine({
+        arcRunId: descriptor.arcRunId,
+        routineId: descriptor.id,
+      });
+      expect(states[0]!.close).toHaveBeenCalledTimes(1);
+      expect(unusedClose[3]).not.toHaveBeenCalled();
+    } finally {
+      release.resolve("cleanup");
+      await pending;
+      await worker.stop();
+      clock.mockRestore();
+    }
+    expect(unusedClose[3]).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to a cold Claude execution after its prepared start rejects", async () => {
+    const task = await firstTask();
+    const descriptor = routine(task);
+    const { query, states } = streamingQueryReturning([
+      { outcome: "completed" },
+    ]);
+    const worker = new ClaudeSdkWorker({
+      query,
+      startup: async () => {
+        throw new Error("preparation failed");
+      },
+    });
+    try {
+      await expect(
+        worker.prepareWarmStart({
+          arcRunId: task.arcRunId,
+          role: task.role,
+          contextKey: descriptor.contextKey,
+          workspacePath: context().workspacePath,
+        }),
+      ).rejects.toThrow("preparation failed");
+      await expect(
+        runBackend(
+          worker,
+          descriptor,
+          context(),
+          noopRoutineEffects(),
+          noopDiagnostics,
+        ),
+      ).resolves.toMatchObject({
+        outcome: "completed",
+        backendDetails: { preparedStartUsed: false },
+      });
+      expect(query).toHaveBeenCalledTimes(1);
+      await worker.disposeRoutine({
+        arcRunId: task.arcRunId,
+        routineId: descriptor.id,
+      });
+      expect(states[0]!.close).toHaveBeenCalledTimes(1);
+    } finally {
+      await worker.stop();
+    }
+  });
+
+  it.each([
+    ["keeps eighteen Claude question invocations alive on one worker", 18, 0],
+    [
+      "keeps a waiting Claude query alive beyond prepared-start expiry",
+      2,
+      300001,
+    ],
+  ] as const)("%s", async (_name, count, elapsed) => {
+    const task = await firstTask();
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const entered = Array.from({ length: count }, () => deferred());
+    const answers = Array.from({ length: count }, () => deferred<string>());
+    const observed: unknown[] = [];
+    const { query, states } = streamingQueryReturning(
+      [{ outcome: "completed" }],
+      async (params) => {
+        observed.push(await callSdkDiscuss(params, { question: "Continue?" }));
+      },
+    );
+    const worker = new ClaudeSdkWorker({
+      query,
+      timeoutMs: 600000,
+      sessionCache: { maxPreparedStarts: 0 },
+    });
+    const pending: Promise<RoutineReport>[] = [];
+    const routines = Array.from({ length: count }, (_, index) =>
+      routine(
+        { ...task, arcRunId: `claude-concurrent-${index}` },
+        {
+          id: `routine-concurrent-${index}`,
+          contextKey: `context-concurrent-${index}`,
+        },
+      ),
+    );
+    try {
+      for (const [index, descriptor] of routines.entries()) {
+        if (index > 0) clock.mockReturnValue(now + elapsed);
+        pending.push(
+          runBackend(
+            worker,
+            descriptor,
+            context(),
+            noopRoutineEffects({
+              emit: async () => {
+                entered[index]!.resolve();
+                return answers[index]!.promise;
+              },
+            }),
+            noopDiagnostics,
+          ),
+        );
+        await entered[index]!.promise;
+      }
+      expect(states).toHaveLength(count);
+      for (const state of states) expect(state.close).not.toHaveBeenCalled();
+      for (let index = count - 1; index >= 0; index--) {
+        answers[index]!.resolve(`answer-${index}`);
+        await expect(pending[index]).resolves.toMatchObject({
+          outcome: "completed",
+        });
+        await worker.disposeRoutine({
+          arcRunId: routines[index]!.arcRunId,
+          routineId: routines[index]!.id,
+        });
+        expect(states[index]!.close).toHaveBeenCalledTimes(1);
+        for (const sibling of states.slice(0, index))
+          expect(sibling.close).not.toHaveBeenCalled();
+      }
+      expect(observed).toEqual(
+        Array.from({ length: count }, (_, index) => ({
+          answer: `answer-${count - index - 1}`,
+        })),
+      );
+      expect(
+        query.mock.calls.every(
+          ([params]) => params.options?.cwd === context().workspacePath,
+        ),
+      ).toBe(true);
+    } finally {
+      answers.forEach((answer, index) => answer.resolve(`answer-${index}`));
+      await Promise.allSettled(pending);
+      await worker.stop();
+      clock.mockRestore();
+    }
+  });
+
   it("resumes the recorded Claude session after delivery and connection loss", async () => {
     const task: InstructionTask = {
       ...(await firstTask()),
@@ -828,6 +1174,13 @@ describe("ClaudeSdkWorker", () => {
       ] as const,
       cells: { planName: "Q4 launch" },
     };
+    task.guidance = [
+      [
+        { kind: "text", value: "Follow " },
+        { kind: "artifact", path: "policy.md" },
+        { kind: "text", value: "." },
+      ],
+    ];
     const { query, states } = streamingQueryReturning([
       { outcome: "completed" },
     ]);
@@ -857,6 +1210,12 @@ describe("ClaudeSdkWorker", () => {
     expect(prompt).toContain("</prior-turns>");
     expect(prompt).toContain("<instruction>");
     expect(prompt).toContain("</instruction>");
+    expect(prompt).toContain(
+      `<guidance>\nFollow ${join(ctx.workspacePath, "policy.md")}.\n</guidance>`,
+    );
+    expect(query.mock.calls[0]![0].options?.systemPrompt).toMatchObject({
+      append: expect.stringContaining("Apply standing guidance"),
+    });
     expect(prompt).toContain("<cells>");
     expect(prompt).toContain("</cells>");
     expect(prompt).toContain("<rules>");
@@ -1447,12 +1806,12 @@ describe("ClaudeSdkWorker", () => {
     expect(query.mock.calls[0]![0].options?.cwd).toBe(workspace);
     expect(firstReport.backendDetails).toMatchObject({
       sessionCacheEnabled: true,
-      sessionCacheHit: false,
+      liveSessionReused: false,
       preparedStartUsed: false,
     });
     expect(secondReport.backendDetails).toMatchObject({
       sessionCacheEnabled: true,
-      sessionCacheHit: true,
+      liveSessionReused: true,
       preparedStartUsed: false,
     });
   });
@@ -1768,7 +2127,7 @@ describe("ClaudeSdkWorker", () => {
     expect(states[0]!.prompts).toHaveLength(1);
     expect(report.backendDetails).toMatchObject({
       sessionCacheEnabled: true,
-      sessionCacheHit: false,
+      liveSessionReused: false,
       preparedStartUsed: true,
     });
   });
@@ -1862,7 +2221,7 @@ describe("ClaudeSdkWorker", () => {
     );
     expect(report.backendDetails).toMatchObject({
       sessionCacheEnabled: true,
-      sessionCacheHit: false,
+      liveSessionReused: false,
       preparedStartUsed: false,
     });
   });
@@ -2000,6 +2359,7 @@ describe("ClaudeSdkWorker", () => {
     await mkdir(workspace, { recursive: true });
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:action",
       role: "researcher",
       stage: "action",
@@ -2030,6 +2390,7 @@ describe("ClaudeSdkWorker", () => {
       ],
       activeInstruction: {
         kind: "instruction",
+        allowedDispositions: [],
         briefIds: ["instruction:active"],
         role: "researcher",
         texts: [
@@ -2134,6 +2495,7 @@ describe("ClaudeSdkWorker", () => {
     await mkdir(workspace, { recursive: true });
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:array-group",
       role: "researcher",
       stage: "action",

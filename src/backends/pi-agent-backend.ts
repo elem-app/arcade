@@ -257,7 +257,7 @@ export class PiAgentWorker implements Worker {
         initialState: {
           ...agentOptions.initialState,
           systemPrompt: isSemantic
-            ? buildSemanticSystemPrompt(systemBase)
+            ? buildSemanticSystemPrompt(task.stage, systemBase)
             : buildInstructionSystemPrompt(task, systemBase),
         },
       });

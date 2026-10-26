@@ -12,6 +12,7 @@ export function buildInstructionSystemPrompt(
     base,
     "You are a managed agent.",
     "Handle exactly one work item and return only JSON.",
+    "Apply the work item's standing guidance when interpreting and carrying out its associated instruction, including audience interaction. Guidance applies only to its associated work in the current assignment.",
     "Do not include a user-visible message unless the work item explicitly asks you to communicate with a workflow participant.",
     `Role: ${task.role}`,
   ];

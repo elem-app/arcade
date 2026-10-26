@@ -91,6 +91,7 @@ describe("PI backend shared protocol adapter", () => {
   it("executes instruction and semantic routines through the stock PI worker", async () => {
     resetFakeAgent();
     const { arcHost, task: instruction } = await firstTaskWithArcHost();
+    instruction.guidance = ["Use the PI instruction policy."];
     const { workerHub } = await makePiHub(arcHost, createPiAgentBackend());
 
     await expect(
@@ -105,8 +106,11 @@ describe("PI backend shared protocol adapter", () => {
         semantic: { judgments: { "judge:required": true } },
       },
     });
+    const semantic = semanticTaskFor(instruction);
+    if (semantic.kind !== "semantic") throw new Error("Expected semantic task");
+    semantic.requests[0]!.guidance = "Use the PI judgment policy.";
     await expect(
-      workerHub.handleTask(semanticTaskFor(instruction), routineContext()),
+      workerHub.handleTask(semantic, routineContext()),
     ).resolves.toMatchObject({
       status: "finished",
       report: {
@@ -117,6 +121,21 @@ describe("PI backend shared protocol adapter", () => {
 
     expect(fakeAgent.prompts[0]).toContain("Work item:");
     expect(fakeAgent.prompts[1]).toContain("<semantic-requests>");
+    expect(fakeAgent.prompts[0]).toContain(
+      '"guidance": "Use the PI instruction policy."',
+    );
+    expect(fakeAgent.prompts[1]).toContain(
+      '"guidance": "Use the PI judgment policy."',
+    );
+    expect(fakeAgent.prompts[1]).toContain(
+      '"guidance": "Use the PI instruction policy."',
+    );
+    expect(fakeAgent.systems[0]).toContain(
+      "Apply the work item's standing guidance",
+    );
+    expect(fakeAgent.systems[1]).toContain(
+      "Apply each request's standing guidance",
+    );
   });
 
   it("accepts flat reports from stock and injected PI runners", async () => {
@@ -462,6 +481,7 @@ function semanticTaskFor(
 ): Task {
   return {
     kind: "semantic",
+    allowedDispositions: [],
     batchId: `semantic:pi:${stage}`,
     role: instruction.role,
     stage,
@@ -514,6 +534,7 @@ function workerHost(): WorkerHost {
 function routineInput() {
   const task: Extract<Task, { kind: "instruction" }> = {
     kind: "instruction",
+    allowedDispositions: [],
     briefIds: ["instruction:pi"],
     role: "researcher",
     texts: ["Do work."],

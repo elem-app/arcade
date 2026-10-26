@@ -15,6 +15,12 @@ import type { ArcRunId } from "./core.js";
 /** Public structured work the hub can carry out. */
 export type Task = InstructionTask | SemanticTask;
 
+/**
+ * A conclusion a worker may report about its task's whole frontier instead of
+ * answering the task. See `RoutineReport`.
+ */
+export type TaskDisposition = "deflect" | "interrupt";
+
 /** Managed-agent context sharing boundary selected by Arcade policy. */
 export type ContextIsolation = "role" | "node";
 
@@ -48,6 +54,8 @@ export type InstructionTask = {
   role: string;
   /** Structured instruction text from Arc runtime briefs. */
   texts: readonly [SemanticText, ...SemanticText[]];
+  /** Standing guidance aligned with briefIds and texts; null marks an empty slot. */
+  guidance?: readonly (SemanticText | null)[];
   /** Optional tool ids requested by the Arc author. */
   tools: readonly string[];
   /** Arc cell values visible at the instruction frontier. */
@@ -62,6 +70,8 @@ export type InstructionTask = {
   contextIsolation: ContextIsolation;
   /** Runtime phase of the source instruction brief. */
   phase: InstructionBrief["phase"];
+  /** Dispositions the worker may report for this task. */
+  allowedDispositions: readonly TaskDisposition[];
 };
 
 /** Semantic frontier work handed to workers. */
@@ -88,6 +98,8 @@ export type SemanticTask = {
   contextIsolation: ContextIsolation;
   /** Active instruction context when semantic work is part of an action frontier. */
   activeInstruction?: InstructionTask;
+  /** Dispositions the worker may report for this task. */
+  allowedDispositions: readonly TaskDisposition[];
 };
 
 /** Structured semantic request emitted by arc host and rendered by backends. */
@@ -97,6 +109,7 @@ export type SemanticRequest =
       briefId: BriefId;
       role: string;
       question: SemanticText;
+      guidance?: SemanticText;
       tool: SemanticToolDefinition;
       sourceRef: NodeRef;
     }
@@ -107,6 +120,7 @@ export type SemanticRequest =
       cell: string;
       mode: ObservationBrief["mode"];
       question: SemanticText;
+      guidance?: SemanticText;
       currentValue?: PrimitiveValue | PrimitiveValue[];
       meta: ObservationBrief["meta"];
       tool: SemanticToolDefinition;
@@ -118,6 +132,7 @@ export type SemanticRequest =
       role: string;
       mode: ObservationGroupBrief["mode"];
       fields: ObservationGroupField[];
+      guidance?: SemanticText;
       tool: SemanticToolDefinition;
       sourceRef: NodeRef;
     };

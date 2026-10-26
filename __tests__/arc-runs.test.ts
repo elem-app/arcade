@@ -8,12 +8,16 @@ import { Runtime, toArcRef } from "@elem-app/arc/runtime";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  DEFAULT_WORKER_ROLE,
   InMemoryArcHostStore,
   InMemoryReplayStore,
   JsonFileArcHostStore,
   arcRunKey,
   taskId,
   type Dialog,
+  type InstructionTask,
+  type RoleWorker,
+  type RoutineReport,
 } from "../src/testing.js";
 import {
   StepDriver,
@@ -37,8 +41,14 @@ import {
   createCapturingLogger,
   makeArcHost,
   makeArcHostWithSource,
+  makeWorkerHub,
   waitFor,
 } from "./helpers.js";
+import {
+  drainLifecycle,
+  recordAdvanceInputs,
+  submitActivation,
+} from "./worker-hub-helpers.js";
 
 import { KeyedSerializer } from "../src/utils/keyed-serializer.js";
 import { makeControlledTime } from "./controlled-time.js";
@@ -703,7 +713,8 @@ function Stock() {
 
   it("poisons a run when worker feedback reports failure", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const { logger, records } = createCapturingLogger("info");
+    const arcHost = createTestArcHost({ store, logger });
     await arcHost.registerArc("greet", parse(GREET_SOURCE));
     const dialog: Dialog = {
       cursor: { user: 0, self: 0 },
@@ -725,6 +736,11 @@ function Stock() {
             code: "worker-timeout",
             message: "Worker timed out.",
           },
+          {
+            error: "failed",
+            code: "provider-failed",
+            message: "Provider refused work.",
+          },
         ],
         instructionCoverage: {
           [taskId(driver.frontier.tasks[0]!)]: "failed",
@@ -739,6 +755,20 @@ function Stock() {
         kind: "poisoned-traversal",
         reasonCode: "worker-timeout",
         reason: "Worker timed out.",
+      }),
+    ]);
+    // The poison reports the first failure; the log keeps the other.
+    expect(
+      records.filter(
+        (record) => record.event === "arc_host.feedback.unacknowledged",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        move: "poison",
+        briefIds: [],
+        failures: [
+          { code: "provider-failed", message: "Provider refused work." },
+        ],
       }),
     ]);
     await expect(store.getState(arcRunKey(driver.arcRunId))).resolves.toEqual(
@@ -1883,7 +1913,7 @@ function Main() {
       arcHost.verifyReplay(first.arcRunId, toArcRef("failed-reentry", "Main"), {
         untilPosition: { stage: "action", index: 0, reactivationCount: 1 },
       }),
-    ).rejects.toThrow("newer than committed reactivation count 0");
+    ).rejects.toThrow("in the selected source prefix");
 
     const verified = await arcHost.verifyReplay(
       first.arcRunId,
@@ -2244,82 +2274,88 @@ function Main() {
     });
   });
 
-  it("retires only the failed trigger probe and finalizes successful sibling matches", async () => {
-    for (const failureFirst of [true, false]) {
-      const store = new InMemoryArcHostStore();
-      const arcHost = createTestArcHost({ store });
-      await arcHost.registerArc(
-        "failed-batch",
-        parse(`"arc";
+  it("retires only a failed or disposition trigger probe and finalizes successful sibling matches", async () => {
+    const retiringReports: RoutineReport[] = [
+      {
+        error: "failed",
+        code: "provider-failed",
+        message: "Provider refused work.",
+      },
+      { outcome: "disposition", interrupt: { id: "external" } },
+    ];
+    for (const retiringReport of retiringReports)
+      for (const retiringFirst of [true, false]) {
+        const store = new InMemoryArcHostStore();
+        const arcHost = createTestArcHost({ store });
+        await arcHost.registerArc(
+          "failed-batch",
+          parse(`"arc";
 function Main() {
   this.trigger = () => judge("event matches");
   $enter(Wait);
   function Wait() { this.guard = () => State.DEFLECTED; }
 }`),
-      );
-      const dialog: Dialog = {
-        cursor: { user: 1, self: 0 },
-        lastTurns: [{ role: "user", message: "event" }],
-      };
-      const begin = () =>
-        beginActivation(arcHost, dialog, {
-          inbound: inboundFromDialog(dialog),
-          principal: ALICE_OWNER,
-        });
-      const match = (probe: TriggerStep) =>
-        arcHost.advanceTrigger(probe.arcRunId, dialog, {
-          instructionCoverage: {},
-          projectDialog: projectorFor(dialog),
-          reports: [
-            {
-              outcome: "completed",
-              semantic: {
-                judgments: { [probe.frontier.briefs.judgments[0]!.id]: true },
+        );
+        const dialog: Dialog = {
+          cursor: { user: 1, self: 0 },
+          lastTurns: [{ role: "user", message: "event" }],
+        };
+        const begin = () =>
+          beginActivation(arcHost, dialog, {
+            inbound: inboundFromDialog(dialog),
+            principal: ALICE_OWNER,
+          });
+        const match = (probe: TriggerStep) =>
+          arcHost.advanceTrigger(probe.arcRunId, dialog, {
+            instructionCoverage: {},
+            projectDialog: projectorFor(dialog),
+            reports: [
+              {
+                outcome: "completed",
+                semantic: {
+                  judgments: { [probe.frontier.briefs.judgments[0]!.id]: true },
+                },
               },
-            },
+            ],
+          });
+        const initial = expectSoleTrigger(await begin());
+        const deflected = expectSoleDriver(await match(initial));
+        const prior = await store.getState(arcRunKey(deflected.arcRunId));
+        expect(prior?.lifecycle).toBe("deflected");
+
+        const probes = (await begin()) as TriggerStep[];
+        expect(probes).toHaveLength(2);
+        if (!retiringFirst)
+          await expect(match(probes[1]!)).resolves.toEqual([]);
+        const retiredSteps = await arcHost.advanceTrigger(
+          probes[0]!.arcRunId,
+          dialog,
+          {
+            instructionCoverage: {},
+            projectDialog: projectorFor(dialog),
+            reports: [retiringReport],
+          },
+        );
+        if (retiringFirst) expect(retiredSteps).toEqual([]);
+        const settled = retiringFirst ? await match(probes[1]!) : retiredSteps;
+        expect(expectSoleHandshake(settled).requirement).toMatchObject({
+          kind: "run-choice",
+          candidates: [
+            expect.objectContaining({ arcRunId: deflected.arcRunId }),
           ],
         });
-      const initial = expectSoleTrigger(await begin());
-      const deflected = expectSoleDriver(await match(initial));
-      const prior = await store.getState(arcRunKey(deflected.arcRunId));
-      expect(prior?.lifecycle).toBe("deflected");
-
-      const probes = (await begin()) as TriggerStep[];
-      expect(probes).toHaveLength(2);
-      if (!failureFirst) await expect(match(probes[1]!)).resolves.toEqual([]);
-      const failedSteps = await arcHost.advanceTrigger(
-        probes[0]!.arcRunId,
-        dialog,
-        {
-          instructionCoverage: {},
-          projectDialog: projectorFor(dialog),
-          reports: [
-            {
-              error: "failed",
-              code: "provider-failed",
-              message: "Provider refused work.",
-            },
-          ],
-        },
-      );
-      if (failureFirst) expect(failedSteps).toEqual([]);
-      const settled = failureFirst ? await match(probes[1]!) : failedSteps;
-      expect(expectSoleHandshake(settled).requirement).toMatchObject({
-        kind: "run-choice",
-        candidates: [expect.objectContaining({ arcRunId: deflected.arcRunId })],
-      });
-      await expect(arcHost.listRunViews()).resolves.toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            arcRunId: deflected.arcRunId,
-            lifecycle: "deflected",
-          }),
-        ]),
-      );
-      await expect(
-        store.getState(arcRunKey(deflected.arcRunId)),
-      ).resolves.toEqual(prior);
-    }
+        await expect(arcHost.listRunViews()).resolves.toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              arcRunId: deflected.arcRunId,
+              lifecycle: "deflected",
+            }),
+          ]),
+        );
+        await expect(
+          store.getState(arcRunKey(deflected.arcRunId)),
+        ).resolves.toEqual(prior);
+      }
   });
 
   it("pins a fresh semantic probe to the documents current when probing began", async () => {
@@ -2436,7 +2472,7 @@ function Main() { this.trigger = () => judge("event matches"); }
 
     const committed = await advanceView(driver, dialog, {
       instructionCoverage: {},
-      reports: [{ outcome: "deflected" }],
+      reports: [{ outcome: "disposition", deflect: {} }],
     });
 
     expect(committed.canProgress).toBe(false);
@@ -2447,5 +2483,361 @@ function Main() { this.trigger = () => judge("event matches"); }
       phase: "suspended",
       state: "deflected",
     });
+  });
+});
+
+describe("worker dispositions", () => {
+  const dialog: Dialog = {
+    cursor: { user: 0, self: 0 },
+    lastTurns: [{ role: "user", message: "hi" }],
+  };
+  const interrupt = (id: string, reason?: string) =>
+    ({
+      outcome: "disposition",
+      interrupt: { id, ...(reason !== undefined ? { reason } : {}) },
+    }) as const;
+
+  async function activate(source: string) {
+    const store = new InMemoryArcHostStore();
+    const { logger, records } = createCapturingLogger("info");
+    const arcHost = createTestArcHost({ store, logger });
+    await arcHost.registerArc("dispositions", parse(source));
+    const driver = await beginActivatedDriver(arcHost, dialog);
+    return { arcHost, store, records, driver };
+  }
+
+  it("lists the frontier's allowed dispositions on action tasks and none on trigger tasks", async () => {
+    const judging = await activate(DEFLECTABLE_SOURCE);
+    expect(judging.driver.frontier.tasks).toEqual([
+      expect.objectContaining({
+        kind: "semantic",
+        allowedDispositions: ["deflect", "interrupt"],
+      }),
+    ]);
+
+    const instructing = await activate(GREET_SOURCE);
+    expect(instructing.driver.frontier.tasks).toEqual([
+      expect.objectContaining({
+        kind: "instruction",
+        allowedDispositions: ["interrupt"],
+      }),
+    ]);
+
+    const closing = await activate(`"arc";
+function Main() {
+  this.trigger = () => true;
+  let closed = Bool();
+  this.effects = () => { if (judge(\`close?\`)) closed.$set(true); };
+  $instruct(\`Work.\`);
+}`);
+    const effects = await advanceView(closing.driver, dialog, {
+      reports: [],
+      instructionCoverage: {
+        [taskId(closing.driver.frontier.tasks[0]!)]: "applied",
+      },
+    });
+    expect(effects.allowedMoves).not.toContain("interrupt");
+    expect(effects.tasks).toEqual([
+      expect.objectContaining({
+        kind: "semantic",
+        allowedDispositions: ["deflect"],
+      }),
+    ]);
+
+    const arcHost = makeArcHost();
+    await arcHost.registerArc(
+      "trigger",
+      parse(`"arc";
+function Main() {
+  this.trigger = () => judge("event matches");
+  $instruct("Work.");
+}`),
+    );
+    const probe = expectSoleTrigger(
+      await beginActivation(arcHost, dialog, {
+        inbound: inboundFromDialog(dialog),
+        principal: ALICE_OWNER,
+      }),
+    );
+    expect(probe.frontier.tasks).toEqual([
+      expect.objectContaining({ kind: "semantic", allowedDispositions: [] }),
+    ]);
+  });
+
+  it("catches a worker interrupt disposition with its id and reason", async () => {
+    const { driver } = await activate(`"arc";
+function Main() {
+  this.trigger = () => true;
+  let rerouted = Bool();
+  rerouted.$set(false);
+  this.catchInterruption = () => {
+    if (this.interruption.id == "external" && this.interruption.reason == "ping") {
+      rerouted.$set(true);
+      return true;
+    }
+    return false;
+  };
+  if (rerouted) {
+    $instruct(\`Handle the event.\`);
+  } else {
+    $instruct(\`Do the work.\`);
+  }
+}`);
+    const caught = await advanceView(driver, dialog, {
+      reports: [interrupt("external", "ping")],
+      instructionCoverage: { [taskId(driver.frontier.tasks[0]!)]: "ignored" },
+    });
+
+    expect(caught.canProgress).toBe(true);
+    expect(JSON.stringify(caught.tasks)).toContain("Handle the event.");
+  });
+
+  it("leaves the run active after an uncaught worker interrupt disposition", async () => {
+    const { driver, store } = await activate(GREET_SOURCE);
+    const interrupted = await advanceView(driver, dialog, {
+      reports: [interrupt("external")],
+      instructionCoverage: { [taskId(driver.frontier.tasks[0]!)]: "ignored" },
+    });
+
+    expect(interrupted.canProgress).toBe(false);
+    expect(interrupted.tasks).toEqual([]);
+    expect(interrupted.status).not.toBe("poisoned");
+    await expect(
+      store.getState(arcRunKey(driver.arcRunId)),
+    ).resolves.toMatchObject({ lifecycle: "active" });
+  });
+
+  it("poisons a worker disposition the frontier does not accept", async () => {
+    const instructing = await activate(GREET_SOURCE);
+    const deflected = await advanceView(instructing.driver, dialog, {
+      reports: [
+        { error: "failed", code: "worker-timeout", message: "Timed out." },
+        { outcome: "disposition", deflect: {} },
+      ],
+      instructionCoverage: {
+        [taskId(instructing.driver.frontier.tasks[0]!)]: "deflected",
+      },
+    });
+    expect(deflected.status).toBe("poisoned");
+    expect(deflected.issues).toEqual([
+      expect.objectContaining({ reasonCode: "worker-deflect-unavailable" }),
+    ]);
+    expect(instructing.records).toContainEqual(
+      expect.objectContaining({
+        event: "arc_host.feedback.unacknowledged",
+        move: "poison",
+        failures: [{ code: "worker-timeout", message: "Timed out." }],
+      }),
+    );
+
+    const closing = await activate(`"arc";
+function Main() {
+  this.trigger = () => true;
+  let closed = Bool();
+  this.effects = () => { if (judge(\`close?\`)) closed.$set(true); };
+  $instruct(\`Work.\`);
+}`);
+    const effects = (
+      await closing.driver.advance({
+        dialog,
+        input: {
+          reports: [],
+          instructionCoverage: {
+            [taskId(closing.driver.frontier.tasks[0]!)]: "applied",
+          },
+        },
+      })
+    ).driver;
+    const interrupted = await advanceView(effects, dialog, {
+      reports: [interrupt("external")],
+      instructionCoverage: {},
+    });
+    expect(effects.frontier.allowedMoves).not.toContain("interrupt");
+    expect(interrupted.status).toBe("poisoned");
+    expect(interrupted.issues).toEqual([
+      expect.objectContaining({ reasonCode: "worker-interrupt-unavailable" }),
+    ]);
+  });
+
+  it("lets a disposition override completed and failed feedback in its batch", async () => {
+    const { driver, store, records } = await activate(DEFLECTABLE_SOURCE);
+    const judgmentId = driver.frontier.briefs.judgments[0]!.id;
+    const interrupted = await advanceView(driver, dialog, {
+      reports: [
+        {
+          outcome: "completed",
+          semantic: { judgments: { [judgmentId]: true } },
+        },
+        { error: "failed", code: "worker-timeout", message: "Timed out." },
+        interrupt("external"),
+      ],
+      instructionCoverage: {},
+    });
+
+    expect(interrupted.status).not.toBe("poisoned");
+    expect(interrupted.canProgress).toBe(false);
+    await expect(
+      store.getState(arcRunKey(driver.arcRunId)),
+    ).resolves.toMatchObject({ lifecycle: "active" });
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: "arc_host.feedback.unacknowledged",
+          arcRunId: driver.arcRunId,
+          move: "interrupt",
+          briefIds: [judgmentId],
+          failures: [{ code: "worker-timeout", message: "Timed out." }],
+        }),
+      ]),
+    );
+  });
+
+  it("redispatches the instruction an uncaught interrupt disposition left unapplied", async () => {
+    const { arcHost, driver } = await activate(GREET_SOURCE);
+    await advanceView(driver, dialog, {
+      reports: [interrupt("external")],
+      instructionCoverage: { [taskId(driver.frontier.tasks[0]!)]: "ignored" },
+    });
+    await arcHost.releaseAction(driver.arcRunId, driver.frontier.frontierId);
+
+    const continued = await beginView(arcHost, driver.arcRunId, dialog);
+    expect(continued.tasks).toEqual([
+      expect.objectContaining({
+        kind: "instruction",
+        briefIds:
+          driver.frontier.tasks[0]!.kind === "instruction"
+            ? driver.frontier.tasks[0]!.briefIds
+            : [],
+      }),
+    ]);
+  });
+
+  /** Present the activation frontier's instruction as a two-task batch. */
+  async function twoTaskActivation() {
+    const arcHost = await makeArcHostWithSource("greet", GREET_SOURCE);
+    const begin = arcHost.begin.bind(arcHost);
+    vi.spyOn(arcHost, "begin").mockImplementation(async (input) =>
+      (await begin(input)).map((step) => {
+        const first =
+          step.kind === "action" ? step.frontier.tasks[0] : undefined;
+        if (step.kind !== "action" || first?.kind !== "instruction")
+          return step;
+        return {
+          ...step,
+          frontier: {
+            ...step.frontier,
+            tasks: [
+              first,
+              { ...first, briefIds: ["second-instruction"] as const },
+            ],
+          },
+        };
+      }),
+    );
+    const advanceInputs = recordAdvanceInputs(arcHost);
+    return { arcHost, advanceInputs };
+  }
+
+  it("stops a task batch at a disposition and forwards it as the batch's feedback", async () => {
+    const { arcHost, advanceInputs } = await twoTaskActivation();
+    const worker = vi.fn<RoleWorker>(async () => interrupt("external"));
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: { greeter: worker },
+    });
+
+    const arcRunId = await submitActivation(workerHub, "hi");
+    await waitFor(() => advanceInputs.length === 1);
+
+    expect(worker).toHaveBeenCalledTimes(1);
+    const first = worker.mock.calls[0]![0] as InstructionTask;
+    expect(first.briefIds).not.toEqual(["second-instruction"]);
+    expect(advanceInputs).toEqual([
+      {
+        reports: [interrupt("external")],
+        instructionCoverage: { [first.briefIds.join("+")]: "ignored" },
+        intent: "agent-work",
+      },
+    ]);
+    await waitFor(async () =>
+      (await workerHub.listWorkEvents(arcRunId)).some(
+        (event) => event.kind === "routine:finished",
+      ),
+    );
+    expect(await workerHub.listWorkEvents(arcRunId)).toContainEqual(
+      expect.objectContaining({
+        kind: "routine:finished",
+        outcome: "disposition",
+        disposition: "interrupt",
+      }),
+    );
+  });
+
+  it("fails the submission's trigger probe on a worker disposition", async () => {
+    const arcHost = await makeArcHostWithSource(
+      "trigger",
+      `"arc";
+function Main() {
+  this.trigger = () => judge("event matches");
+  $instruct("Work.");
+}`,
+    );
+    const { logger, records } = createCapturingLogger("info");
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      logger,
+      workers: { [DEFAULT_WORKER_ROLE]: async () => interrupt("external") },
+    });
+
+    const events = await drainLifecycle(
+      workerHub.submitInbound({
+        content: "event",
+        metadata: { principal: ALICE_OWNER },
+      }),
+    );
+
+    expect(events).toEqual([
+      {
+        kind: "failed",
+        arcRunId: expect.any(String),
+        routineId: expect.any(String),
+        reason:
+          'Worker reported disposition "interrupt" on a trigger task, which accepts none.',
+      },
+    ]);
+    const [failed] = events;
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        event: "worker_hub.lap.finished",
+        arcRunId: failed?.kind === "failed" ? failed.arcRunId : undefined,
+        arcStatus: "failed",
+      }),
+    );
+  });
+
+  it("stops a resumed task batch at a disposition", async () => {
+    const { arcHost, advanceInputs } = await twoTaskActivation();
+    const worker = vi
+      .fn<RoleWorker>()
+      .mockResolvedValueOnce({ suspension: "paused" })
+      .mockResolvedValue(interrupt("external"));
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: { greeter: worker },
+    });
+
+    const arcRunId = await submitActivation(workerHub, "hi");
+    await waitFor(() => worker.mock.calls.length === 1);
+    await workerHub.resume(arcRunId);
+    await waitFor(() => advanceInputs.length === 1);
+
+    expect(worker).toHaveBeenCalledTimes(2);
+    for (const [task] of worker.mock.calls)
+      expect((task as InstructionTask).briefIds).not.toEqual([
+        "second-instruction",
+      ]);
+    expect(advanceInputs).toEqual([
+      expect.objectContaining({ reports: [interrupt("external")] }),
+    ]);
   });
 });

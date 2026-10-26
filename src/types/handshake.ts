@@ -107,25 +107,38 @@ export type PendingHandshake = {
  * declines the candidates and activates a new run from the staged trigger
  * selection. A fresh run may also need `workspace` when the Arc's workspace
  * policy requires a client-supplied path.
+ *
+ * `decline: true` declines any pending handshake's activation branch. It is
+ * exclusive with answer fields and consumes the handshake without starting or
+ * joining a run. Other branches retain their current state.
  */
-export type HandshakeResolution = {
-  /** Absolute workspace path supplied by the client. */
-  workspace?: string;
-  /** Choice for a pending run-choice handshake. */
-  runChoice?: { action: "join"; arcRunId: ArcRunId } | { action: "fresh" };
-  /**
-   * Choice for a pending arc-choice handshake: `activate` proceeds to activate
-   * this arc (which may then require run-choice/workspace); otherwise the arc is
-   * declined and rejected.
-   */
-  arcChoice?: { activate: boolean };
-};
+export type HandshakeResolution =
+  | {
+      decline: true;
+      workspace?: never;
+      runChoice?: never;
+      arcChoice?: never;
+    }
+  | {
+      decline?: never;
+      /** Absolute workspace path supplied by the client. */
+      workspace?: string;
+      /** Choice for a pending run-choice handshake. */
+      runChoice?: { action: "join"; arcRunId: ArcRunId } | { action: "fresh" };
+      /**
+       * Choice for a pending arc-choice handshake: `activate` proceeds to activate
+       * this arc (which may then require run-choice/workspace); otherwise the arc is
+       * declined and rejected.
+       */
+      arcChoice?: { activate: boolean };
+    };
 
 /**
  * Connector-facing ack returned after resolving an activation handshake.
  *
- * `ok` means the resolve was accepted; the resulting activation (or a next-round
- * handshake) is delivered on the originating submission channel, not here.
+ * `ok` means the resolve was accepted; the resulting activation, join, rejection,
+ * or next-round handshake is delivered on the originating submission channel.
+ * Invalid answers leave the handshake pending; consumed ids return `missing`.
  */
 export type HandshakeReceipt =
   | { status: "missing" }

@@ -84,9 +84,11 @@ export function formatWorkEventText(event: WorkEvent): string {
     case "routine:started":
       return "Routine started";
     case "routine:finished":
-      return event.outcome === "deflected"
+      return event.disposition === "deflect"
         ? "Routine deflected"
-        : "Routine completed";
+        : event.disposition === "interrupt"
+          ? "Routine interrupted"
+          : "Routine completed";
     case "routine:failed":
       return "Routine failed";
     case "routine:skipped":
@@ -198,7 +200,7 @@ export function formatWorkEventOutcome(event: WorkEvent): string | undefined {
     case "routine:finished":
     case "routine:failed":
     case "routine:skipped":
-      return event.outcome ?? event.error?.code;
+      return event.disposition ?? event.outcome ?? event.error?.code;
     case "routine:capacity-limited":
       return event.capacityReason.reason;
     case "routine:transport-lost":

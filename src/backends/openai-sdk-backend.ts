@@ -238,13 +238,14 @@ function buildInstructionPrompt(
     kind: "sandbox",
     sandboxRoot: WORKSPACE_SANDBOX_ROOT,
   });
-  const { text, audienceReferences } = rendered;
+  const { text, guidance, audienceReferences } = rendered;
   const parts = [
     `You are working as the "${task.role}" role.`,
     ...renderDialogPriming(task, shouldPrimeDialog),
     "",
     xmlBlock("instruction", text),
   ];
+  if (guidance !== undefined) parts.push("", xmlBlock("guidance", guidance));
   if (Object.keys(task.cells).length > 0) {
     parts.push("", xmlBlock("cells", JSON.stringify(task.cells, null, 2)));
   }
@@ -287,10 +288,15 @@ function buildSemanticPrompt(
       "semantic-requests",
       JSON.stringify(
         task.requests.map((request) =>
-          renderSemanticRequestForPrompt(request, context, {
-            kind: "sandbox",
-            sandboxRoot: WORKSPACE_SANDBOX_ROOT,
-          }),
+          renderSemanticRequestForPrompt(
+            request,
+            context,
+            {
+              kind: "sandbox",
+              sandboxRoot: WORKSPACE_SANDBOX_ROOT,
+            },
+            task.stage,
+          ),
         ),
         null,
         2,

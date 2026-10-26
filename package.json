@@ -1,10 +1,11 @@
 {
   "name": "@elem-app/arcade",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "files": [
-    "dist"
+    "dist",
+    "skills"
   ],
   "bin": {
     "arcade": "./dist/app.js"
@@ -27,11 +28,10 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "start": "pnpm build && node --env-file-if-exists=.env dist/app.js",
-    "postinstall": "pnpm -C web install",
     "typecheck": "tsc --noEmit && pnpm -C web run typecheck",
     "test": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run --project unit",
     "eval": "pnpm build && node --env-file-if-exists=.env dist/eval-main.js",
-    "prepare": "pnpm build"
+    "prepare": "pnpm -C web install --frozen-lockfile && pnpm build"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.150",
@@ -43,7 +43,7 @@
     "jsonc-parser": "^3.3.1",
     "openai": "^6.39.1",
     "zod": "^4.4.3",
-    "@elem-app/arc": "git+ssh://git@github.com/elem-app/arc.git#v0.9.0"
+    "@elem-app/arc": "git+ssh://git@github.com/elem-app/arc.git#v0.10.0"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

@@ -765,10 +765,6 @@ async function makeAskHub(
   workerHub.addBackend("custom-agent", backend);
   await workerHub.start({
     workers: { roles: { researcher: { backend: "custom-agent" } } },
-    scheduling: {
-      default: { concurrency: 4, maxQueueSize: 8 },
-      roles: { researcher: { concurrency: 4, maxQueueSize: 8 } },
-    },
   });
   return { workerHub, task, historyStore };
 }

@@ -597,6 +597,7 @@ describe("backend registry", () => {
     const warm = vi.fn();
     const triggerTask: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:fast-trigger-warm",
       role: instruction.role,
       stage: "trigger",
@@ -827,7 +828,7 @@ describe("backend registry", () => {
       "custom-agent",
       backend(["role"], () => ({
         disposeRoutine: async () => {},
-        run: async () => ({ outcome: "deflected" }),
+        run: async () => ({ outcome: "disposition", deflect: {} }),
       })),
     );
     await workerHub.start({
@@ -841,7 +842,8 @@ describe("backend registry", () => {
         expect.objectContaining({
           event: "worker_hub.routine.finished",
           reportDiscriminator: "outcome",
-          reportValue: "deflected",
+          reportValue: "disposition",
+          disposition: "deflect",
         }),
       ]),
     );

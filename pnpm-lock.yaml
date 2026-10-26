@@ -18,8 +18,8 @@ importers:
         specifier: 0.80.6
         version: 0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.0)(zod@4.4.3)
       '@elem-app/arc':
-        specifier: git+ssh://git@github.com/elem-app/arc.git#v0.9.0
-        version: https://codeload.github.com/elem-app/arc/tar.gz/1db4ee0bb9273be4b7c55e05acbce7cc1d52d787
+        specifier: git+ssh://git@github.com/elem-app/arc.git#v0.10.0
+        version: https://codeload.github.com/elem-app/arc/tar.gz/73d9d91164dbcf71417e5f95ce27484e3433705f
       '@js-temporal/polyfill':
         specifier: ^0.5.1
         version: 0.5.1
@@ -291,9 +291,9 @@ packages:
     engines: {node: '>=22.19.0'}
     hasBin: true
 
-  '@elem-app/arc@https://codeload.github.com/elem-app/arc/tar.gz/1db4ee0bb9273be4b7c55e05acbce7cc1d52d787':
-    resolution: {gitHosted: true, tarball: https://codeload.github.com/elem-app/arc/tar.gz/1db4ee0bb9273be4b7c55e05acbce7cc1d52d787}
-    version: 0.9.0
+  '@elem-app/arc@https://codeload.github.com/elem-app/arc/tar.gz/73d9d91164dbcf71417e5f95ce27484e3433705f':
+    resolution: {gitHosted: true, integrity: sha512-uZKprmtQwJ6ek+154VwnUPkIOeW8oWvn0j1y5V/TqVlTI8hk2DEivaIJLKeN8tDG27U76meQ4Hk2a+OqdUqqIg==, tarball: https://codeload.github.com/elem-app/arc/tar.gz/73d9d91164dbcf71417e5f95ce27484e3433705f}
+    version: 0.10.0
 
   '@emnapi/core@1.10.0':
     resolution: {integrity: sha512-yq6OkJ4p82CAfPl0u9mQebQHKPJkY7WrIuk205cTYnYe+k2Z8YBh11FrbRG/H6ihirqcacOgl2BIO8oyMQLeXw==}
@@ -2218,7 +2218,7 @@ snapshots:
       - ws
       - zod
 
-  '@elem-app/arc@https://codeload.github.com/elem-app/arc/tar.gz/1db4ee0bb9273be4b7c55e05acbce7cc1d52d787':
+  '@elem-app/arc@https://codeload.github.com/elem-app/arc/tar.gz/73d9d91164dbcf71417e5f95ce27484e3433705f':
     dependencies:
       acorn: 8.16.0
       acorn-walk: 8.3.5
@@ -2437,7 +2437,7 @@ snapshots:
     dependencies:
       '@hono/node-server': 1.19.14(hono@4.12.18)
       ajv: 8.20.0
-      ajv-formats: 3.0.1(ajv@8.20.0)
+      ajv-formats: 3.0.1
       content-type: 1.0.5
       cors: 2.8.6
       cross-spawn: 7.0.6
@@ -2725,8 +2725,8 @@ snapshots:
 
   agent-base@7.1.4: {}
 
-  ajv-formats@3.0.1(ajv@8.20.0):
-    optionalDependencies:
+  ajv-formats@3.0.1:
+    dependencies:
       ajv: 8.20.0
 
   ajv@8.20.0:

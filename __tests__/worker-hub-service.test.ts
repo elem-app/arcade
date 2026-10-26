@@ -21,7 +21,9 @@ describe("Worker hub worker selection", () => {
   it("routes an explicit role slot before an in-process registration", async () => {
     const { arcHost, task } = await firstTaskWithArcHost();
     const configured = vi.fn(async () => ({ outcome: "completed" }) as const);
-    const embedded = vi.fn(async () => ({ outcome: "deflected" }) as const);
+    const embedded = vi.fn(
+      async () => ({ outcome: "disposition", deflect: {} }) as const,
+    );
     const workerHub = createWorkerHub(arcHost);
     workerHub.addBackend(
       "configured-agent",
@@ -40,7 +42,9 @@ describe("Worker hub worker selection", () => {
 
   it("routes an in-process registration before the default worker slot", async () => {
     const { arcHost, task } = await firstTaskWithArcHost();
-    const fallback = vi.fn(async () => ({ outcome: "deflected" }) as const);
+    const fallback = vi.fn(
+      async () => ({ outcome: "disposition", deflect: {} }) as const,
+    );
     const embedded = vi.fn(async () => ({ outcome: "completed" }) as const);
     const workerHub = createWorkerHub(arcHost);
     workerHub.addBackend("default-agent", workerBackend(["default"], fallback));
@@ -203,7 +207,57 @@ describe("Worker hub worker selection", () => {
     expect(fast).not.toHaveBeenCalled();
   });
 
-  it("enforces one role limiter across two selected backends", async () => {
+  it("overlaps different roles and trigger action contexts on one shared default worker", async () => {
+    const { arcHost, task: instruction } = await firstTaskWithArcHost();
+    const inputs: RoutineInput[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const workerHub = createWorkerHub(arcHost);
+    let created = 0;
+    workerHub.addBackend("shared", {
+      supportedSlotKinds: new Set(["default"]),
+      createWorker: () => {
+        created++;
+        return {
+          disposeRoutine: async () => {},
+          run: async (input) => {
+            inputs.push(input);
+            await gate;
+            return { outcome: "completed" };
+          },
+        };
+      },
+    });
+    await workerHub.start({
+      workers: { default: { backend: "shared" }, fastTrigger: null },
+    });
+    const tasks: Task[] = [
+      instruction,
+      { ...instruction, role: "reviewer" },
+      { ...semanticTask(instruction, "trigger"), role: "trigger-reviewer" },
+    ];
+    const pending = tasks.map((task) =>
+      workerHub.handleTask(task, routineContext()),
+    );
+    try {
+      await vi.waitFor(() => expect(inputs).toHaveLength(3));
+      expect(created).toBe(1);
+      expect(
+        new Set(inputs.map((input) => input.routine.contextKey)).size,
+      ).toBe(3);
+      expect(inputs.map((input) => input.routine.role).sort()).toEqual(
+        tasks.map((task) => task.role).sort(),
+      );
+    } finally {
+      release();
+      await Promise.allSettled(pending);
+      await workerHub.stop();
+    }
+  });
+
+  it("allows same-role trigger and action work to overlap across selected backends", async () => {
     const { arcHost, task: instruction } = await firstTaskWithArcHost();
     let active = 0;
     let maximum = 0;
@@ -226,10 +280,6 @@ describe("Worker hub worker selection", () => {
         default: { backend: "ordinary-agent" },
         fastTrigger: { backend: "fast-agent" },
       },
-      scheduling: {
-        default: { concurrency: 1, maxQueueSize: 8 },
-        roles: { researcher: { concurrency: 1, maxQueueSize: 8 } },
-      },
     });
 
     const fast = workerHub.handleTask(
@@ -237,11 +287,11 @@ describe("Worker hub worker selection", () => {
       routineContext(),
     );
     const ordinary = workerHub.handleTask(instruction, routineContext());
-    await vi.waitFor(() => expect(active).toBe(1));
+    await vi.waitFor(() => expect(active).toBe(2));
     release();
     await Promise.all([fast, ordinary]);
 
-    expect(maximum).toBe(1);
+    expect(maximum).toBe(2);
   });
 });
 
@@ -288,6 +338,7 @@ function semanticTask(
 ): SemanticTask {
   return {
     kind: "semantic",
+    allowedDispositions: [],
     batchId: `semantic:routing:${stage}`,
     role: instruction.role,
     stage,

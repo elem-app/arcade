@@ -1,6 +1,6 @@
 import { parse } from "@elem-app/arc/parser";
 import { describe, expect, it } from "vitest";
-import { workEventsFor } from "./work-event-fixtures.js";
+import { moduleHubFor, workEventsFor } from "./work-event-fixtures.js";
 
 import {
   ArcHostService,
@@ -11,7 +11,13 @@ import {
   type ArcRunId,
   type ReplayStep,
 } from "../src/testing.js";
-import { firstActivation, makeWorkerHub, waitFor } from "./helpers.js";
+import {
+  firstActivation,
+  HOST_MODULE_DECLARATIONS,
+  hostModule,
+  makeWorkerHub,
+  waitFor,
+} from "./helpers.js";
 import {
   answeringWorker,
   makeReplayHost,
@@ -282,4 +288,155 @@ describe("replay lifecycle publication", () => {
       expect(await workEventsFor(host).list(runId)).toEqual(history);
     });
   });
+});
+
+it("replay.jump dispatches only changed work after a replayed instruction completion", async () => {
+  const { host, replay } = makeReplayHost();
+  const source = (next: string) =>
+    parse(`"arc";
+    function Main() {
+      this.trigger = () => true;
+      $instruct("A");
+      $instruct("${next}");
+    }`);
+  await host.registerArc("source", source("B"));
+  const dispatched: { run: string; texts: unknown[] }[] = [];
+  const { workerHub } = makeWorkerHub({
+    arcHost: host,
+    workers: {
+      [DEFAULT_WORKER_ROLE]: async (task, ...rest) => {
+        if (task.kind === "instruction")
+          dispatched.push({ run: task.arcRunId, texts: [...task.texts] });
+        return answeringWorker(task, ...rest);
+      },
+    },
+  });
+  try {
+    const sourceRun = await firstActivation(
+      workerHub.submitInbound({
+        content: "start",
+        metadata: { principal: REPLAY_OWNER },
+      }),
+    );
+    await waitFor(async () => {
+      const view = await host.getRunView(sourceRun);
+      return view?.stage === "actioning" && view.lifecycle === "completed";
+    });
+    const before = await host.getRunView(sourceRun);
+    await host.registerArc("candidate", source("C"));
+    const jumped = await host.jump(sourceRun, "arc:candidate:Main");
+    if (jumped.status !== "compatible") throw new Error(jumped.reason);
+    expect(jumped.handoff).toBe("diverged");
+    const saved = await replay.listSteps(jumped.arcRunId);
+    expect(saved.filter((step) => step.kind === "action-report")).toHaveLength(
+      1,
+    );
+    await workerHub.requestPause(jumped.arcRunId);
+    expect(await workerHub.resume(jumped.arcRunId)).toMatchObject({
+      outcome: "resumed",
+    });
+    await waitFor(async () => {
+      const view = await host.getRunView(jumped.arcRunId);
+      return view?.stage === "actioning" && view.lifecycle === "completed";
+    });
+    expect(
+      dispatched
+        .filter((item) => item.run === jumped.arcRunId)
+        .flatMap((item) => item.texts),
+    ).toEqual(["C"]);
+    expect(
+      dispatched
+        .filter((item) => item.run === sourceRun)
+        .flatMap((item) => item.texts),
+    ).toEqual(["A", "B"]);
+    expect(await host.getRunView(sourceRun)).toEqual(before);
+  } finally {
+    await workerHub.stop();
+    await host.stop();
+  }
+});
+
+it("replay.jump never repeats a completed host operation when the following instruction changes", async () => {
+  const { host } = makeReplayHost();
+  let executions = 0;
+  const opaqueData = {
+    ref: "node:source:Main",
+    nested: ["arc:source:Main"],
+  };
+  const audit = hostModule(
+    moduleHubFor(host),
+    HOST_MODULE_DECLARATIONS.stringAppendEffect,
+    () => {
+      executions += 1;
+    },
+  );
+  host.registerHostModule("audit", {
+    ...audit,
+    submit: async (...args) =>
+      (await audit.submit!(...args)).map((ack) => ({
+        ...ack,
+        moduleData: opaqueData,
+      })),
+  });
+  const arc = (next: string) =>
+    parse(
+      `"arc"; import Audit from "host:audit"; function Main() { this.trigger = () => true; Audit.records.$append("A"); $instruct("${next}"); }`,
+    );
+  await host.registerArc("source", arc("B"));
+  const dispatched: { run: string; texts: unknown[] }[] = [];
+  const { workerHub } = makeWorkerHub({
+    arcHost: host,
+    workers: {
+      [DEFAULT_WORKER_ROLE]: async (task, ...rest) => {
+        if (task.kind === "instruction")
+          dispatched.push({ run: task.arcRunId, texts: [...task.texts] });
+        return answeringWorker(task, ...rest);
+      },
+    },
+  });
+  try {
+    const run = await firstActivation(
+      workerHub.submitInbound({
+        content: "start",
+        metadata: { principal: REPLAY_OWNER },
+      }),
+    );
+    await waitFor(async () => {
+      const view = await host.getRunView(run);
+      return view?.stage === "actioning" && view.lifecycle === "completed";
+    });
+    expect(executions).toBe(1);
+    await host.registerArc("candidate", arc("C"));
+    await host.verifyReplay(run, "arc:candidate:Main");
+    const jumped = await host.jump(run, "arc:candidate:Main");
+    if (jumped.status !== "compatible") throw new Error(jumped.reason);
+    expect(
+      handoffCheckpoint(jumped.regenerated).hostModules.calls,
+    ).toHaveLength(1);
+    expect(
+      handoffCheckpoint(jumped.regenerated).hostModules.calls[0]!.effects,
+    ).toHaveLength(1);
+    expect(
+      handoffCheckpoint(jumped.regenerated).hostModules.calls[0]!.call,
+    ).toMatchObject({
+      sourceRef: "node:candidate:Main",
+      moduleData: opaqueData,
+    });
+    expect(executions).toBe(1);
+    await workerHub.requestPause(jumped.arcRunId);
+    await workerHub.resume(jumped.arcRunId);
+    await waitFor(async () => {
+      const view = await host.getRunView(jumped.arcRunId);
+      return view?.stage === "actioning" && view.lifecycle === "completed";
+    });
+    expect(
+      dispatched
+        .filter((item) => item.run === jumped.arcRunId)
+        .flatMap((item) => item.texts),
+    ).toEqual(["C"]);
+    expect(executions).toBe(1);
+  } finally {
+    await workerHub.stop();
+    await host.stop();
+  }
 });

@@ -186,5 +186,38 @@ function Main() {
 
 /** The shared observation scenario corpus. */
 export function observationCases(): ObservationCase[] {
-  return [GROUPED_OBSERVATION, ARRAY_OBSERVATION, GROUPED_ASK];
+  return [
+    GROUPED_OBSERVATION,
+    ARRAY_OBSERVATION,
+    GROUPED_ASK,
+    GUIDED_OBSERVATION,
+  ];
 }
+
+const GUIDED_OBSERVATION: ObservationCase = {
+  name: "standing-guidance-observation",
+  inbound:
+    "Current record: service=checkout-api, severity=high. Archived record: service=ledger-api, severity=low. Prepare the selected incident record.",
+  arcSource: `
+"arc";
+function Main() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "writer" };
+  this.guidance = \`For this workflow, selected always means the archived record. Extract both fields from that record, even when the current record describes a more severe incident.\`;
+  let severity = Enum(["low", "high"], { observing: \`the selected incident severity\` });
+  let service = Str({ observing: \`the selected service name\` });
+  let selected = Artifact("selected.md");
+  let other = Artifact("other.md");
+  $observe({ severity, service });
+  if (severity == "low") {
+    $instruct(\`Create \${selected} with exactly this one line: service=\${service};severity=\${severity}\`);
+  } else {
+    $instruct(\`Create \${other} with exactly this one line: service=\${service};severity=\${severity}\`);
+  }
+}
+`,
+  observed: { severity: "low", service: "ledger-api" },
+  artifact: "selected.md",
+  requiredArtifactFacts: ["service=ledger-api;severity=low"],
+  unselectedArtifact: "other.md",
+};

@@ -19,7 +19,7 @@ Arcade runs Arc scripts as durable, agent-oriented workflows. Use it when work n
 - **Human interaction:** route asks, answers, permission decisions, and outbound messages through connector inboxes.
 - **Replay tools:** inspect, rewind, jump, and verify replay behavior for recorded runs.
 - **Workspace discovery:** scan configured working roots for Arcade workspaces and register discovered Arc bundles.
-- **Configurable operation:** configure storage, connectors, worker-slot bindings, Arc directories, and hub scheduling through the Arcade config file; programmatic builders can register additional backend implementations.
+- **Configurable operation:** configure storage, connectors, worker-slot bindings, and Arc directories through the Arcade config file; programmatic builders can register additional backend implementations.
 
 ## Get Started
 

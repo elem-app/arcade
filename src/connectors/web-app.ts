@@ -1191,6 +1191,17 @@ function readHandshakeResolution(
   const input = "values" in value ? value.values : value;
   if (typeof input !== "object" || input === null) return undefined;
 
+  if ("decline" in input) {
+    if (
+      input.decline !== true ||
+      "workspace" in input ||
+      "runChoice" in input ||
+      "arcChoice" in input
+    )
+      return undefined;
+    return { decline: true };
+  }
+
   const resolution: HandshakeResolution = {};
   if ("workspace" in input) {
     if (typeof input.workspace !== "string") return undefined;
@@ -1216,6 +1227,17 @@ function readHandshakeResolution(
     } else {
       return undefined;
     }
+  }
+  if ("arcChoice" in input) {
+    const arcChoice = input.arcChoice;
+    if (
+      typeof arcChoice !== "object" ||
+      arcChoice === null ||
+      !("activate" in arcChoice) ||
+      typeof arcChoice.activate !== "boolean"
+    )
+      return undefined;
+    resolution.arcChoice = { activate: arcChoice.activate };
   }
   return resolution;
 }

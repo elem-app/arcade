@@ -507,7 +507,7 @@ export class ClaudeSdkTstWorker implements Worker {
       promptSuggestions: false,
       settingSources: [],
       skills: [],
-      systemPrompt: buildSemanticSystemPrompt(),
+      systemPrompt: buildSemanticSystemPrompt("trigger"),
       tools: [],
       outputFormat: {
         type: "json_schema",

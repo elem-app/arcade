@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { moduleHubFor } from "./work-event-fixtures.js";
 
 import { parse } from "@elem-app/arc/parser";
+import { Runtime } from "@elem-app/arc/runtime";
 import type {
   ArcTraversal,
   ArcTraversalSet,
@@ -17,10 +18,12 @@ import { catchSegKey } from "@elem-app/arc/types";
 import { describe, expect, it } from "vitest";
 
 import {
+  alignActionReplay,
   assertShapePreserved,
   createReplayIso,
   traversalsEqualModuloIso,
 } from "../src/service/replay-verify.js";
+import { stripBrief } from "../src/types/replay.js";
 
 import {
   arcRunKey,
@@ -138,6 +141,116 @@ describe("exact self-replay (determinism anchor)", () => {
     expect(handoffCheckpoint(alignment.regenerated).traversals).toEqual(
       finalCheckpoint.traversals,
     );
+  });
+});
+
+describe("guidance replay equivalence", () => {
+  const work = [
+    { name: "judgment", body: 'if (judge("Ready?")) {}' },
+    { name: "observation", body: "$observe(ready);" },
+    { name: "observation group", body: "$observe({ ready, other });" },
+    { name: "host call", body: 'Audit.records.$append("record");' },
+    { name: "instruction", body: '$instruct("Work.");' },
+  ];
+
+  function runtimeFor(body: string, guidance?: string): Runtime {
+    return new Runtime({
+      hostModules: new Map([
+        ["audit", HOST_MODULE_DECLARATIONS.stringAppendEffect],
+      ]),
+    })
+      .add(
+        "guided-replay",
+        parse(`"arc";
+import Audit from "host:audit";
+function Main() {
+  this.trigger = () => true;
+  ${guidance === undefined ? "" : `this.guidance = ${guidance};`}
+  let ready = Bool();
+  let other = Bool();
+  ${body}
+}`),
+      )
+      .init();
+  }
+
+  function replay(
+    body: string,
+    before: string | undefined,
+    after: string | undefined,
+  ) {
+    const runtime = runtimeFor(body, before);
+    const dialog = userDialog("ready");
+    const seed = runtime.startTrigger([], dialog).traversals;
+    const first = runtime.start(seed, dialog);
+    if (!first.canProgress) throw new Error("Expected guided work");
+    const position = {
+      stage: "action",
+      index: 1,
+      reactivationCount: 0,
+    } as const;
+    return alignActionReplay({
+      snapshotRuntime: runtimeFor(body, after),
+      seedTraversals: seed,
+      iso: createReplayIso(),
+      reactivationCount: 0,
+      steps: [
+        { kind: "action-brief", position, dialog, brief: stripBrief(first) },
+      ],
+      checkpoints: [
+        {
+          position: { ...position, index: 0 },
+          traversals: seed,
+          hostModules: { calls: [] },
+        },
+        { position, traversals: first.traversals, hostModules: { calls: [] } },
+      ],
+    });
+  }
+
+  function expectGuidanceHandoff(result: ReturnType<typeof replay>): void {
+    expect(result).toMatchObject({
+      status: "compatible",
+      handoff: "diverged",
+      regeneratedSteps: [
+        {
+          kind: "action-brief",
+          position: { stage: "action", index: 1, reactivationCount: 0 },
+        },
+      ],
+      regeneratedCheckpoints: [
+        { position: { stage: "action", index: 0, reactivationCount: 0 } },
+        { position: { stage: "action", index: 1, reactivationCount: 0 } },
+      ],
+    });
+  }
+
+  it.each(work)(
+    "replay guidance changes diverge before accepting $name work",
+    ({ body }) => {
+      expect(
+        replay(body, '"Original policy."', '"Original policy."'),
+      ).toMatchObject({
+        status: "compatible",
+        handoff: "reproduced",
+      });
+      for (const guidance of [
+        '"Changed policy."',
+        "`Address ${user}.`",
+        undefined,
+      ]) {
+        expectGuidanceHandoff(replay(body, '"Original policy."', guidance));
+      }
+    },
+  );
+
+  it("replay guidance distinguishes an empty declaration from absent guidance", () => {
+    for (const [before, after] of [
+      [undefined, '""'],
+      ['""', undefined],
+    ] as const) {
+      expectGuidanceHandoff(replay('$instruct("Work.");', before, after));
+    }
   });
 });
 
@@ -735,13 +848,14 @@ describe("a fanned-out run diverges mid-body against an edited arc", () => {
     expect(alignment.handoff).toBe("diverged");
     expect(handoffCheckpoint(alignment.regenerated).position).toEqual({
       stage: "action",
-      index: 1,
+      index: 2,
       reactivationCount: 0,
     });
     const steps = alignment.regenerated.actionSteps;
     expect(hasStep(steps, "action-brief", 1)).toBe(true);
     expect(hasStep(steps, "action-report", 1)).toBe(true);
-    expect(hasStep(steps, "action-brief", 2)).toBe(false);
+    expect(hasStep(steps, "action-brief", 2)).toBe(true);
+    expect(hasStep(steps, "action-report", 2)).toBe(false);
   });
 });
 
@@ -833,16 +947,17 @@ describe("mid-stream action divergence", () => {
 
     // The judge at brief 1 reproduces (brief + report regenerated); the changed
     // instruction at brief 2 is where the candidate parts, so the handoff
-    // installs at checkpoint 1.
+    // installs at the candidate checkpoint 2.
     expect(handoffCheckpoint(alignment.regenerated).position).toEqual({
       stage: "action",
-      index: 1,
+      index: 2,
       reactivationCount: 0,
     });
     const steps = alignment.regenerated.actionSteps;
     expect(hasStep(steps, "action-brief", 1)).toBe(true);
     expect(hasStep(steps, "action-report", 1)).toBe(true);
-    expect(hasStep(steps, "action-brief", 2)).toBe(false);
+    expect(hasStep(steps, "action-brief", 2)).toBe(true);
+    expect(hasStep(steps, "action-report", 2)).toBe(false);
   });
 });
 
@@ -887,7 +1002,7 @@ function Greet() {
 // `alignActionReplay` is a defensive guard: a trigger-matching candidate reaching
 // a different checkpoint 0 could not be constructed through this vector.
 describe("trigger matches but the body differs", () => {
-  it("holds checkpoint 0 and treats the body change as a brief-1 divergence", async () => {
+  it("retains candidate output 1 when the body diverges immediately", async () => {
     const { env, runId } = await recordedGreetRun();
     await env.host.registerArc("greet2", parse(SAME_TRIGGER_DIFFERENT_BODY));
 
@@ -901,7 +1016,7 @@ describe("trigger matches but the body differs", () => {
     expect(alignment.handoff).toBe("diverged");
     expect(handoffCheckpoint(alignment.regenerated).position).toEqual({
       stage: "action",
-      index: 0,
+      index: 1,
       reactivationCount: 0,
     });
   });

@@ -564,26 +564,37 @@ export class McpConnector implements Connector {
       {
         title: "Resolve Activation Handshake",
         description:
-          "Provides values requested by a pending activation handshake so the matching Arc run can proceed.",
+          "Provides values requested by a pending activation handshake, or declines that activation with { decline: true }.",
         inputSchema: {
           /** Handshake ID. */
           id: z.string(),
-          values: z.object({
-            /** Workspace path provided for workspache handshake. */
-            workspace: z.string().optional(),
-            /** Run behavior selected for run-choice handshake. */
-            runChoice: z
-              .union([
-                z.object({
-                  action: z.literal("join"),
-                  arcRunId: z.string(),
-                }),
-                z.object({ action: z.literal("fresh") }),
-              ])
-              .optional(),
-            /** Activate-or-decline selected for an arc-choice handshake. */
-            arcChoice: z.object({ activate: z.boolean() }).optional(),
-          }),
+          // Declare forbidden fields so parsing cannot strip a mixed answer
+          // into a valid decline or ordinary resolution.
+          values: z.union([
+            z.object({
+              decline: z.literal(true),
+              workspace: z.never().optional(),
+              runChoice: z.never().optional(),
+              arcChoice: z.never().optional(),
+            }),
+            z.object({
+              decline: z.never().optional(),
+              /** Workspace path provided for workspace handshake. */
+              workspace: z.string().optional(),
+              /** Run behavior selected for run-choice handshake. */
+              runChoice: z
+                .union([
+                  z.object({
+                    action: z.literal("join"),
+                    arcRunId: z.string(),
+                  }),
+                  z.object({ action: z.literal("fresh") }),
+                ])
+                .optional(),
+              /** Activate-or-decline selected for an arc-choice handshake. */
+              arcChoice: z.object({ activate: z.boolean() }).optional(),
+            }),
+          ]),
         },
       },
       async ({ id, values }, extra) => {

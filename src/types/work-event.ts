@@ -4,7 +4,7 @@ import type { ArcRunId } from "./core.js";
 import type { CapacityLimit, TransportLoss } from "./execution-control.js";
 import type { HandshakeOutcome } from "./handshake.js";
 import type { ToolEventInput } from "./routine.js";
-import type { InstructionIssue } from "./task.js";
+import type { InstructionIssue, TaskDisposition } from "./task.js";
 import type { RoutineTokenUsage } from "./token-usage.js";
 import type { BackendName } from "./worker-slot.js";
 
@@ -28,7 +28,9 @@ export type RoutineEvent = RoutineEventEnvelope &
   (
     | {
         kind: `routine:${"started" | "finished" | "failed" | "skipped"}`;
-        outcome?: "completed" | "deflected";
+        outcome?: "completed" | "disposition";
+        /** Which disposition a `disposition` outcome reported. */
+        disposition?: TaskDisposition;
         error?: { code: string; message: string };
       }
     | {

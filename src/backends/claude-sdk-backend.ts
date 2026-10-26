@@ -162,13 +162,14 @@ function buildInstructionPrompt(
   const rendered = renderInstructionTaskTextForPrompt(task, context, {
     kind: "host",
   });
-  const { text, audienceReferences } = rendered;
+  const { text, guidance, audienceReferences } = rendered;
   const parts = [
     `You are working as the "${task.role}" role.`,
     ...renderDialogPriming(task, shouldPrimeDialog),
     "",
     xmlBlock("instruction", text),
   ];
+  if (guidance !== undefined) parts.push("", xmlBlock("guidance", guidance));
   if (Object.keys(task.cells).length > 0) {
     parts.push("", xmlBlock("cells", JSON.stringify(task.cells, null, 2)));
   }
@@ -215,7 +216,12 @@ function buildSemanticPrompt(
       "semantic-requests",
       JSON.stringify(
         task.requests.map((request) =>
-          renderSemanticRequestForPrompt(request, context, { kind: "host" }),
+          renderSemanticRequestForPrompt(
+            request,
+            context,
+            { kind: "host" },
+            task.stage,
+          ),
         ),
         null,
         2,
@@ -330,8 +336,7 @@ class ClaudeSdkLiveSession {
   #closed = false;
   #tail: Promise<void> = Promise.resolve();
   signal: RoutineSignal | undefined;
-  owner?: Parameters<Worker["disposeRoutine"]>[0];
-  lastUsedAt = Date.now();
+  owner: Parameters<Worker["disposeRoutine"]>[0];
 
   constructor(input: {
     sessionKey: string;
@@ -341,6 +346,7 @@ class ClaudeSdkLiveSession {
     prompt: AsyncSdkUserMessageQueue;
     query: Query;
     model: string;
+    owner: Parameters<Worker["disposeRoutine"]>[0];
   }) {
     this.sessionKey = input.sessionKey;
     this.cwd = input.cwd;
@@ -350,10 +356,7 @@ class ClaudeSdkLiveSession {
     this.#query = input.query;
     this.#iterator = input.query[Symbol.asyncIterator]();
     this.#model = input.model;
-  }
-
-  touch(): void {
-    this.lastUsedAt = Date.now();
+    this.owner = input.owner;
   }
 
   async setModel(model: string): Promise<void> {
@@ -370,7 +373,6 @@ class ClaudeSdkLiveSession {
     if (this.#closed) {
       throw new Error("Claude SDK session is closed.");
     }
-    this.touch();
     this.signal = undefined;
     this.#prompt.push(sdkUserMessage(prompt));
     return this.#collectTurn(checkSignal, onMessage);
@@ -698,7 +700,6 @@ export type ClaudeSdkRoutineOptions = {
 
 export type ClaudeSdkSessionCacheOptions = {
   enabled?: boolean;
-  maxLiveSessions?: number;
   maxPreparedStarts?: number;
   idleTtlMs?: number;
   initializeTimeoutMs?: number;
@@ -708,7 +709,6 @@ type NormalizedSessionCacheOptions = Required<ClaudeSdkSessionCacheOptions>;
 
 const DEFAULT_SESSION_CACHE: NormalizedSessionCacheOptions = {
   enabled: true,
-  maxLiveSessions: 16,
   maxPreparedStarts: 4,
   idleTtlMs: 300000,
   initializeTimeoutMs: 30000,
@@ -730,7 +730,6 @@ const ClaudeWorkerSlotSchema = createWorkerSlotSchema({
   sessionCache: z
     .strictObject({
       enabled: z.boolean().optional(),
-      maxLiveSessions: OptionalPositiveIntegerSchema,
       maxPreparedStarts: OptionalNonNegativeIntegerSchema,
       idleTtlMs: OptionalPositiveIntegerSchema,
       initializeTimeoutMs: OptionalPositiveIntegerSchema,
@@ -905,6 +904,7 @@ type PreparedStart = {
 };
 
 type ClaudeSdkRunInput = {
+  owner: Parameters<Worker["disposeRoutine"]>[0];
   sessionKey: string;
   cwd: string;
   renderContext: RoutineContext;
@@ -916,7 +916,7 @@ type ClaudeSdkRunInput = {
 
 type LiveSessionAcquisition = {
   session: ClaudeSdkLiveSession;
-  cacheHit: boolean;
+  liveSessionReused: boolean;
   preparedStartUsed: boolean;
 };
 
@@ -948,6 +948,7 @@ export class ClaudeSdkWorker implements Worker {
   readonly #liveSessions = new Map<string, ClaudeSdkLiveSession>();
   readonly #preparedStarts = new Map<string, PreparedStart>();
   readonly #grantsBySession = new Map<string, PermissionGrant[]>();
+  #stopped = false;
 
   constructor(options: ClaudeSdkBackendTestOptions) {
     this.#options = {
@@ -970,7 +971,8 @@ export class ClaudeSdkWorker implements Worker {
   clearSession(sessionKey: string): void {
     this.#sessions.delete(sessionKey);
     this.#grantsBySession.delete(sessionKey);
-    this.#evictLiveSession(sessionKey);
+    const session = this.#liveSessions.get(sessionKey);
+    if (session) this.#closeLiveSession(session);
     for (const [key, entry] of this.#preparedStarts) {
       if (entry.sessionKey !== sessionKey) continue;
       this.#closePreparedStart(entry);
@@ -983,16 +985,17 @@ export class ClaudeSdkWorker implements Worker {
   ): Promise<void> {
     if (this.#retryStates.get(input.routineId)?.arcRunId === input.arcRunId)
       this.#retryStates.delete(input.routineId);
-    for (const [key, session] of this.#liveSessions) {
+    for (const session of this.#liveSessions.values()) {
       if (
-        session.owner?.routineId === input.routineId &&
+        session.owner.routineId === input.routineId &&
         session.owner.arcRunId === input.arcRunId
       )
-        this.#evictLiveSession(key);
+        this.#closeLiveSession(session);
     }
   }
 
   async stop(): Promise<void> {
+    this.#stopped = true;
     this.#retryStates.clear();
     for (const session of this.#liveSessions.values()) session.close();
     this.#liveSessions.clear();
@@ -1004,12 +1007,13 @@ export class ClaudeSdkWorker implements Worker {
 
   async prepareWarmStart(input: WorkerWarmupInput): Promise<void> {
     if (
+      this.#stopped ||
       !this.#sessionCache.enabled ||
       this.#sessionCache.maxPreparedStarts === 0
     ) {
       return;
     }
-    this.#sweepCache();
+    this.#sweepPreparedStarts();
     const sessionKey = input.contextKey;
     const cwd = this.#options.cwd ?? input.workspacePath;
     const live = this.#liveSessions.get(sessionKey);
@@ -1089,7 +1093,8 @@ export class ClaudeSdkWorker implements Worker {
     cacheEnabled: boolean,
     sessionResume: ClaudeSdkSessionResume | undefined,
   ): Promise<RoutineReport> {
-    this.#sweepCache();
+    if (this.#stopped) throw new Error("Claude SDK worker is stopped.");
+    this.#sweepPreparedStarts();
     const input = this.#buildRunInput(routine, context, sessionResume);
     const retry = this.#retryStates.get(routine.id);
     if (retry) {
@@ -1134,10 +1139,13 @@ export class ClaudeSdkWorker implements Worker {
       await logToolEvent(event);
     };
     let timedOut = false;
+    let session: ClaudeSdkLiveSession | undefined;
+    const closeOwnedSession = () => {
+      if (session?.owner === input.owner) this.#closeLiveSession(session);
+    };
     const timeout = setTimeout(() => {
       timedOut = true;
-      const session = this.#liveSessions.get(sessionKey);
-      session?.close();
+      closeOwnedSession();
     }, timeoutMs);
     timeout.unref?.();
 
@@ -1148,7 +1156,7 @@ export class ClaudeSdkWorker implements Worker {
       cwd,
       model,
       sessionCacheEnabled: cacheEnabled,
-      sessionCacheHit: false,
+      liveSessionReused: false,
       preparedStartUsed: false,
     };
 
@@ -1195,14 +1203,21 @@ export class ClaudeSdkWorker implements Worker {
       await effects.recordTokenUsage(tokenUsage);
       tokenUsageRecorded = true;
     };
-    let session: ClaudeSdkLiveSession | undefined;
     let acquisition: LiveSessionAcquisition | undefined;
     let signal: RoutineSignal | undefined;
     try {
       acquisition = await this.#getLiveSession(input);
       session = acquisition.session;
+      backendDetails = {
+        ...backendDetails,
+        liveSessionReused: acquisition.liveSessionReused,
+        preparedStartUsed: acquisition.preparedStartUsed,
+      };
+      if (timedOut) {
+        closeOwnedSession();
+        throw new Error(`Claude SDK timed out after ${timeoutMs}ms.`);
+      }
       await session.runExclusive(async () => {
-        session!.owner = { arcRunId: routine.arcRunId, routineId: routine.id };
         session!.holder.current = workerCtx;
         try {
           await session!.setModel(model);
@@ -1216,7 +1231,6 @@ export class ClaudeSdkWorker implements Worker {
           await session!.runPrompt(prompt, effects.checkSignal, observeMessage);
           await diagnostics.writeJson("sdk-messages", transcript);
           if (session!.signal) {
-            session!.touch();
             signal = session!.signal;
             return;
           }
@@ -1249,7 +1263,6 @@ export class ClaudeSdkWorker implements Worker {
             );
             await diagnostics.writeJson("sdk-messages", transcript);
             if (session!.signal) {
-              session!.touch();
               signal = session!.signal;
               return;
             }
@@ -1286,7 +1299,6 @@ export class ClaudeSdkWorker implements Worker {
               cwd,
             });
           }
-          session!.touch();
           backendDetails = {
             backend: "claude-sdk",
             sessionKey,
@@ -1296,7 +1308,7 @@ export class ClaudeSdkWorker implements Worker {
             cwd,
             model,
             sessionCacheEnabled: cacheEnabled,
-            sessionCacheHit: acquisition!.cacheHit,
+            liveSessionReused: acquisition!.liveSessionReused,
             preparedStartUsed: acquisition!.preparedStartUsed,
             ...(result.resultSubtype !== undefined
               ? { resultSubtype: result.resultSubtype }
@@ -1341,9 +1353,10 @@ export class ClaudeSdkWorker implements Worker {
       }
       await recordTranscriptTokenUsage();
       this.#retryStates.delete(routine.id);
-      if (!cacheEnabled) this.#evictLiveSession(sessionKey);
+      if (!cacheEnabled) closeOwnedSession();
       return withBackendDetails(report, backendDetails);
     } catch (error) {
+      closeOwnedSession();
       await recordTranscriptTokenUsage();
       if ((await effects.checkSignal())?.kind === "cancel") {
         await this.disposeRoutine({
@@ -1355,7 +1368,6 @@ export class ClaudeSdkWorker implements Worker {
           backendDetails,
         );
       }
-      this.#evictLiveSession(sessionKey);
       const continuation = this.#retryStates.get(routine.id);
       if (continuation) continuation.report = report;
       const failure = timedOut
@@ -1426,6 +1438,7 @@ export class ClaudeSdkWorker implements Worker {
     const model = selected?.model ?? this.#options.model;
     const timeoutMs = selected?.timeoutMs ?? this.#options.timeoutMs;
     return {
+      owner: { arcRunId: routine.arcRunId, routineId: routine.id },
       sessionKey,
       cwd,
       renderContext,
@@ -1474,12 +1487,11 @@ export class ClaudeSdkWorker implements Worker {
     const existing = this.#liveSessions.get(input.sessionKey);
     if (existing) {
       if (existing.cwd === input.cwd) {
-        this.#liveSessions.delete(input.sessionKey);
-        this.#liveSessions.set(input.sessionKey, existing);
-        existing.touch();
+        // Transfer ownership before returning across the acquisition boundary.
+        existing.owner = input.owner;
         return {
           session: existing,
-          cacheHit: true,
+          liveSessionReused: true,
           preparedStartUsed: false,
         };
       }
@@ -1491,15 +1503,18 @@ export class ClaudeSdkWorker implements Worker {
         storedCwd: existing.cwd,
         cwd: input.cwd,
       });
-      this.#evictLiveSession(input.sessionKey);
+      this.#closeLiveSession(existing);
     }
     const prepared = await this.#consumePreparedStart(input);
     const session = prepared ?? this.#createColdLiveSession(input);
+    if (this.#stopped) {
+      session.close();
+      throw new Error("Claude SDK worker is stopped.");
+    }
     this.#liveSessions.set(input.sessionKey, session);
-    this.#enforceLiveSessionLimit();
     return {
       session,
-      cacheHit: false,
+      liveSessionReused: false,
       preparedStartUsed: prepared !== undefined,
     };
   }
@@ -1517,6 +1532,7 @@ export class ClaudeSdkWorker implements Worker {
       const warm = await entry.promise;
       const sdkQuery = warm.query(prompt);
       return new ClaudeSdkLiveSession({
+        owner: input.owner,
         sessionKey: input.sessionKey,
         cwd: input.cwd,
         holder: entry.holder,
@@ -1551,6 +1567,7 @@ export class ClaudeSdkWorker implements Worker {
       }),
     }) as Query;
     return new ClaudeSdkLiveSession({
+      owner: input.owner,
       sessionKey: input.sessionKey,
       cwd: input.cwd,
       holder,
@@ -1561,36 +1578,19 @@ export class ClaudeSdkWorker implements Worker {
     });
   }
 
-  #evictLiveSession(sessionKey: string): void {
-    const session = this.#liveSessions.get(sessionKey);
-    if (!session) return;
+  #closeLiveSession(session: ClaudeSdkLiveSession): void {
     session.close();
-    this.#liveSessions.delete(sessionKey);
+    if (this.#liveSessions.get(session.sessionKey) === session)
+      this.#liveSessions.delete(session.sessionKey);
   }
 
-  #sweepCache(): void {
+  #sweepPreparedStarts(): void {
     const now = Date.now();
-    for (const [key, session] of this.#liveSessions) {
-      if (now - session.lastUsedAt > this.#sessionCache.idleTtlMs) {
-        session.close();
-        this.#liveSessions.delete(key);
-      }
-    }
     for (const [key, entry] of this.#preparedStarts) {
       if (now - entry.createdAt > this.#sessionCache.idleTtlMs) {
         this.#closePreparedStart(entry);
         this.#preparedStarts.delete(key);
       }
-    }
-  }
-
-  #enforceLiveSessionLimit(): void {
-    while (this.#liveSessions.size > this.#sessionCache.maxLiveSessions) {
-      const oldest = this.#liveSessions.keys().next().value as
-        | string
-        | undefined;
-      if (!oldest) return;
-      this.#evictLiveSession(oldest);
     }
   }
 

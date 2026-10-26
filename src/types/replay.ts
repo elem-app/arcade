@@ -161,20 +161,20 @@ export type ReplayIso = {
   briefIds: BiMap<BriefId, BriefId>;
 };
 
-/** The verified candidate-refs prefix the fork persists as its own replay data. */
+/** Candidate history through the handoff checkpoint persisted by a successor. */
 export type RegeneratedReplay = {
   /** Regenerated trigger stream that selected the candidate. */
   triggerSteps: TriggerReplayStep[];
-  /** Action outputs through the fork point; reports only for indexes < forkPoint. */
+  /** Action history ending at the selected pre-report boundary. */
   actionSteps: ActionReplayStep[];
-  /** Regenerated action checkpoints 0..forkPoint. */
+  /** Regenerated checkpoints for every accepted episode through the continuation. */
   checkpoints: ReplayCheckpoint[];
 };
 
 /**
  * The checkpoint where a compatible replay hands off to live execution: a fork
- * installs here and resumes. Its `position` is the fork point and its
- * `traversals` is the installable pre-report state, in candidate refs.
+ * installs here and resumes. Its position, traversals, and host module state
+ * describe the candidate continuation reached by the replayed prefix.
  */
 export function handoffCheckpoint(
   regenerated: RegeneratedReplay,
@@ -188,8 +188,9 @@ export function handoffCheckpoint(
 
 /**
  * The verdict on a candidate that reproduced the run's first checkpoint (the
- * activation seed traversal set). Once that checkpoint matches, the action
- * stream never fails; every candidate hands off with one of these.
+ * activation seed traversal set). Once that checkpoint matches, candidate
+ * divergence hands off with one of these verdicts. Invalid recordings and
+ * unexpected runtime failures remain errors.
  *
  * - `reproduced`: the candidate reproduces the recorded run in full, to the end
  *   of the recording or to a requested `untilPosition`.

@@ -166,6 +166,7 @@ async function makeOpenAiHubWithReport(report: unknown) {
 function semanticTask(): Task {
   return {
     kind: "semantic",
+    allowedDispositions: [],
     batchId: "semantic:tst-validation",
     role: "researcher",
     stage: "trigger",

@@ -64,6 +64,77 @@ afterEach(async () => {
 });
 
 describe("McpConnector", () => {
+  it.each(["workspace", "run-choice", "arc-choice"] as const)(
+    "accepts MCP decline for %s after rejecting mixed and malformed decisions",
+    async (kind) => {
+      const workerHub = new StubWorkerHub();
+      const channel = new HotAsyncQueue<InboundLifecycleEvent>();
+      channel.push({
+        kind: "handshake-required",
+        arcRunId: "run:selection",
+        handshakeId: "handshake:decline",
+        arcRef: "arc:test:Main",
+        requirement:
+          kind === "run-choice"
+            ? { kind, freshAvailable: false, candidates: [] }
+            : { kind },
+      });
+      workerHub.submitInbound.mockReturnValueOnce(channel);
+      workerHub.handshake.mockImplementationOnce(async () => {
+        channel.push({
+          kind: "rejected",
+          arcRef: "arc:test:Main",
+          reason: "Arc activation declined by client.",
+        });
+        channel.close();
+        return { status: "ok" };
+      });
+      const { port, logRecords } = await startConnector({ workerHub });
+      const client = await connectClient(port);
+      await client.callTool({
+        name: "arcade_submit_user_message",
+        arguments: { content: "Start." },
+      });
+      for (const values of [
+        { decline: false },
+        { decline: false, workspace: "/tmp/workspace" },
+        { decline: "true" },
+        { decline: null },
+        { decline: true, workspace: "/tmp/workspace" },
+        { decline: true, runChoice: { action: "fresh" } },
+        { decline: true, arcChoice: { activate: false } },
+        { decline: true, arcChoice: null },
+      ]) {
+        const invalid = await client.callTool({
+          name: "arcade_resolve_handshake",
+          arguments: { id: "decline", values },
+        });
+        expect(invalid.isError).toBe(true);
+        expect(workerHub.handshake).not.toHaveBeenCalled();
+      }
+      const result = await client.callTool({
+        name: "arcade_resolve_handshake",
+        arguments: { id: "decline", values: { decline: true } },
+      });
+      expect(workerHub.handshake).toHaveBeenCalledExactlyOnceWith(
+        "handshake:decline",
+        { decline: true },
+        expect.any(String),
+      );
+      expect(result.content).toEqual([
+        expect.objectContaining({
+          text: "Arcade did not start a run for that request.",
+        }),
+      ]);
+      expect(logRecords).toContainEqual(
+        expect.objectContaining({
+          event: "connector.mcp.submission.rejected",
+          reason: "Arc activation declined by client.",
+        }),
+      );
+    },
+  );
+
   it.each(["pause", "resume"])(
     "mcp.control-inactive preserves authorized %s results and authorization",
     async (operation) => {

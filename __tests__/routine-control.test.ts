@@ -324,6 +324,56 @@ describe("Routine control contract", () => {
     await worker.stop();
     expect(close).toHaveBeenCalledTimes(1);
   });
+
+  it("retains nineteen paused Claude continuations beyond prepared-start expiry", async () => {
+    const input = await routineInput({ kind: "pause" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1000);
+    const queries: ReturnType<typeof signalQuery>[] = [];
+    const worker = new ClaudeSdkWorker({
+      sessionCache: { maxPreparedStarts: 0, idleTtlMs: 10 },
+      query: ((params) => {
+        const state = signalQuery();
+        queries.push(state);
+        return state.query(params);
+      }) as ClaudeSdkQueryFn,
+    });
+    const inputs = Array.from({ length: 19 }, (_, index) => ({
+      ...input,
+      routine: {
+        ...input.routine,
+        id: `routine:${index}`,
+        arcRunId: `run:${index}`,
+        contextKey: `context:${index}`,
+      },
+    }));
+    try {
+      const reports = await Promise.all(
+        inputs.slice(0, 18).map((item) => worker.run(item)),
+      );
+      expect(reports.every((report) => report.suspension === "paused")).toBe(
+        true,
+      );
+      clock.mockReturnValue(1000000);
+      await expect(worker.run(inputs[18]!)).resolves.toMatchObject({
+        suspension: "paused",
+      });
+      expect(queries).toHaveLength(19);
+      for (const query of queries) expect(query.close).not.toHaveBeenCalled();
+      await worker.disposeRoutine(disposal(inputs[7]!));
+      expect(queries[7]!.close).toHaveBeenCalledTimes(1);
+      for (const [index, query] of queries.entries())
+        if (index !== 7) expect(query.close).not.toHaveBeenCalled();
+      await expect(worker.run(inputs[0]!)).resolves.toMatchObject({
+        suspension: "paused",
+        backendDetails: { liveSessionReused: true },
+      });
+      expect(queries).toHaveLength(19);
+    } finally {
+      await worker.stop();
+      clock.mockRestore();
+    }
+    for (const query of queries) expect(query.close).toHaveBeenCalledTimes(1);
+  });
 });
 
 async function routineInput(signal?: RoutineSignal): Promise<RoutineInput> {

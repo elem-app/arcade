@@ -5,6 +5,7 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import type {
   ActionBrief,
+  ActionMove,
   ActionReport,
   ArcRef,
   ArcTraversalSet,
@@ -101,7 +102,6 @@ import {
   type FailedReplay,
   type JumpedReplay,
   type RegeneratedReplay,
-  type ReplayCheckpoint,
   type ReplayStep,
   type TriggerReplayStep,
 } from "../types/replay.js";
@@ -112,16 +112,24 @@ import type {
   InstructionTask,
   SemanticRequest,
   SemanticTask,
+  TaskDisposition,
 } from "../types/task.js";
 import { KeyedSerializer } from "../utils/keyed-serializer.js";
 import { HandshakeStore } from "./handshake.js";
 import { audienceDeclaration } from "./host-module-declarations.js";
 import { ModuleExecution } from "./module-execution.js";
+import {
+  replayPrefixAt,
+  requireReplayTarget,
+  validateReplayPrefix,
+} from "./replay-history.js";
 import { RecordingRuntime } from "./replay-recorder.js";
+import { matchingReplayCheckpoint } from "./replay-state.js";
 import {
   alignActionReplay,
   alignTriggerReplay,
   createReplayIso,
+  stageReplayIso,
 } from "./replay-verify.js";
 import type { WorkEventService } from "./work-events.js";
 import { semanticTaskSourceRef } from "./worker-context.js";
@@ -1622,6 +1630,22 @@ export class ArcHostService {
       });
     }
 
+    if ("decline" in values) {
+      if (
+        values.decline !== true ||
+        "workspace" in values ||
+        "runChoice" in values ||
+        "arcChoice" in values
+      ) {
+        return {
+          status: "invalid",
+          reason:
+            "Decline must be true and cannot include handshake answer fields.",
+        };
+      }
+      return this.#declineHandshake(handshake, operation);
+    }
+
     const requirement = handshake.requirements[0];
     if (!requirement) {
       return { status: "invalid", reason: "Handshake has no requirements." };
@@ -1635,21 +1659,10 @@ export class ArcHostService {
           reason: "This handshake requires arcChoice: { activate }.",
         };
       }
-      await this.#consumeHandshake(
-        handshake,
-        { kind: choice.activate ? "proceed" : "declined" },
-        operation,
-      );
       if (!choice.activate) {
-        return {
-          status: "ok",
-          step: {
-            kind: "rejected",
-            arcRef: handshake.arcRef,
-            reason: "Arc activation declined by client.",
-          },
-        };
+        return this.#declineHandshake(handshake, operation);
       }
+      await this.#consumeHandshake(handshake, { kind: "proceed" }, operation);
       // Activating: the arc may still need run-choice/workspace — stage that as
       // the next-round handshake — otherwise activate now.
       const request: ActivationRequest = {
@@ -1841,6 +1854,21 @@ export class ArcHostService {
       workspace.value,
       opts.projectDialog,
     );
+  }
+
+  async #declineHandshake(
+    handshake: PendingHandshake,
+    operation: PreparationOperation,
+  ): Promise<ResolveHandshakeResult> {
+    await this.#consumeHandshake(handshake, { kind: "declined" }, operation);
+    return {
+      status: "ok",
+      step: {
+        kind: "rejected",
+        arcRef: handshake.arcRef,
+        reason: "Arc activation declined by client.",
+      },
+    };
   }
 
   async #activateFreshFromHandshake(
@@ -2523,11 +2551,20 @@ export class ArcHostService {
       }
       effect = { hostCallId: input.hostCallId, hostCallOutcome: outcome };
     } else {
-      report = this.#buildReport(
+      const built = this.#buildReport(
         brief,
         input.reports,
         input.instructionCoverage,
       );
+      report = built.report;
+      const { briefIds, failures } = built.unacknowledged;
+      if (briefIds.length > 0 || failures.length > 0)
+        this.#logger.info("arc_host.feedback.unacknowledged", {
+          arcRunId,
+          move: report.move,
+          briefIds,
+          failures,
+        });
     }
     const runtime = await this.#runtimeForSnapshot(state.snapshotId);
     const dialog = await input.projectDialog({
@@ -2928,7 +2965,11 @@ export class ArcHostService {
     candidateArcRef: ArcRef,
     opts: { untilPosition?: ActionReplayPosition } = {},
   ): Promise<CompatibleReplay | FailedReplay> {
-    return this.#verifyReplay(sourceArcRunId, candidateArcRef, opts);
+    return this.#verifyReplay(
+      await this.#captureReplaySource(sourceArcRunId),
+      candidateArcRef,
+      opts,
+    );
   }
 
   /**
@@ -2941,21 +2982,16 @@ export class ArcHostService {
     candidateArcRef: ArcRef,
     opts: { untilPosition?: ActionReplayPosition } = {},
   ): Promise<JumpedReplay | FailedReplay> {
-    const alignment = await this.#verifyReplay(
-      sourceArcRunId,
-      candidateArcRef,
-      opts,
-    );
+    const source = await this.#captureReplaySource(sourceArcRunId);
+    const alignment = await this.#verifyReplay(source, candidateArcRef, opts);
     if (alignment.status === "incompatible") return alignment;
-    const sourceRun = await this.#requireRunState(sourceArcRunId);
     const arcRunId = await this.#materializeFork(
-      handoffCheckpoint(alignment.regenerated).traversals,
       {
         arcRef: alignment.arcRef,
         deps: alignment.deps,
         snapshotId: alignment.snapshotId,
       },
-      sourceRun,
+      source.run,
       alignment.regenerated,
       "jump",
     );
@@ -2971,31 +3007,20 @@ export class ArcHostService {
     sourceArcRunId: ArcRunId,
     atPosition: ActionReplayPosition,
   ): Promise<{ arcRunId: ArcRunId }> {
-    const replayStore = this.#requireReplayStore();
-    const sourceRun = await this.#requireRunState(sourceArcRunId);
-    if (atPosition.reactivationCount > sourceRun.reactivationCount) {
-      throw new Error(
-        `Replay position reactivation count ${atPosition.reactivationCount} is newer than committed reactivation count ${sourceRun.reactivationCount} for run ${sourceArcRunId}.`,
-      );
-    }
-    const traversals = await replayStore.getCheckpoint(
-      sourceArcRunId,
-      atPosition,
+    const source = await this.#captureReplaySource(sourceArcRunId);
+    const continuation = requireReplayTarget(source.prefix, atPosition);
+    const prefix = replayPrefixAt(
+      [...source.prefix.triggerSteps, ...source.prefix.actionSteps],
+      source.prefix.checkpoints,
+      continuation,
     );
-    if (!traversals) {
-      throw new Error(
-        `No replay checkpoint at action:${atPosition.index} for run ${sourceArcRunId}.`,
-      );
-    }
-    const prefix = await this.#copySourcePrefix(sourceArcRunId, atPosition);
     const arcRunId = await this.#materializeFork(
-      traversals,
       {
-        arcRef: sourceRun.arcRef,
-        deps: [...sourceRun.deps],
-        snapshotId: sourceRun.snapshotId,
+        arcRef: source.run.arcRef,
+        deps: source.run.deps,
+        snapshotId: source.run.snapshotId,
       },
-      sourceRun,
+      source.run,
       prefix,
       "rewind",
     );
@@ -3009,116 +3034,138 @@ export class ArcHostService {
    * each regenerated brief and checkpoint modulo a typed-ref isomorphism.
    */
   async #verifyReplay(
-    sourceArcRunId: ArcRunId,
+    source: { run: ArcRunState; prefix: RegeneratedReplay },
     candidateArcRef: ArcRef,
     opts: { untilPosition?: ActionReplayPosition },
   ): Promise<CompatibleReplay | FailedReplay> {
-    const replayStore = this.#requireReplayStore();
-    const sourceRun = await this.#requireRunState(sourceArcRunId);
-    const steps = await replayStore.listSteps(sourceArcRunId);
-    const checkpoints = await replayStore.listCheckpoints(sourceArcRunId);
-
+    const { run: sourceRun, prefix } = source;
+    const steps = [...prefix.triggerSteps, ...prefix.actionSteps];
+    const checkpoints = prefix.checkpoints;
+    if (opts.untilPosition) requireReplayTarget(prefix, opts.untilPosition);
+    const targetCount =
+      opts.untilPosition?.reactivationCount ?? sourceRun.reactivationCount;
     const iso = createReplayIso();
     iso.arcs.set(sourceRun.arcRef, candidateArcRef);
-
-    // Scope trigger replay to the arcs that participated in the recorded
-    // resolution, mapped through the rename iso — the same scoping the action
-    // stage gets below via `#pinSnapshot(deps)`. Replaying against the global
-    // latest runtime would re-pose a judgment for a coexisting, un-renamed
-    // original arc (the candidate's pre-rename self) that the recorded report,
-    // rewritten onto the candidate, never answers — leaving `matched` unset.
-    const recordedTriggerDeps = this.#recordedTriggerDeps(steps);
-    const triggerScopeDeps = recordedTriggerDeps.map(
+    const recordIds = new Map(this.#latestDocumentRecordIds);
+    const triggerScopeDeps = this.#recordedTriggerDeps(steps).map(
       (dep) => iso.arcs.get(dep) ?? dep,
     );
-    const triggerRuntime =
-      triggerScopeDeps.length > 0
-        ? await this.#runtimeForSnapshot(
-            await this.#pinSnapshot(triggerScopeDeps),
-          )
-        : this.#latestRuntime;
-
-    const targetReactivationCount = opts.untilPosition
-      ? opts.untilPosition.reactivationCount
-      : sourceRun.reactivationCount;
-    if (targetReactivationCount > sourceRun.reactivationCount) {
-      throw new Error(
-        `Replay position reactivation count ${targetReactivationCount} is newer than committed reactivation count ${sourceRun.reactivationCount} for run ${sourceArcRunId}.`,
-      );
-    }
-    let replayTriggerRuntime = triggerRuntime;
-    let seedTraversals: ArcTraversalSet | undefined;
+    let triggerRuntime = triggerScopeDeps.length
+      ? await this.#runtimeForSnapshot(
+          await this.#pinSnapshot(triggerScopeDeps, recordIds),
+        )
+      : this.#latestRuntime;
     let snapshotId: ArcDocumentSnapshotId | undefined;
     let snapshotRuntime: Runtime | undefined;
-    let finalTrigger:
-      | Extract<ReturnType<typeof alignTriggerReplay>, { status: "compatible" }>
-      | undefined;
-    let finalAction:
-      | Extract<ReturnType<typeof alignActionReplay>, { status: "compatible" }>
-      | undefined;
-    const regeneratedTriggerSteps: TriggerReplayStep[] = [];
-    const regeneratedActionSteps: ActionReplayStep[] = [];
-    const regeneratedCheckpoints: ReplayCheckpoint[] = [];
-
+    let binding: { arcRef: ArcRef; deps: readonly ArcRef[] } | undefined;
+    let seedTraversals: ArcTraversalSet | undefined;
+    let hostModules: HostModuleState = { calls: [] };
+    let regenerated: RegeneratedReplay | undefined;
+    let handoff: CompatibleReplay["handoff"] = "reproduced";
     for (
       let reactivationCount = 0;
-      reactivationCount <= targetReactivationCount;
-      reactivationCount += 1
+      reactivationCount <= targetCount;
+      reactivationCount++
     ) {
-      const triggerAlignment = alignTriggerReplay({
-        triggerRuntime: replayTriggerRuntime,
+      const episode = stageReplayIso(iso);
+      const trigger = alignTriggerReplay({
+        triggerRuntime,
         steps,
         candidateArcRef,
-        iso,
+        iso: episode.iso,
         reactivationCount,
         seedTraversals,
+        hostModules,
         arcRefs: reactivationCount === 0 ? undefined : [candidateArcRef],
       });
-      if (triggerAlignment.status === "incompatible") return triggerAlignment;
-      finalTrigger = triggerAlignment;
-      regeneratedTriggerSteps.push(...triggerAlignment.regenerated);
-
+      if (trigger.status === "incompatible") {
+        if (!regenerated) return trigger;
+        handoff = "diverged";
+        break;
+      }
       if (!snapshotRuntime) {
-        snapshotId = await this.#pinSnapshot(triggerAlignment.deps);
+        snapshotId = await this.#pinSnapshot(trigger.deps, recordIds);
         snapshotRuntime = await this.#runtimeForSnapshot(snapshotId);
       }
-      const actionAlignment = alignActionReplay({
+      const action = alignActionReplay({
         snapshotRuntime,
         steps,
         checkpoints,
-        seedTraversals: triggerAlignment.activationTraversals,
-        iso,
+        seedTraversals: trigger.activationTraversals,
+        hostModules: trigger.hostModules,
+        iso: episode.iso,
         reactivationCount,
         untilPosition:
-          reactivationCount === targetReactivationCount
-            ? opts.untilPosition
-            : undefined,
+          reactivationCount === targetCount ? opts.untilPosition : undefined,
       });
-      if (actionAlignment.status === "incompatible") return actionAlignment;
-      finalAction = actionAlignment;
-      regeneratedActionSteps.push(...actionAlignment.regeneratedSteps);
-      regeneratedCheckpoints.push(...actionAlignment.regeneratedCheckpoints);
-      seedTraversals =
-        actionAlignment.regeneratedCheckpoints.at(-1)?.traversals;
-      replayTriggerRuntime = snapshotRuntime;
+      if (action.status === "incompatible") {
+        if (!regenerated) return action;
+        handoff = "diverged";
+        break;
+      }
+      episode.commit();
+      binding = { arcRef: trigger.arcRef, deps: trigger.deps };
+      regenerated = {
+        triggerSteps: [
+          ...(regenerated?.triggerSteps ?? []),
+          ...trigger.regenerated,
+        ],
+        actionSteps: [
+          ...(regenerated?.actionSteps ?? []),
+          ...action.regeneratedSteps,
+        ],
+        checkpoints: [
+          ...(regenerated?.checkpoints ?? []),
+          ...action.regeneratedCheckpoints,
+        ],
+      };
+      handoff = action.handoff;
+      if (handoff === "diverged") break;
+      const continuation = handoffCheckpoint(regenerated);
+      seedTraversals = continuation.traversals;
+      hostModules = continuation.hostModules;
+      triggerRuntime = snapshotRuntime;
     }
-
-    if (!finalTrigger || !finalAction || !snapshotId) {
+    if (!regenerated || !binding || !snapshotId)
       throw new Error("Replay produced no activation.");
-    }
+    validateReplayPrefix(regenerated);
     return {
       status: "compatible",
       iso,
-      arcRef: finalTrigger.arcRef,
-      deps: finalTrigger.deps,
+      ...binding,
       snapshotId,
-      handoff: finalAction.handoff,
-      regenerated: {
-        triggerSteps: regeneratedTriggerSteps,
-        actionSteps: regeneratedActionSteps,
-        checkpoints: regeneratedCheckpoints,
-      },
+      handoff,
+      regenerated,
     };
+  }
+
+  /** Capture a state-equivalent source prefix without reconstructing or writing the run. */
+  async #captureReplaySource(
+    arcRunId: ArcRunId,
+  ): Promise<{ run: ArcRunState; prefix: RegeneratedReplay }> {
+    return this.#actionMutations.run(arcRunId, async () => {
+      const replayStore = this.#requireReplayStore();
+      const run = await this.#requireRunState(arcRunId);
+      const steps = await replayStore.listSteps(arcRunId);
+      const checkpoints = await replayStore.listCheckpoints(arcRunId);
+      const matched = matchingReplayCheckpoint(
+        checkpoints,
+        run.traversals,
+        run.hostModules,
+        run.reactivationCount,
+      );
+      if (!matched)
+        throw new Error(
+          `No replay checkpoint matches the authoritative state of run ${arcRunId}.`,
+        );
+      const continuation = {
+        ...matched,
+        hostModules: structuredClone(run.hostModules),
+      };
+      const prefix = replayPrefixAt(steps, checkpoints, continuation);
+      validateReplayPrefix(prefix);
+      return { run, prefix };
+    });
   }
 
   /**
@@ -3129,7 +3176,6 @@ export class ArcHostService {
    * `start`/`#settle`; the source run is left untouched.
    */
   async #materializeFork(
-    seedTraversals: ArcTraversalSet,
     binding: {
       arcRef: ArcRef;
       deps: readonly ArcRef[];
@@ -3139,10 +3185,15 @@ export class ArcHostService {
     replayPrefix: RegeneratedReplay,
     route: "jump" | "rewind",
   ): Promise<ArcRunId> {
+    validateReplayPrefix(replayPrefix);
+    const {
+      traversals: seedTraversals,
+      hostModules,
+      position,
+    } = handoffCheckpoint(replayPrefix);
     const arcRunId: ArcRunId = `arc-run:${randomUUID()}`;
     const now = new Date().toISOString();
-    const reactivationCount =
-      handoffCheckpoint(replayPrefix).position.reactivationCount;
+    const reactivationCount = position.reactivationCount;
     const replayStore = this.#replayStore;
     if (replayStore) {
       for (const step of replayPrefix.triggerSteps) {
@@ -3169,7 +3220,7 @@ export class ArcHostService {
       workspacePath: sourceRun.workspacePath,
       contextIsolation: sourceRun.contextIsolation,
       artifactPaths: [...sourceRun.artifactPaths],
-      hostModules: structuredClone(handoffCheckpoint(replayPrefix).hostModules),
+      hostModules: structuredClone(hostModules),
     });
     await this.#workEvents.append({ kind: "run:started", arcRunId, route });
     const lifecycle = lifecycleFromTraversals(binding.arcRef, seedTraversals);
@@ -3197,65 +3248,6 @@ export class ArcHostService {
       );
     }
     return arcRunId;
-  }
-
-  /**
-   * Copy a run's own replay data through `forkPoint`: the full trigger stream,
-   * action briefs and checkpoints through the fork point, and action reports
-   * only for indexes strictly before it (the install point is pre-report).
-   */
-  async #copySourcePrefix(
-    sourceArcRunId: ArcRunId,
-    forkPoint: ActionReplayPosition,
-  ): Promise<RegeneratedReplay> {
-    const replayStore = this.#requireReplayStore();
-    const steps = await replayStore.listSteps(sourceArcRunId);
-    const checkpoints = await replayStore.listCheckpoints(sourceArcRunId);
-    const triggerSteps: TriggerReplayStep[] = [];
-    const actionSteps: RegeneratedReplay["actionSteps"] = [];
-    const targetReactivationCount = forkPoint.reactivationCount;
-    const beforeTargetReactivation = (position: {
-      reactivationCount: number;
-    }) => position.reactivationCount < targetReactivationCount;
-    const atTargetReactivation = (position: { reactivationCount: number }) =>
-      position.reactivationCount === targetReactivationCount;
-    for (const step of steps) {
-      if (step.kind === "trigger-brief" || step.kind === "trigger-report") {
-        if (
-          beforeTargetReactivation(step.position) ||
-          atTargetReactivation(step.position)
-        ) {
-          triggerSteps.push(step);
-        }
-      } else if (
-        step.kind === "action-brief" ||
-        step.kind === "terminal-brief"
-      ) {
-        if (
-          beforeTargetReactivation(step.position) ||
-          (atTargetReactivation(step.position) &&
-            step.position.index <= forkPoint.index)
-        ) {
-          actionSteps.push(step);
-        }
-      } else if (
-        beforeTargetReactivation(step.position) ||
-        (atTargetReactivation(step.position) &&
-          step.position.index < forkPoint.index)
-      ) {
-        actionSteps.push(step);
-      }
-    }
-    return {
-      triggerSteps,
-      actionSteps,
-      checkpoints: checkpoints.filter(
-        (checkpoint) =>
-          beforeTargetReactivation(checkpoint.position) ||
-          (atTargetReactivation(checkpoint.position) &&
-            checkpoint.position.index <= forkPoint.index),
-      ),
-    };
   }
 
   #requireReplayStore(): ReplayStore {
@@ -3708,12 +3700,16 @@ export class ArcHostService {
     dialog: Dialog,
     transitions: readonly RunTransition[] = [],
   ): Promise<RunFrontier> {
+    const allowedDispositions = allowedDispositionsFromMoves(
+      brief.allowedMoves,
+    );
     const { instruction, instructionIssues, postcheckingInstructions } =
       await this.#agentInstructionFromActionBrief(
         arcRunId,
         state,
         brief,
         dialog,
+        allowedDispositions,
       );
     // Arcade waits for instruction application before dispatching these checks,
     // so they use the updated dialog, including any awaited reply.
@@ -3742,6 +3738,7 @@ export class ArcHostService {
         (item) => !deferredPostcheckIds.has(item.id),
       ),
       postcheckingInstructions,
+      allowedDispositions,
     });
     const status = statusFromBrief(state.arcRef, brief);
     return {
@@ -3782,6 +3779,7 @@ export class ArcHostService {
       judgments: brief.judgments,
       observations: brief.observations,
       postcheckingInstructions: new Map(),
+      allowedDispositions: [],
     });
     return {
       status: semanticTasks.length ? "ready" : "blocked",
@@ -3846,6 +3844,7 @@ export class ArcHostService {
     state: ArcRunRuntimeState,
     actionBrief: ActionBrief,
     dialog: Dialog,
+    allowedDispositions: readonly TaskDisposition[],
   ): Promise<{
     instruction?: InstructionTask;
     postcheckingInstructions: Map<BriefId, InstructionTask>;
@@ -3882,6 +3881,7 @@ export class ArcHostService {
           state,
           sourceRef,
         ),
+        allowedDispositions,
       });
     }
     const postcheckingInstructions = await buildPostcheckingInstructions({
@@ -3892,59 +3892,158 @@ export class ArcHostService {
       dialog,
       contextIsolationForSourceRef: (sourceRef) =>
         this.#effectiveContextIsolation(state, sourceRef),
+      allowedDispositions,
     });
     return { instruction, postcheckingInstructions, instructionIssues };
   }
 
+  /**
+   * Turn one batch of worker feedback into one runtime move. Precedence:
+   *
+   * 1. A disposition concludes the whole frontier rather than answering one
+   *    task. An interruption supersedes the frontier; a deflection declares its
+   *    work misplaced. Either way the batch's other results, failures included,
+   *    answer a frontier that no longer stands, so they stay unacknowledged and
+   *    Arc reissues whatever work remains. The hub stops a batch at its first
+   *    disposition, so at most one is present. A disposition the frontier does
+   *    not accept poisons: proceeding instead would redispatch the same work.
+   * 2. A failure concerns only its own task. Poisoning is the conservative
+   *    handling until usable results can be committed and the task retried.
+   * 3. Otherwise the batch proceeds with every applied instruction and
+   *    semantic result.
+   *
+   * `unacknowledged` lists what the chosen move leaves out: the brief ids of
+   * applied instructions and semantic results, and every failure other than
+   * the one a failure poison reports.
+   */
   #buildReport(
     brief: ActionBrief,
     reports: readonly RoutineReport[],
     coverage: InstructionCoverage,
-  ): ActionReport {
-    const failedReport = reports.find(
-      (report): report is Extract<RoutineReport, { error: "failed" }> =>
-        report.error === "failed",
-    );
-    const failedCoverage = Object.entries(coverage).find(
-      ([, value]) => value === "failed",
-    );
-    if (failedReport || failedCoverage) {
-      return {
-        move: "poison",
-        poisonReason: {
-          reasonCode: failedReport?.code ?? "worker-failed",
-          reason:
-            failedReport?.message ??
-            `Worker failed while applying ${failedCoverage?.[0] ?? "an instruction"}.`,
-        },
-      };
-    }
-
-    const shouldDeflect =
-      reports.some((report) => report.outcome === "deflected") ||
-      Object.values(coverage).some((value) => value === "deflected");
-    if (shouldDeflect && brief.allowedMoves.includes("deflect"))
-      return { move: "deflect" };
-
+  ): {
+    report: ActionReport;
+    unacknowledged: {
+      briefIds: BriefId[];
+      failures: { code: string; message: string }[];
+    };
+  } {
     const semantic = collectSemanticResults(reports);
     const instructions = Object.fromEntries(
       Object.entries(coverage)
         .filter(([, status]) => status === "applied")
         .map(([id]) => [id, { status: "applied" as const }]),
     );
+    const { report, reportedFailure } = this.#feedbackMove(
+      brief,
+      reports,
+      coverage,
+    );
+    if (report.move !== "proceed")
+      return {
+        report,
+        unacknowledged: {
+          briefIds: [
+            ...Object.keys(instructions),
+            ...Object.keys(semantic.judgments),
+            ...Object.keys(semantic.observations),
+          ],
+          failures: reports
+            .filter(
+              (item): item is FailedRoutineReport =>
+                item.error === "failed" && item !== reportedFailure,
+            )
+            .map(({ code, message }) => ({ code, message })),
+        },
+      };
     return {
-      move: "proceed",
-      instructions:
-        Object.keys(instructions).length > 0 ? instructions : undefined,
-      judgments:
-        Object.keys(semantic.judgments).length > 0
-          ? semantic.judgments
-          : undefined,
-      observations:
-        Object.keys(semantic.observations).length > 0
-          ? semantic.observations
-          : undefined,
+      report: {
+        move: "proceed",
+        instructions:
+          Object.keys(instructions).length > 0 ? instructions : undefined,
+        judgments:
+          Object.keys(semantic.judgments).length > 0
+            ? semantic.judgments
+            : undefined,
+        observations:
+          Object.keys(semantic.observations).length > 0
+            ? semantic.observations
+            : undefined,
+      },
+      unacknowledged: { briefIds: [], failures: [] },
     };
+  }
+
+  /**
+   * Select the move for a feedback batch; see `#buildReport` for precedence.
+   * `reportedFailure` is the failure a failure poison reports.
+   */
+  #feedbackMove(
+    brief: ActionBrief,
+    reports: readonly RoutineReport[],
+    coverage: InstructionCoverage,
+  ): { report: ActionReport; reportedFailure?: FailedRoutineReport } {
+    const disposition = reports.find(
+      (report): report is Extract<RoutineReport, { outcome: "disposition" }> =>
+        report.outcome === "disposition",
+    );
+    if (disposition?.interrupt) {
+      const { id, reason } = disposition.interrupt;
+      if (!brief.allowedMoves.includes("interrupt"))
+        return {
+          report: {
+            move: "poison",
+            poisonReason: {
+              reasonCode: "worker-interrupt-unavailable",
+              reason: `Worker requested interruption ${id} on a frontier that does not accept interrupt.`,
+            },
+          },
+        };
+      return {
+        report: {
+          move: "interrupt",
+          interruption: { id, ...(reason !== undefined ? { reason } : {}) },
+        },
+      };
+    }
+    if (
+      disposition?.deflect ||
+      Object.values(coverage).some((value) => value === "deflected")
+    ) {
+      if (!brief.allowedMoves.includes("deflect"))
+        return {
+          report: {
+            move: "poison",
+            poisonReason: {
+              reasonCode: "worker-deflect-unavailable",
+              reason:
+                "Worker requested deflection on a frontier that does not accept deflect.",
+            },
+          },
+        };
+      return { report: { move: "deflect" } };
+    }
+
+    const failedReport = reports.find(
+      (report): report is FailedRoutineReport => report.error === "failed",
+    );
+    const failedCoverage = Object.entries(coverage).find(
+      ([, value]) => value === "failed",
+    );
+    if (failedReport || failedCoverage) {
+      return {
+        report: {
+          move: "poison",
+          poisonReason: {
+            reasonCode: failedReport?.code ?? "worker-failed",
+            reason:
+              failedReport?.message ??
+              `Worker failed while applying ${failedCoverage?.[0] ?? "an instruction"}.`,
+          },
+        },
+        reportedFailure: failedReport,
+      };
+    }
+    return { report: { move: "proceed" } };
   }
 
   #enqueueRunEvents(events: RunEventCollection): void {
@@ -4383,10 +4482,21 @@ function idleFrontier(arcRunId: ArcRunId): RunFrontier {
   };
 }
 
+type FailedRoutineReport = Extract<RoutineReport, { error: "failed" }>;
+
 type ParsedInstructionItem = {
   brief: InstructionBrief;
   instruction: WorkerInstruction;
 };
+
+/** Dispositions a worker may report at a frontier offering these moves. */
+function allowedDispositionsFromMoves(
+  moves: readonly ActionMove[],
+): TaskDisposition[] {
+  return (
+    ["deflect", "interrupt"] as const satisfies readonly TaskDisposition[]
+  ).filter((disposition) => moves.includes(disposition));
+}
 
 async function buildPostcheckingInstructions(args: {
   items: readonly ParsedInstructionItem[];
@@ -4397,6 +4507,7 @@ async function buildPostcheckingInstructions(args: {
   contextIsolationForSourceRef: (
     sourceRef: NodeRef,
   ) => ContextIsolation | Promise<ContextIsolation>;
+  allowedDispositions: readonly TaskDisposition[];
 }): Promise<Map<BriefId, InstructionTask>> {
   const postcheckingInstructions = new Map<BriefId, InstructionTask>();
   for (const item of args.items) {
@@ -4410,6 +4521,7 @@ async function buildPostcheckingInstructions(args: {
       arcRunId: args.arcRunId,
       dialog: args.dialog,
       contextIsolation: await args.contextIsolationForSourceRef(sourceRef),
+      allowedDispositions: args.allowedDispositions,
     });
     for (const briefId of [
       ...postcheck.judgmentIds,
@@ -4432,6 +4544,7 @@ async function semanticTasksFromBrief(args: {
   judgments: readonly TriggerBrief["judgments"][number][];
   observations: readonly TriggerBrief["observations"][number][];
   postcheckingInstructions: ReadonlyMap<BriefId, InstructionTask>;
+  allowedDispositions: readonly TaskDisposition[];
 }): Promise<SemanticTask[]> {
   const byRole = new Map<string, SemanticTaskGroup[]>();
   let ordinal = 0;
@@ -4444,6 +4557,9 @@ async function semanticTasksFromBrief(args: {
       briefId: judgment.id,
       role,
       question: judgment.question,
+      ...(judgment.guidance !== undefined
+        ? { guidance: judgment.guidance }
+        : {}),
       sourceRef: judgment.sourceRef,
       tool: {
         type: "function",
@@ -4482,6 +4598,9 @@ async function semanticTasksFromBrief(args: {
             role,
             mode: observation.mode,
             fields: observation.fields,
+            ...(observation.guidance !== undefined
+              ? { guidance: observation.guidance }
+              : {}),
             sourceRef: observation.sourceRef,
             tool: {
               type: "function",
@@ -4502,6 +4621,9 @@ async function semanticTasksFromBrief(args: {
             cell: observation.cell,
             mode: observation.mode,
             question: observation.question,
+            ...(observation.guidance !== undefined
+              ? { guidance: observation.guidance }
+              : {}),
             currentValue: observation.currentValue,
             meta: observation.meta,
             sourceRef: observation.sourceRef,
@@ -4543,6 +4665,7 @@ async function semanticTasksFromBrief(args: {
         requests,
         contextIsolation: await args.contextIsolationForSourceRef(sourceRef),
         activeInstruction,
+        allowedDispositions: args.allowedDispositions,
       };
     }),
   );
@@ -4712,11 +4835,15 @@ function lifecycleFromTraversals(
   return "active";
 }
 
+/**
+ * Whether trigger feedback ends its probe. Trigger tasks accept no
+ * disposition, so one is treated like a failure.
+ */
 function hasFailedTriggerFeedback(input: AdvanceInput): boolean {
   return (
     "reports" in input &&
     input.reports.some(
-      (report) => report.error === "failed" || report.outcome === "deflected",
+      (report) => report.error === "failed" || report.outcome === "disposition",
     )
   );
 }
@@ -4790,6 +4917,16 @@ function unionArtifactPaths(
   brief: ActionBrief,
 ): readonly string[] {
   const seen = new Set(existing);
+  for (const item of [
+    ...brief.instructions,
+    ...brief.judgments,
+    ...brief.observations,
+    ...brief.hostCalls,
+  ]) {
+    if (item.guidance !== undefined) {
+      collectArtifactPathsFromSemanticText(item.guidance, seen);
+    }
+  }
   for (const item of brief.instructions) {
     collectArtifactPathsFromSemanticText(item.text, seen);
   }

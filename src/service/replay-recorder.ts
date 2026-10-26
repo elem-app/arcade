@@ -4,7 +4,6 @@ import type {
   ArcRef,
   ArcTraversalSet,
   Dialog,
-  HostCallBrief,
   Runtime,
   TerminalBrief,
   TriggerBrief,
@@ -12,12 +11,11 @@ import type {
 } from "@elem-app/arc/runtime";
 import { validateActionReport } from "@elem-app/arc/runtime";
 
-import { structurallyEqual, type ReplayStore } from "../storage/base.js";
+import type { ReplayStore } from "../storage/base.js";
 import type { ArcRunId } from "../types/core.js";
-import {
-  hostCallTraversal,
-  type HostModuleEffect,
-  type HostModuleState,
+import type {
+  HostModuleEffect,
+  HostModuleState,
 } from "../types/host-module.js";
 import type {
   ActionReplayPosition,
@@ -27,6 +25,10 @@ import type {
   TriggerReportStep,
 } from "../types/replay.js";
 import { stripBrief } from "../types/replay.js";
+import {
+  advanceHostModuleState,
+  matchingReplayCheckpoint,
+} from "./replay-state.js";
 
 /**
  * Per-run recording facade over a shared `Runtime`.
@@ -124,8 +126,7 @@ export class RecordingRuntime {
     if (!position)
       throw new Error("Recording trigger progress for an unknown brief.");
     const next = this.#runtime.progressTrigger(brief, report, dialog);
-    const admitted = moduleEffect && this.#admitEffect(moduleEffect, next);
-    this.#syncPendingCalls(next.hostCalls, next.traversals);
+    const admitted = this.#advanceHostModules(next, moduleEffect);
     this.#triggerBuffer.push({
       kind: "trigger-report",
       position,
@@ -215,11 +216,7 @@ export class RecordingRuntime {
     dialog: Dialog,
   ): Promise<ActionBrief | TerminalBrief> {
     const brief = this.#runtime.start(traversals, dialog);
-    this.#syncPendingCalls(
-      brief.canProgress ? brief.hostCalls : [],
-      brief.traversals,
-      true,
-    );
+    this.#advanceHostModules(brief, undefined, true);
     if (!this.#replayStore) return brief;
 
     const matched = await this.#findCheckpointPosition(traversals);
@@ -292,13 +289,9 @@ export class RecordingRuntime {
     opts.beforeProgress?.();
     const validation = validateActionReport(brief, report);
     const next = this.#runtime.progress(brief, report, dialog);
-    const admitted =
-      !validation.rejected &&
-      opts.moduleEffect &&
-      this.#admitEffect(opts.moduleEffect, next);
-    this.#syncPendingCalls(
-      next.canProgress ? next.hostCalls : [],
-      next.traversals,
+    const admitted = this.#advanceHostModules(
+      next,
+      validation.rejected ? undefined : opts.moduleEffect,
     );
     opts.progressed?.(next);
     if (position) {
@@ -318,77 +311,20 @@ export class RecordingRuntime {
     return next;
   }
 
-  /** Retain only outcomes admitted by the runtime, including interruptions ending in poison. */
-  #admitEffect(
-    effect: HostModuleEffect,
-    output: Pick<ActionBrief | TriggerBrief, "issues">,
-  ): boolean {
-    const record = this.#hostModules.calls.find(
-      (item) => item.call.hostCallId === effect.hostCallId,
-    );
-    if (!record)
-      throw new Error("Recording an effect for an unknown host call.");
-    if (
-      effect.hostCallOutcome.kind === "resolution" &&
-      output.issues.some(
-        (issue) =>
-          issue.kind === "invalid-item" &&
-          issue.reasonCode === "host-call-result-type" &&
-          issue.briefId === record.runtimeCallId,
-      )
-    )
-      return false;
-    record.effects.push(structuredClone(effect));
-    return true;
-  }
-
-  /** Runtime ids address only currently pending calls; retained occurrence ids stay stable. */
-  #syncPendingCalls(
-    calls: readonly HostCallBrief[],
-    traversals: ArcTraversalSet,
+  /** Keep the canonical live state bound while sharing replay's pure projection. */
+  #advanceHostModules(
+    output: ActionBrief | TerminalBrief | TriggerBrief,
+    effect?: HostModuleEffect,
     reconstruct = false,
-  ): void {
-    const available = new Set(calls);
-    for (const record of this.#hostModules.calls) {
-      if (record.runtimeCallId === undefined) continue;
-      const source = hostCallTraversal(traversals, record.call.sourceRef);
-      if (
-        record.context.arcRunId !== undefined &&
-        source?.enterCount !== record.enterCount
-      ) {
-        record.runtimeCallId = undefined;
-        continue;
-      }
-      const pending = [...available].find((call) =>
-        reconstruct
-          ? call.sourceRef === record.call.sourceRef &&
-            call.module === record.call.module &&
-            call.operation === record.call.operation &&
-            structurallyEqual(call.target, record.call.target) &&
-            structurallyEqual(call.arguments, record.call.arguments)
-          : call.id === record.runtimeCallId,
-      );
-      if (pending) {
-        record.runtimeCallId = pending.id;
-        available.delete(pending);
-        continue;
-      }
-      const traversal = hostCallTraversal(traversals, record.call.sourceRef);
-      const resolved = record.effects.some(
-        (effect) =>
-          effect.hostCallOutcome.kind === "resolution" ||
-          effect.hostCallOutcome.kind === "failure",
-      );
-      // A call can be temporarily hidden by its source node's catch judgment.
-      // Its original entry survives a caught interruption, including transitions.
-      if (
-        resolved ||
-        !traversal ||
-        traversal.enterCount !== record.enterCount ||
-        traversal.state !== undefined
-      )
-        record.runtimeCallId = undefined;
-    }
+  ): boolean {
+    const projected = advanceHostModuleState(
+      this.#hostModules,
+      output,
+      effect,
+      reconstruct,
+    );
+    this.#hostModules.calls = projected.hostModules.calls;
+    return projected.effectAdmitted;
   }
 
   /** Capture host module state changes made after the runtime output was recorded. */
@@ -486,21 +422,12 @@ export class RecordingRuntime {
   ): Promise<number | undefined> {
     if (!this.#replayStore) return undefined;
     const checkpoints = await this.#replayStore.listCheckpoints(this.#arcRunId);
-    let latest: number | undefined;
-    for (const checkpoint of checkpoints) {
-      if (
-        checkpoint.position.reactivationCount === this.#reactivationCount &&
-        structurallyEqual(checkpoint.traversals, traversals) &&
-        structurallyEqual(
-          checkpoint.hostModules.calls.flatMap((record) => record.effects),
-          this.#hostModules.calls.flatMap((record) => record.effects),
-        ) &&
-        (latest === undefined || checkpoint.position.index > latest)
-      ) {
-        latest = checkpoint.position.index;
-      }
-    }
-    return latest;
+    return matchingReplayCheckpoint(
+      checkpoints,
+      traversals,
+      this.#hostModules,
+      this.#reactivationCount,
+    )?.position.index;
   }
 
   async #derivePosition(

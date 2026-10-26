@@ -8,7 +8,7 @@ ARCADE_CONFIG_FILE=./config.local.jsonc pnpm start
 
 The config file is parsed by `src/config.ts`, validated, and filled with schema defaults before services start. Values in `config.local.jsonc` are explicit recommended local deployment values, not the source of runtime defaults.
 
-Arcade config describes the deployment: which connectors start, where file-backed service state lives, which registered backend each worker slot selects, how worker hub schedules role work, and which connector delivery rules are installed. The committed local deployment enables both the Web and MCP connectors. Connector runtime state carries the concrete principal, session, and user-selected workspace values that arrive with a connection or browser interaction.
+Arcade config describes the deployment: which connectors start, where file-backed service state lives, which registered backend each worker slot selects, and which connector delivery rules are installed. The committed local deployment enables both the Web and MCP connectors. Connector runtime state carries the concrete principal, session, and user-selected workspace values that arrive with a connection or browser interaction.
 
 ## App Config
 
@@ -19,10 +19,6 @@ Arcade config describes the deployment: which connectors start, where file-backe
 | `workers.default` | omitted | Complete slot used for roles without an explicit role slot or in-process worker. The backend name is an open-ended canonical string. |
 | `workers.fastTrigger` | omitted | Complete slot used only for trigger-stage semantic work. Set it to `null` explicitly when overriding a composed configuration that supplies one. |
 | `workers.roles` | `{}` | Complete slots keyed by Arc worker role. A slot embeds its backend-specific JSON configuration beside `backend`. |
-| `workerHub.scheduling.default.concurrency` | `1` | Maximum concurrently running routines per role unless that role overrides it. |
-| `workerHub.scheduling.default.maxQueueSize` | `64` | Maximum queued routines per role unless that role overrides it. |
-| `workerHub.scheduling.roles.<role>.concurrency` | inherited | Optional positive integer override for one role. |
-| `workerHub.scheduling.roles.<role>.maxQueueSize` | inherited | Optional non-negative integer override for one role. |
 | `secrets.provider` | unset | Secret provider. Currently supports `env`. |
 | `secrets.env` | `{}` | Mapping from Arcade logical secret refs to process environment variable names. |
 | `connectors.mcp.host` | `127.0.0.1` | Host address for the MCP Streamable HTTP server. Use `0.0.0.0` only when the host network should expose Arcade outside loopback. |
@@ -40,6 +36,8 @@ The built-in logging sink writes structured records to stdout. Record timestamps
 
 Worker hub supplies and manages an existing `RoutineContext.workspacePath` before worker warm-up, dispatch, and resume. For trigger work the hub supplies the Arcade process directory; it keeps this shared directory intact when a probe finishes or the hub stops. Action work receives the real workspace: `${dataDir}/artifacts` holds run-scoped workspaces, while arc-scoped work uses the selected workspace. Default logical artifact paths resolve inside the supplied directory. An explicit worker-slot or programmatic backend `cwd` override must name a usable directory managed by the configuration owner; the hub continues managing the workspace it supplies independently of that override.
 
+Workspaces can be shared by concurrent workers and external sessions; deployments requiring filesystem isolation supply separate filesystems or workspace copies.
+
 Startup sweeps unclaimed empty run workspaces under the artifact root. A directory is removed only when all three hold: it is named exactly as a run workspace, no persisted run state claims that id, and it is empty. Anything holding content is left in place.
 
 ## Worker Slots And Backend Registration
@@ -48,9 +46,7 @@ Each configured slot is one complete worker binding. `backend` is its implementa
 
 The `arcade` CLI registers `pi-agent`, `claude-sdk`, `claude-sdk-tst`, `openai-sdk`, and `openai-sdk-tst`. A programmatic application imports `startArcade` and the backend-authoring contracts from `arcade`, then supplies exactly the implementations it wants through `StartArcadeOptions.backends`; no stock implementation is installed implicitly. The owning application constructs any connectors around the returned services. Configuration can then select those supplied names without changing Arcade's config schema. The `arcade/backends` export supplies optional stock factories. One backend implementation can create distinct workers for any number of supported slots.
 
-Worker hub owns concurrency and queue limits independently of backend choice. A single role limiter applies even when different slots or continuations for that role use different backends.
-
-`workers.default.backend = "claude-sdk"` and `workers.roles.<role>.backend = "claude-sdk"` run normal Arc instruction tasks through the Claude Agent SDK from the long-running Arcade process. Slot fields include `model`, `timeoutMs`, `cwd`, and `sessionCache`. The model defaults to `claude-opus-4-7`; session-cache defaults are `enabled: true`, `maxLiveSessions: 16`, `maxPreparedStarts: 4`, `idleTtlMs: 300000`, and `initializeTimeoutMs: 30000`. The worker tool surface, permission bridging, and session-resume rules are specified in `docs/arcade.md` under "Claude Agent SDK Backend Protocol".
+`workers.default.backend = "claude-sdk"` and `workers.roles.<role>.backend = "claude-sdk"` run normal Arc instruction tasks through the Claude Agent SDK from the long-running Arcade process. Slot fields include `model`, `timeoutMs`, `cwd`, and `sessionCache`. The model defaults to `claude-opus-4-7`; session-cache defaults are `enabled: true`, `maxPreparedStarts: 4`, `idleTtlMs: 300000`, and `initializeTimeoutMs: 30000`. `maxPreparedStarts` and `idleTtlMs` bound unused prepared starts, and `initializeTimeoutMs` bounds preparation. The worker tool surface, permission bridging, and session-resume rules are specified in `docs/arcade.md` under "Claude Agent SDK Backend Protocol".
 
 `workers.fastTrigger.backend = "claude-sdk-tst"` runs trigger-stage frontiers through the Claude SDK tst backend and defaults `model` to `claude-haiku-4-5`. Slot fields include `model`, `timeoutMs`, `cwd`, and `fastStarts`. When `fastStarts.enabled` is true, that worker maintains a bounded pool of task-independent one-shot SDK starts. An explicit `cwd` allows startup-time preparation; otherwise the pool starts when the hub supplies `context.workspacePath` through warm-up or a routine. The backend obtains its default cwd from that context. Ready starts are consumed once; in-flight starts do not block requests, and cold query execution remains the fallback.
 

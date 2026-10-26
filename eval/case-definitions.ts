@@ -13,6 +13,18 @@ function definition(
 }
 
 export const CASES = {
+  standingGuidanceInstruction: definition(
+    "standing-guidance-instruction",
+    "uses standing guidance to format and address an instruction reply",
+  ),
+  standingGuidanceObservation: definition(
+    "standing-guidance-observation",
+    "uses standing guidance to select the observed record",
+  ),
+  standingGuidanceTrigger: definition(
+    "standing-guidance-trigger",
+    "resolves trigger questions independently of conflicting action guidance",
+  ),
   sdkSessionContinuity: definition(
     "sdk-session-continuity",
     "preserves SDK session continuity and workspace cwd",
@@ -143,6 +155,7 @@ export const CASES = {
 } as const;
 
 export const COMMUNICATION_CASES = [
+  CASES.standingGuidanceInstruction,
   CASES.replyToUser,
   CASES.showUser,
   CASES.notifySupervisor,
@@ -165,6 +178,7 @@ export const BEHAVIORAL_CASES = [
 ] as const;
 
 export const OBSERVATION_CASES = [
+  CASES.standingGuidanceObservation,
   CASES.groupedObservation,
   CASES.arrayObservation,
   CASES.groupedObserveOrAsk,

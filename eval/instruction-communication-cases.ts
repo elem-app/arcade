@@ -29,9 +29,27 @@ export function communicationDecisionCases(
   // The reply content for this case lives ONLY in the inbound message; the Arc
   // instruction never repeats it.
   const replyFromUserRequest = `release the hold on order ${randomUUID()}`;
+  const guidanceToken = randomUUID();
+  const guidancePrefix = `review-${randomUUID()}`;
   const caseInbound = (name: string): string =>
     `Run the ${name} communication case.`;
   return [
+    {
+      name: "standing-guidance-instruction",
+      inbound: `Send the status notice for ticket ${guidanceToken}.`,
+      source: communicationDecisionEvalArc(
+        "Send the requested status notice.",
+        {
+          audienceImport: true,
+          guidance: `Address status notices to \${Audience.supervisor}. The entire notice must be exactly ${guidancePrefix}:<ticket>, replacing <ticket> with the ticket identifier in the latest user message. No questions or additional text.`,
+        },
+      ),
+      expected: {
+        audience: "supervisor",
+        content: `${guidancePrefix}:${guidanceToken}`,
+      },
+      forbidQuestions: true,
+    },
     {
       name: "reply-to-user",
       inbound: caseInbound("reply-to-user"),
@@ -125,7 +143,7 @@ function oneWayCommunicationInstruction(
 
 function communicationDecisionEvalArc(
   instruction: string,
-  options: { audienceImport?: boolean } = {},
+  options: { audienceImport?: boolean; guidance?: string } = {},
 ): string {
   return `
 "arc";
@@ -139,6 +157,7 @@ function Main() {
   this.hostParams = {
     workerRole: "writer",
   };
+  ${options.guidance === undefined ? "" : `this.guidance = \`${options.guidance}\`;`}
   $instruct(\`${instruction}\`);
 }
 `;

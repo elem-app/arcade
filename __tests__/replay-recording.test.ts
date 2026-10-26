@@ -8,6 +8,7 @@ import {
   type ActionReportStep,
   type ReplayStep,
 } from "../src/testing.js";
+import { beginActivatedDriver } from "./arc-host-helpers.js";
 import { GREET_SOURCE } from "./helpers.js";
 import { makeReplayHost, runToCompletion } from "./replay-helpers.js";
 
@@ -51,6 +52,38 @@ describe("replay recording", () => {
     );
     expect(reports).toHaveLength(1);
     expect(reports[0]!.origin).toBe("worker");
+  });
+
+  it("records a worker interrupt disposition with the worker origin", async () => {
+    const { host, replay } = makeReplayHost();
+    await host.registerArc("greet", parse(GREET_SOURCE));
+    const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+    const driver = await beginActivatedDriver(host, dialog);
+    await driver.advance({
+      dialog,
+      input: {
+        reports: [
+          {
+            outcome: "disposition",
+            interrupt: { id: "external", reason: "ping" },
+          },
+        ],
+        instructionCoverage: {},
+      },
+    });
+
+    const reports = (await replay.listSteps(driver.arcRunId)).filter(
+      (step): step is ActionReportStep => step.kind === "action-report",
+    );
+    expect(reports).toEqual([
+      expect.objectContaining({
+        origin: "worker",
+        report: {
+          move: "interrupt",
+          interruption: { id: "external", reason: "ping" },
+        },
+      }),
+    ]);
   });
 
   it("records the trigger stream under the activated run id", async () => {

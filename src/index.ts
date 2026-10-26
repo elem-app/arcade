@@ -110,8 +110,12 @@ export type {
 } from "./types/messaging.js";
 export type {
   ActionReplayPosition,
+  CompatibleReplay,
   FailedReplay,
   JumpedReplay,
+  RegeneratedReplay,
+  ReplayCheckpoint,
+  ReplayHandoffReason,
 } from "./types/replay.js";
 export {
   AgentRoutineReportSchema,
@@ -129,7 +133,12 @@ export type {
   RoutineReport,
   RoutineSignal,
 } from "./types/routine.js";
-export type { InstructionTask, SemanticTask, Task } from "./types/task.js";
+export type {
+  InstructionTask,
+  SemanticTask,
+  Task,
+  TaskDisposition,
+} from "./types/task.js";
 export type { AskEvent, RunEvent, WorkEvent } from "./types/work-event.js";
 export {
   BackendNameSchema,

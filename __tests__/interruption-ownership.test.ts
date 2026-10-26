@@ -58,7 +58,7 @@ function deferred<T = void>() {
   return { promise, resolve, reject };
 }
 
-async function fixture(worker?: Worker, poison = false, concurrency = 1) {
+async function fixture(worker?: Worker, poison = false) {
   const clock = makeControlledTime();
   const store = new InMemoryArcHostStore();
   const replayStore = new InMemoryReplayStore();
@@ -69,7 +69,7 @@ async function fixture(worker?: Worker, poison = false, concurrency = 1) {
     ? makeWorkerHub({
         arcHost: host,
         logger: logging.logger,
-        defaultConcurrency: concurrency,
+
         backends: {
           controlled: {
             supportedSlotKinds: new Set(["default"]),
@@ -320,10 +320,11 @@ describe("Host interruption ownership", () => {
     },
   );
 
-  it("interruption.ownership releases the execution slot before eventual disposal completes", async () => {
+  it("interruption.ownership keeps independent execution and context reuse live during disposal", async () => {
     const releaseWorker = deferred();
     const releaseDisposal = deferred();
     const releaseCatch = deferred();
+    const releaseOther = deferred();
     const inputs: RoutineInput[] = [];
     let disposing = false;
     let otherRunId: string | undefined;
@@ -332,11 +333,13 @@ describe("Host interruption ownership", () => {
       async run(input) {
         inputs.push(input);
         if (inputs.length === 1) await releaseWorker.promise;
-        else if (input.routine.arcRunId !== otherRunId)
+        else if (input.routine.arcRunId === inputs[0]!.routine.arcRunId)
           await releaseCatch.promise;
+        else await releaseOther.promise;
         return { outcome: "completed" };
       },
-      async disposeRoutine() {
+      async disposeRoutine(input) {
+        if (input.routineId !== inputs[0]!.routine.id) return;
         disposing = true;
         await releaseDisposal.promise;
       },
@@ -371,20 +374,24 @@ describe("Host interruption ownership", () => {
           (await collectAsync(env.routineStore!.listRoutines(otherRunId)))
             .length === 1,
       );
-      expect(inputs).toHaveLength(1);
+      await waitFor(() => inputs.length === 2);
+      expect(inputs[1]!.routine.arcRunId).toBe(otherRunId);
+      expect(disposing).toBe(false);
       releaseWorker.resolve();
-      await waitFor(() => disposing);
-      await waitFor(() =>
-        inputs.some((input) => input.routine.arcRunId === otherRunId),
+      await waitFor(() => disposing && inputs.length === 3);
+      expect(inputs[2]!.routine.contextKey).toBe(inputs[0]!.routine.contextKey);
+      releaseOther.resolve();
+      await waitFor(async () =>
+        (await collectAsync(env.routineStore!.listRoutines(otherRunId!))).every(
+          (routine) => routine.status === "finished",
+        ),
       );
-      expect(
-        inputs.some((input) => input.routine.arcRunId === otherRunId),
-      ).toBe(true);
       releaseDisposal.resolve();
     } finally {
       releaseWorker.resolve();
       releaseDisposal.resolve();
       releaseCatch.resolve();
+      releaseOther.resolve();
       env.host.stop();
       await env.workerHub!.stop();
     }
@@ -420,7 +427,6 @@ describe("Host interruption ownership", () => {
         },
       },
       false,
-      2,
     );
     try {
       await collectAsync(
@@ -481,7 +487,6 @@ describe("Host interruption ownership", () => {
         async disposeRoutine() {},
       },
       false,
-      2,
     );
     await env.host.registerArc(
       "ownership",

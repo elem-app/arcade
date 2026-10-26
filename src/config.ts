@@ -9,10 +9,6 @@ import type {
   DeliveryRuleSituation,
   DeliveryTarget,
 } from "./connectors/mcp/delivery.js";
-import {
-  DEFAULT_WORKER_HUB_CONFIG,
-  WorkerHubConfigSchema,
-} from "./service/worker-hub-config.js";
 import { RawWorkersConfigSchema } from "./types/worker-slot.js";
 
 const WorkersSchema = RawWorkersConfigSchema.default({}).transform(
@@ -83,7 +79,6 @@ const ArcadeConfigShape = {
   dataDir: z.string().default(".arcade-data"),
   arcsDir: z.string().default(".arcade/arcs"),
   workers: WorkersSchema,
-  workerHub: WorkerHubConfigSchema.default(DEFAULT_WORKER_HUB_CONFIG),
   arcHost: ArcHostSchema.default({ snapshotRuntimeCacheSize: 32 }),
   logging: LoggingSchema.default({ level: "info", format: "json" }),
 };

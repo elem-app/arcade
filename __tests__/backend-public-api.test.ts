@@ -215,6 +215,7 @@ describe("backend authoring public API", () => {
 
   it("imports backend contracts prompt renderers and report validation through the package root", () => {
     const task = instructionTask();
+    task.guidance = ["Use primary sources."];
     const context = routineContext();
     const input = undefined as unknown as RoutineInput;
     const backendName: BackendName = "custom-agent";
@@ -222,6 +223,12 @@ describe("backend authoring public API", () => {
     expect(input).toBeUndefined();
     expect(backendName).toBe("custom-agent");
     expect(buildInstructionSystemPrompt(task)).toContain("Role: researcher");
+    expect(buildInstructionSystemPrompt(task)).toContain(
+      "Apply the work item's standing guidance",
+    );
+    expect(buildInstructionPrompt(task, context)).toContain(
+      '"guidance": "Use primary sources."',
+    );
     expect(buildInstructionPrompt(task, context)).toContain(
       '"outcome":"completed"',
     );
@@ -241,10 +248,14 @@ describe("backend authoring public API", () => {
       AgentRoutineReportSchema.safeParse({ suspension: "paused" }).success,
     ).toBe(false);
     expect(
-      AgentRoutineReportSchema.safeParse({ outcome: "deflected" }).success,
+      AgentRoutineReportSchema.safeParse({
+        outcome: "disposition",
+        deflect: {},
+      }).success,
     ).toBe(false);
     expect(
-      RoutineReportSchema.safeParse({ outcome: "deflected" }).success,
+      RoutineReportSchema.safeParse({ outcome: "disposition", deflect: {} })
+        .success,
     ).toBe(true);
     expect(
       RoutineReportSchema.safeParse({
@@ -269,9 +280,10 @@ describe("backend authoring public API", () => {
         const flavor: "sour" = slot.flavor;
         return {
           disposeRoutine: async () => {},
-          run: async () => ({
-            outcome: flavor === "sour" ? "completed" : "deflected",
-          }),
+          run: async () =>
+            flavor === "sour"
+              ? { outcome: "completed" as const }
+              : { outcome: "disposition" as const, deflect: {} },
         };
       },
     });
@@ -402,11 +414,7 @@ describe("backend authoring public API", () => {
 
   it("validates stock worker-slot limits and endpoints before construction", () => {
     const claudeSchema = createClaudeSdkBackend().workerSlotSchema;
-    for (const field of [
-      "maxLiveSessions",
-      "idleTtlMs",
-      "initializeTimeoutMs",
-    ] as const) {
+    for (const field of ["idleTtlMs", "initializeTimeoutMs"] as const) {
       expect(
         claudeSchema?.safeParse({
           backend: "claude-sdk",
@@ -422,6 +430,14 @@ describe("backend authoring public API", () => {
         sessionCache: { maxPreparedStarts: 0 },
       }).success,
     ).toBe(true);
+
+    expect(
+      claudeSchema?.safeParse({
+        backend: "claude-sdk",
+        kind: "default",
+        sessionCache: { maxLiveSessions: 16 },
+      }).success,
+    ).toBe(false);
 
     const claudeTstSchema = createClaudeSdkTstBackend().workerSlotSchema;
     for (const field of ["idleTtlMs", "initializeTimeoutMs"] as const) {
@@ -598,18 +614,35 @@ describe("backend authoring public API", () => {
 
   it("builds the public semantic stock prompt without resolving the requested report", () => {
     const task = semanticTask();
+    task.requests[0]!.guidance = "Treat ready as approved.";
+    task.stage = "action";
     const context = routineContext();
 
-    expect(buildSemanticSystemPrompt()).toContain(
+    expect(buildSemanticSystemPrompt(task.stage)).toContain(
       "Include a key for every request id",
     );
     expect(buildSemanticPrompt(task, context)).toContain('"id": "judge:1"');
+    expect(buildSemanticSystemPrompt(task.stage)).toContain(
+      "Apply each request's standing guidance",
+    );
+    expect(buildSemanticPrompt(task, context)).toContain(
+      '"guidance": "Treat ready as approved."',
+    );
+    task.stage = "trigger";
+    task.activeInstruction = instructionTask();
+    task.activeInstruction.guidance = ["Action-only context."];
+    expect(buildSemanticSystemPrompt(task.stage)).not.toContain("guidance");
+    expect(buildSemanticPrompt(task, context)).not.toContain('"guidance"');
+    expect(buildSemanticPrompt(task, context)).not.toContain(
+      "active-instruction",
+    );
   });
 });
 
 function instructionTask(): InstructionTask {
   return {
     kind: "instruction",
+    allowedDispositions: [],
     role: "researcher",
     phase: "apply",
     contextIsolation: "role",
@@ -626,6 +659,7 @@ function instructionTask(): InstructionTask {
 function semanticTask(): SemanticTask {
   return {
     kind: "semantic",
+    allowedDispositions: [],
     batchId: "semantic:public-api",
     role: "researcher",
     stage: "trigger",

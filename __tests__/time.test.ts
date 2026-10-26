@@ -12,6 +12,7 @@ import {
 } from "../src/service/time.js";
 import {
   arcRunKey,
+  handoffCheckpoint,
   InMemoryArcHostStore,
   InMemoryReplayStore,
   JsonFileArcHostStore,
@@ -24,7 +25,9 @@ import {
 import {
   beginActivatedDriver,
   beginDriver,
+  drainModuleEffects,
   expectSoleDriver,
+  expectSoleHandshake,
   projectorFor,
 } from "./arc-host-helpers.js";
 import { makeControlledTime } from "./controlled-time.js";
@@ -1887,7 +1890,9 @@ describe("host:time replay and cancellation", () => {
             .calls,
         ).toHaveLength(1);
         const resumed = await beginDriver(env.host, fork.arcRunId, dialog);
-        expect(resumed.frontier.briefs.instructions[0]?.text).toBe("before");
+        expect(resumed.frontier.briefs.instructions[0]?.text).toBe(
+          operation === "jump" ? "different" : "before",
+        );
         env.clock.advanceTo(1100);
         env.clock.fireDue();
         expect(
@@ -2749,3 +2754,281 @@ it("time.hub retains an interruption when pause wins during its dialog projectio
     await Promise.all([env.host.stop(), workerHub.stop()]);
   }
 });
+
+it("time.replay retains a completed registration and starts only the changed pending sleep", async () => {
+  const env = await hostFixture(
+    'Time.$addTimeout(1000, "retained"); Time.$sleep(100); $instruct("after");',
+  );
+  try {
+    const pending = await beginActivatedDriver(env.host, dialog);
+    const original = (await env.store.getState(arcRunKey(pending.arcRunId)))!;
+    expect(original.hostModules.calls).toHaveLength(2);
+    env.clock.advanceTo(1050);
+    await env.host.registerArc(
+      "candidate",
+      parse(
+        source(
+          'Time.$addTimeout(1000, "retained"); Time.$sleep(200); $instruct("after");',
+        ),
+      ),
+    );
+    const handles = env.clock.pendingCount;
+    const jumped = await env.host.jump(pending.arcRunId, "arc:candidate:Main");
+    if (jumped.status !== "compatible") throw new Error(jumped.reason);
+    expect(jumped.handoff).toBe("diverged");
+    expect(
+      handoffCheckpoint(jumped.regenerated).hostModules.calls,
+    ).toHaveLength(1);
+    expect(
+      handoffCheckpoint(jumped.regenerated).hostModules.calls[0]!.call
+        .hostCallId,
+    ).toBe(original.hostModules.calls[0]!.call.hostCallId);
+    expect(
+      handoffCheckpoint(jumped.regenerated).hostModules.calls[0]!.effects,
+    ).toEqual(original.hostModules.calls[0]!.effects);
+    expect(env.clock.pendingCount).toBe(handles);
+    const continued = await beginDriver(env.host, jumped.arcRunId, dialog);
+    const retained = (await env.store.getState(arcRunKey(jumped.arcRunId)))!
+      .hostModules.calls;
+    expect(retained).toHaveLength(2);
+    expect(retained[0]!.call.moduleData).toEqual({ deadlineMillis: 2000 });
+    expect(retained[1]!.call.moduleData).toEqual({ deadlineMillis: 1250 });
+    expect(retained[1]!.call.hostCallId).not.toBe(
+      original.hostModules.calls[1]!.call.hostCallId,
+    );
+    expect(await env.store.getState(arcRunKey(pending.arcRunId))).toEqual(
+      original,
+    );
+    env.clock.advanceTo(1100);
+    env.clock.fireDue();
+    expect(
+      (await pending.deliverEffects({ dialog })).driver.frontier.briefs
+        .instructions[0]?.text,
+    ).toBe("after");
+    expect(continued.frontier.status).toBe("blocked");
+    env.clock.advanceTo(1250);
+    env.clock.fireDue();
+    expect(
+      (await continued.deliverEffects({ dialog })).driver.frontier.briefs
+        .instructions[0]?.text,
+    ).toBe("after");
+  } finally {
+    await env.host.stop();
+  }
+});
+
+it("time.replay uses authoritative setup facts when the latest checkpoint contains newer setup", async () => {
+  const env = await hostFixture('Time.$sleep(100); $instruct("after");');
+  try {
+    const pending = await beginActivatedDriver(env.host, dialog);
+    const original = (await env.store.getState(arcRunKey(pending.arcRunId)))!;
+    const checkpoint = (
+      await env.replayStore.listCheckpoints(pending.arcRunId)
+    ).at(-1)!;
+    const newer = structuredClone(checkpoint.hostModules);
+    newer.calls[0]!.call.moduleData = { deadlineMillis: 9999 };
+    await env.replayStore.updateCheckpointHostModules(
+      pending.arcRunId,
+      checkpoint.position,
+      newer,
+    );
+    const capture = vi.spyOn(env.replayStore, "updateCheckpointHostModules");
+    const verified = await env.host.verifyReplay(
+      pending.arcRunId,
+      "arc:time:Main",
+    );
+    if (verified.status !== "compatible") throw new Error(verified.reason);
+    expect(handoffCheckpoint(verified.regenerated).hostModules).toEqual(
+      original.hostModules,
+    );
+    expect(capture).not.toHaveBeenCalled();
+    expect(
+      (await env.replayStore.listCheckpoints(pending.arcRunId)).at(-1)!
+        .hostModules,
+    ).toEqual(newer);
+  } finally {
+    await env.host.stop();
+  }
+});
+
+it("time.replay rejects an outcome that disagrees with its recorded input before candidate divergence", async () => {
+  const env = await hostFixture("Time.$addTimeout(1000); Time.$sleep(100);");
+  try {
+    const pending = await beginActivatedDriver(env.host, dialog);
+    const steps = await env.replayStore.listSteps(pending.arcRunId);
+    const input = steps.find(
+      (step) => step.kind === "action-report" && step.moduleEffect,
+    );
+    if (
+      input?.kind !== "action-report" ||
+      input.moduleEffect?.hostCallOutcome.kind !== "resolution"
+    )
+      throw new Error("Expected the timeout registration resolution.");
+    input.moduleEffect.hostCallOutcome.value = "corrupt";
+    vi.spyOn(env.replayStore, "listSteps").mockResolvedValue(steps);
+    await env.host.registerArc(
+      "candidate",
+      parse(source("Time.$addTimeout(2000); Time.$sleep(100);")),
+    );
+    await expect(
+      env.host.verifyReplay(pending.arcRunId, "arc:candidate:Main"),
+    ).rejects.toThrow(
+      "Replay resolution differs from its recorded runtime report",
+    );
+  } finally {
+    await env.host.stop();
+    vi.restoreAllMocks();
+  }
+});
+
+it("time.replay retains admitted interruption and a sleep hidden by a divergent catch judgment", async () => {
+  const body =
+    'Time.$addTimeout(100, "deadline"); Time.$sleep(200); $instruct("after");';
+  const env = await hostFixture(
+    body,
+    'this.catchInterruption = () => judge("old catch");',
+  );
+  try {
+    const pending = await beginActivatedDriver(env.host, dialog);
+    env.clock.advanceTo(1100);
+    env.clock.fireDue();
+    const catching = (await pending.deliverEffects({ dialog })).driver;
+    expect(catching.frontier.briefs.judgments[0]?.question).toBe("old catch");
+    const original = (await env.store.getState(arcRunKey(pending.arcRunId)))!;
+    const sleep = original.hostModules.calls.find(
+      (record) => record.call.operation === "sleep",
+    )!;
+    expect(sleep.runtimeCallId).toBeDefined();
+    await env.host.registerArc(
+      "candidate",
+      parse(source(body, 'this.catchInterruption = () => judge("new catch");')),
+    );
+    const jumped = await env.host.jump(pending.arcRunId, "arc:candidate:Main");
+    if (jumped.status !== "compatible") throw new Error(jumped.reason);
+    expect(jumped.handoff).toBe("diverged");
+    const retained = handoffCheckpoint(jumped.regenerated).hostModules.calls;
+    expect(retained).toHaveLength(2);
+    expect(retained[0]!.effects).toHaveLength(2);
+    expect(retained[1]!.call.hostCallId).toBe(sleep.call.hostCallId);
+    expect(retained[1]!.runtimeCallId).toBeDefined();
+    expect(
+      (await workEventsFor(env.host).list(jumped.arcRunId)).filter(
+        (event) => event.kind === "run:interruption-occurred",
+      ),
+    ).toEqual([]);
+    const resumed = await beginDriver(env.host, jumped.arcRunId, dialog);
+    expect(resumed.frontier.briefs.judgments[0]?.question).toBe("new catch");
+    env.clock.advanceTo(1200);
+    env.clock.fireDue();
+    const after = (
+      await resumed.advance({
+        dialog,
+        input: {
+          reports: [
+            {
+              outcome: "completed",
+              semantic: {
+                judgments: { [resumed.frontier.briefs.judgments[0]!.id]: true },
+              },
+            },
+          ],
+          instructionCoverage: {},
+        },
+      })
+    ).driver;
+    expect(after.frontier.briefs.instructions[0]?.text).toBe("after");
+    const calls = (await env.store.getState(arcRunKey(jumped.arcRunId)))!
+      .hostModules.calls;
+    expect(
+      calls.filter((record) => record.call.operation === "sleep"),
+    ).toHaveLength(1);
+    expect(calls[1]!.call.hostCallId).toBe(sleep.call.hostCallId);
+    expect(calls[1]!.effects).toEqual([resolution(sleep.call.hostCallId)]);
+    expect(await env.store.getState(arcRunKey(pending.arcRunId))).toEqual(
+      original,
+    );
+  } finally {
+    await env.host.stop();
+  }
+});
+
+it.each(["accepted", "rejected"] as const)(
+  "time.replay stages trigger module facts with %s re-entry and retains prior action resources",
+  async (admission) => {
+    const clock = makeControlledTime();
+    const nowMillis = vi.fn(clock.nowMillis);
+    const store = new InMemoryArcHostStore();
+    const replayStore = new InMemoryReplayStore();
+    const host = createTestArcHost({ store, replayStore, ...clock, nowMillis });
+    const arc = (pattern: string) =>
+      parse(`"arc"; import Time from "host:time";
+      function Main() {
+        this.trigger = () => Time.nowMillis() > 0 && /${pattern}/.test(Dialog.lastUserMessage);
+        this.forgetfulEntry = true;
+        Time.$addTimeout(1000, "retained");
+        $enter(Wait);
+        function Wait() { this.guard = () => State.DEFLECTED; }
+      }`);
+    const firstDialog = {
+      cursor: { user: 1, self: 0 },
+      lastTurns: [{ role: "user" as const, message: "first" }],
+    };
+    const secondDialog = {
+      cursor: { user: 2, self: 0 },
+      lastTurns: [{ role: "user" as const, message: "second" }],
+    };
+    try {
+      await host.registerArc("time", arc("first|second"));
+      const first = await beginActivatedDriver(host, firstDialog, {
+        principal: "owner",
+      });
+      const earlier = (await store.getState(arcRunKey(first.arcRunId)))!;
+      expect(earlier.lifecycle).toBe("deflected");
+      const selection = await drainModuleEffects(
+        host,
+        await host.begin({
+          dialog: secondDialog,
+          inbound: { content: "second" },
+          principal: "owner",
+          projectDialog: projectorFor(secondDialog),
+        }),
+        secondDialog,
+      );
+      const handshake = expectSoleHandshake(selection);
+      const resolved = await host.resolveHandshake(
+        handshake.handshakeId,
+        { runChoice: { action: "join", arcRunId: first.arcRunId } },
+        { projectDialog: projectorFor(secondDialog) },
+      );
+      if (resolved.status !== "ok")
+        throw new Error("Expected accepted re-entry.");
+      await drainModuleEffects(host, [resolved.step], secondDialog);
+      const original = (await store.getState(arcRunKey(first.arcRunId)))!;
+      expect(original.reactivationCount).toBe(1);
+      await host.registerArc(
+        "time",
+        arc(admission === "accepted" ? "first|second" : "first"),
+        undefined,
+        { replace: true },
+      );
+      nowMillis.mockClear();
+      const handles = clock.pendingCount;
+      const replayed = await host.verifyReplay(first.arcRunId, "arc:time:Main");
+      if (replayed.status !== "compatible") throw new Error(replayed.reason);
+      expect(replayed.handoff).toBe(
+        admission === "accepted" ? "reproduced" : "diverged",
+      );
+      expect(
+        handoffCheckpoint(replayed.regenerated).position.reactivationCount,
+      ).toBe(admission === "accepted" ? 1 : 0);
+      expect(handoffCheckpoint(replayed.regenerated).hostModules).toEqual(
+        admission === "accepted" ? original.hostModules : earlier.hostModules,
+      );
+      expect(nowMillis).not.toHaveBeenCalled();
+      expect(clock.pendingCount).toBe(handles);
+      expect(await store.getState(arcRunKey(first.arcRunId))).toEqual(original);
+    } finally {
+      await host.stop();
+    }
+  },
+);

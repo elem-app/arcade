@@ -31,8 +31,8 @@ export type WorkEventHandler = (event: WorkEvent) => Promise<void> | void;
  * - `queued` — the underlying routine is retained after an interrupt or hub
  *   pause; `routineId` is the hub's handle for later lookup via
  *   `WorkerHubService.getRoutine`.
- * - `skipped` — limiter admission was refused or the worker reported
- *   unavailable work. No coverage is recorded so the next lap can retry.
+ * - `skipped` — the worker reported unavailable work or its frontier was
+ *   superseded. No coverage is recorded for the skipped task.
  */
 export type TaskResult =
   | { status: "finished"; routineId: string; report: RoutineReport }

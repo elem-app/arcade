@@ -37,6 +37,9 @@ describe("worker context identity", () => {
             mode: "once",
             phase: "apply",
             text: "Second step.",
+            guidance: [
+              { kind: "text", value: "Use the second captured scope." },
+            ],
             hostParams: { workerRole: "researcher" },
           },
           instruction: {
@@ -51,10 +54,15 @@ describe("worker context identity", () => {
       arcRunId: "arc-run:test",
       dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
       contextIsolation: "role",
+      allowedDispositions: [],
     });
 
     expect(task.briefIds).toEqual(["instruction:first", "instruction:second"]);
     expect(task.texts).toEqual(["First step.", "Second step."]);
+    expect(JSON.parse(JSON.stringify(task)).guidance).toEqual([
+      null,
+      [{ kind: "text", value: "Use the second captured scope." }],
+    ]);
   });
 
   it("encodes role isolation as one opaque context for same-role nodes", () => {
@@ -189,6 +197,7 @@ function instructionTask(
 ): InstructionTask {
   return {
     kind: "instruction",
+    allowedDispositions: [],
     briefIds: ["instruction:test"],
     role: "researcher",
     texts: ["Research."],
@@ -208,6 +217,7 @@ function semanticTask(
 ): SemanticTask {
   return {
     kind: "semantic",
+    allowedDispositions: [],
     batchId: "semantic:test",
     role: "researcher",
     stage: "action",

@@ -1,5 +1,6 @@
 import { join } from "node:path";
 
+import type { SemanticText } from "@elem-app/arc/runtime";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -8,13 +9,20 @@ import {
   renderDialogPriming,
   renderInstructionTaskText,
   renderInstructionTaskTextForPrompt,
+  renderSemanticRequestForPrompt,
+  renderTaskForPrompt,
 } from "../src/service/task-renderer.js";
-import { type InstructionTask, type RoutineContext } from "../src/testing.js";
+import {
+  type InstructionTask,
+  type RoutineContext,
+  type SemanticRequest,
+} from "../src/testing.js";
 
 describe("task renderer", () => {
-  it("rejects instruction tasks whose texts and brief ids are misaligned", () => {
+  it("rejects instruction tasks whose texts or guidance are misaligned with brief ids", () => {
     const task: InstructionTask = {
       kind: "instruction",
+      allowedDispositions: [],
       briefIds: ["instruction:1", "instruction:2"],
       role: "researcher",
       texts: ["Only one instruction text."],
@@ -32,14 +40,23 @@ describe("task renderer", () => {
     ).toThrow(
       "Instruction task text/brief id mismatch: 1 text item(s) for 2 brief id(s).",
     );
+    task.texts = ["First instruction.", "Second instruction."];
+    task.guidance = ["Only one guidance item."];
+    expect(() =>
+      renderInstructionTaskText(task, context(), { kind: "host" }),
+    ).toThrow(
+      "Instruction task guidance/brief id mismatch: 1 guidance item(s) for 2 brief id(s).",
+    );
   });
 
   it("renders the slim active-instruction prompt contract with cells", () => {
     const task: InstructionTask = {
       kind: "instruction",
+      allowedDispositions: [],
       briefIds: ["instruction:1"],
       role: "researcher",
       texts: ["Research the scoped company."],
+      guidance: ["Use primary sources."],
       tools: [],
       cells: { ticker: "LITE" },
       arcRunId: "arc-run:test",
@@ -55,6 +72,7 @@ describe("task renderer", () => {
       ids: ["instruction:1"],
       role: "researcher",
       text: "Research the scoped company.",
+      guidance: "Use primary sources.",
       phase: "postcheck",
       cells: { ticker: "LITE" },
     });
@@ -63,6 +81,7 @@ describe("task renderer", () => {
   it("renders artifact paths for the host and for the sandbox root", () => {
     const task: InstructionTask = {
       kind: "instruction",
+      allowedDispositions: [],
       briefIds: ["instruction:1"],
       role: "writer",
       texts: [
@@ -92,11 +111,47 @@ describe("task renderer", () => {
     });
     expect(sandboxText).toBe("Write /workspace/report.txt.");
     expect(sandboxText).not.toContain(process.cwd());
+
+    task.guidance = [
+      [
+        { kind: "text", value: "Use " },
+        { kind: "artifact", path: "policy.md" },
+        { kind: "text", value: " when replying to " },
+        { kind: "hostVar", module: "audience", path: ["reviewer"] },
+        { kind: "text", value: "." },
+      ],
+    ];
+    for (const target of [
+      { kind: "host" },
+      { kind: "sandbox", sandboxRoot: "/workspace" },
+    ] as const) {
+      const rendered = renderTaskForPrompt(task, context(), target);
+      const path =
+        target.kind === "host"
+          ? join(process.cwd(), "policy.md")
+          : "/workspace/policy.md";
+      expect(rendered).toMatchObject({
+        guidance: `Use ${path} when replying to <audience:reviewer>.`,
+        audienceReferences: [
+          { marker: "<audience:reviewer>", audience: "reviewer" },
+        ],
+      });
+      expect(JSON.stringify(rendered)).not.toContain('"kind":"artifact"');
+    }
+    task.guidance = [""];
+    expect(
+      renderTaskForPrompt(task, context(), { kind: "host" }),
+    ).toHaveProperty("guidance", "");
+    delete task.guidance;
+    expect(
+      renderTaskForPrompt(task, context(), { kind: "host" }),
+    ).not.toHaveProperty("guidance");
   });
 
   it("maps entity and audience-scoped references to their audiences", () => {
     const task: InstructionTask = {
       kind: "instruction",
+      allowedDispositions: [],
       briefIds: ["instruction:1"],
       role: "writer",
       texts: [
@@ -132,6 +187,7 @@ describe("task renderer", () => {
   it("primes projected prior turns only when priming is requested", () => {
     const task: InstructionTask = {
       kind: "instruction",
+      allowedDispositions: [],
       briefIds: ["instruction:1"],
       role: "writer",
       texts: ["Continue the task."],
@@ -164,9 +220,11 @@ describe("task renderer", () => {
   it("prefixes multiple instruction texts with their brief ids", () => {
     const task: InstructionTask = {
       kind: "instruction",
+      allowedDispositions: [],
       briefIds: ["instruction:1", "instruction:2"],
       role: "writer",
       texts: ["First step.", "Second step."],
+      guidance: [null, "Use the second scope."],
       tools: [],
       cells: {},
       arcRunId: "arc-run:test",
@@ -183,6 +241,90 @@ describe("task renderer", () => {
     expect(rendered.text).toContain("First step.");
     expect(rendered.text).toContain("Instruction 2 (instruction:2):");
     expect(rendered.text).toContain("Second step.");
+    expect(rendered.guidance).toBe(
+      "Instruction 2 (instruction:2):\nUse the second scope.",
+    );
+  });
+
+  it("renders guidance on every semantic request kind and preserves absent and empty guidance", () => {
+    const common = {
+      briefId: "semantic:1",
+      role: "researcher",
+      sourceRef: "node:test:Main" as const,
+      tool: {
+        type: "function" as const,
+        name: "resolve",
+        description: "Resolve.",
+        parameters: {},
+        strict: true as const,
+      },
+    };
+    const requests: SemanticRequest[] = [
+      { ...common, kind: "judgment", question: "Ready?" },
+      {
+        ...common,
+        kind: "observation",
+        cell: "ready",
+        mode: "observe",
+        question: "Ready?",
+        meta: { type: "boolean" },
+      },
+      {
+        ...common,
+        kind: "observation-group",
+        mode: "observe",
+        fields: [
+          { cell: "ready", question: "Ready?", meta: { type: "boolean" } },
+        ],
+      },
+    ];
+    const guidance: SemanticText = [
+      { kind: "text", value: "Use " },
+      { kind: "artifact", path: "criteria.md" },
+      { kind: "text", value: " for " },
+      { kind: "entity", name: "user" },
+      { kind: "text", value: "; consult " },
+      { kind: "hostVar", module: "audience", path: ["reviewer"] },
+      { kind: "text", value: "." },
+    ];
+    for (const request of requests) {
+      for (const target of [
+        { kind: "host" },
+        { kind: "sandbox", sandboxRoot: "/workspace" },
+      ] as const) {
+        const path =
+          target.kind === "host"
+            ? join(process.cwd(), "criteria.md")
+            : "/workspace/criteria.md";
+        expect(
+          renderSemanticRequestForPrompt(
+            { ...request, guidance },
+            context(),
+            target,
+            "action",
+          ).guidance,
+        ).toBe(`Use ${path} for user; consult <audience:reviewer>.`);
+        expect(
+          renderSemanticRequestForPrompt(request, context(), target, "action"),
+        ).not.toHaveProperty("guidance");
+        expect(
+          renderSemanticRequestForPrompt(
+            { ...request, guidance: "" },
+            context(),
+            target,
+            "action",
+          ).guidance,
+        ).toBe("");
+        expect(
+          renderSemanticRequestForPrompt(
+            { ...request, guidance },
+            context(),
+            target,
+            "trigger",
+          ),
+        ).not.toHaveProperty("guidance");
+      }
+    }
   });
   it("seeds prompt example values that are admissible for each cell type", () => {
     // A wrong-typed example (e.g. a boolean for a string cell) would teach a

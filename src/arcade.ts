@@ -115,10 +115,7 @@ export async function startArcade(
     workerHub.registerRoleWorker(role, worker);
   }
   try {
-    await workerHub.start({
-      workers: config.workers,
-      scheduling: config.workerHub.scheduling,
-    });
+    await workerHub.start({ workers: config.workers });
   } catch (error) {
     await arcHost.stop();
     throw error;

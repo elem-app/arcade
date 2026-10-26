@@ -16,6 +16,7 @@ import {
   type AdvanceInput,
   type Dialog,
 } from "../src/testing.js";
+import type { HandshakeResolution } from "../src/types/handshake.js";
 import {
   StepDriver,
   advanceView,
@@ -30,9 +31,179 @@ import {
   type HandshakeStep,
   type TriggerStep,
 } from "./arc-host-helpers.js";
-import { ALICE_OWNER, GREET_SOURCE, makeArcHostWithSource } from "./helpers.js";
+import {
+  ALICE_OWNER,
+  GREET_SOURCE,
+  collectAsync,
+  makeArcHostWithSource,
+} from "./helpers.js";
 
 describe("Activation handshakes", () => {
+  it.each([
+    "workspace",
+    "active-run-choice",
+    "existing-only-run-choice",
+    "arc-choice",
+  ] as const)(
+    "hs.decline consumes %s once without activating or mutating candidate runs",
+    async (kind) => {
+      const store = new InMemoryArcHostStore();
+      const handshakes = new HandshakeStore();
+      const host = createTestArcHost({ store, handshakes });
+      const existingOnly = kind === "existing-only-run-choice";
+      const source = `"arc"; function Main() {
+        this.trigger = () => true;
+        ${existingOnly ? "$enter(Wait); function Wait() { this.guard = () => State.DEFLECTED; }" : '$instruct("Work");'}
+      }`;
+      await host.registerArc("decline-main", parse(source), {
+        workspaceScope: kind === "workspace" ? "arc" : "run",
+        bundle: {},
+        contextIsolation: "role",
+      });
+      const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+      if (kind === "active-run-choice" || existingOnly) {
+        await beginActivatedDriver(host, dialog);
+        if (existingOnly) {
+          await host.registerArc(
+            "decline-main",
+            parse(source.replace("() => true", "() => false")),
+            undefined,
+            { replace: true },
+          );
+        }
+      }
+      if (kind === "arc-choice")
+        await host.registerArc("decline-sibling", parse(source));
+      const statesBefore = structuredClone(
+        await collectAsync(store.listStates()),
+      );
+      const candidateEventsBefore = await Promise.all(
+        statesBefore.map(([, state]) =>
+          workEventsFor(host).list(state.arcRunId),
+        ),
+      );
+      const steps = await host.begin({
+        dialog,
+        principal: ALICE_OWNER,
+        inbound: { content: "start" },
+        activationPolicy: kind === "arc-choice" ? "choose" : "all",
+        projectDialog: projectorFor(dialog),
+      });
+      const gate = steps.find((step) => step.kind === "handshake");
+      if (gate?.kind !== "handshake")
+        throw new Error("Expected pending handshake");
+      expect(gate.requirement.kind).toBe(
+        kind.includes("run-choice") ? "run-choice" : kind,
+      );
+      if (existingOnly)
+        expect(gate.requirement).toMatchObject({ freshAvailable: false });
+      expect(handshakes.get(gate.handshakeId)).toBeDefined();
+      expect(await host.getRunView(gate.arcRunId)).toMatchObject({
+        stage: "handshaking",
+      });
+      await expect(
+        host.resolveHandshake(
+          gate.handshakeId,
+          { decline: true },
+          { projectDialog: projectorFor(dialog) },
+        ),
+      ).resolves.toEqual({
+        status: "ok",
+        step: {
+          kind: "rejected",
+          arcRef: gate.arcRef,
+          reason: "Arc activation declined by client.",
+        },
+      });
+      expect(handshakes.get(gate.handshakeId)).toBeUndefined();
+      expect(await host.getRunView(gate.arcRunId)).toBeUndefined();
+      expect(await collectAsync(store.listStates())).toEqual(statesBefore);
+      expect(
+        await Promise.all(
+          statesBefore.map(([, state]) =>
+            workEventsFor(host).list(state.arcRunId),
+          ),
+        ),
+      ).toEqual(candidateEventsBefore);
+      const events = await workEventsFor(host).list(gate.arcRunId);
+      expect(events.map((event) => event.kind)).toEqual([
+        "run:handshake-pending",
+        "run:handshake-resolved",
+      ]);
+      expect(events[1]).toMatchObject({
+        handshakeId: gate.handshakeId,
+        outcome: { kind: "declined" },
+      });
+      await expect(
+        host.resolveHandshake(
+          gate.handshakeId,
+          { decline: true },
+          { projectDialog: projectorFor(dialog) },
+        ),
+      ).resolves.toEqual({ status: "missing" });
+      expect(await workEventsFor(host).list(gate.arcRunId)).toEqual(events);
+    },
+  );
+
+  it("hs.decline rejects malformed and mixed decisions while retaining a valid answer", async () => {
+    for (const values of [
+      { decline: false },
+      { decline: false, workspace: "/tmp/valid" },
+      { decline: "true" },
+      { decline: null },
+      { decline: true, workspace: "/tmp/valid" },
+      { decline: true, workspace: undefined },
+      { decline: true, runChoice: { action: "fresh" } },
+      { decline: true, arcChoice: { activate: false } },
+    ]) {
+      const store = new InMemoryArcHostStore();
+      const host = createTestArcHost({ store });
+      await host.registerArc("decline-validation", parse(GREET_SOURCE), {
+        workspaceScope: "arc",
+        bundle: {},
+        contextIsolation: "role",
+      });
+      const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+      const gate = expectSoleHandshake(
+        await beginActivation(host, dialog, {
+          principal: ALICE_OWNER,
+          inbound: { content: "start" },
+        }),
+      );
+      const opts = { projectDialog: projectorFor(dialog) };
+      await expect(
+        host.resolveHandshake(
+          gate.handshakeId,
+          values as unknown as HandshakeResolution,
+          opts,
+        ),
+      ).resolves.toMatchObject({ status: "invalid" });
+      expect(await host.getRunView(gate.arcRunId)).toMatchObject({
+        stage: "handshaking",
+      });
+      expect(
+        (await workEventsFor(host).list(gate.arcRunId)).map(
+          (event) => event.kind,
+        ),
+      ).toEqual(["run:handshake-pending"]);
+      expect(await collectArcRunStates(store)).toEqual([]);
+      await expect(
+        host.resolveHandshake(
+          gate.handshakeId,
+          { workspace: "/tmp/valid" },
+          opts,
+        ),
+      ).resolves.toMatchObject({ status: "ok", step: { kind: "action" } });
+      await expect(
+        host.resolveHandshake(
+          "handshake:missing",
+          values as unknown as HandshakeResolution,
+          opts,
+        ),
+      ).resolves.toEqual({ status: "missing" });
+    }
+  });
+
   it("uses a separate existing-only selection identity and commits reentry without changing its sibling", async () => {
     const store = new InMemoryArcHostStore();
     const host = createTestArcHost({ store });

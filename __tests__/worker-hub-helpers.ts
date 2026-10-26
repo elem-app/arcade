@@ -123,6 +123,7 @@ export function semanticRequestIds(prompt: string): string[] {
 export function openAiSemanticTask(): Task {
   return {
     kind: "semantic",
+    allowedDispositions: [],
     batchId: "semantic:openai",
     role: "researcher",
     stage: "trigger",

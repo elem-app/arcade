@@ -275,8 +275,8 @@ export type ArcHostStep =
 /**
  * Result of resolving a previously staged activation handshake.
  *
- * `ok` produced a step — a fresh activation's `action` step, or a *next-round*
- * `handshake` step (e.g. an arc-choice "activate" that now needs
+ * `ok` produced a `rejected` step, a fresh activation's `action` step, or a
+ * next-round `handshake` step (e.g. an arc-choice "activate" that now needs
  * run-choice/workspace). `joined` names a validated active run for immediate
  * join handling; the submission input is not delivered to that run.
  * `missing`/`invalid` are lookup acks.

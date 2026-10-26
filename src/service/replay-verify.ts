@@ -4,7 +4,6 @@ import type {
   ArcRef,
   ArcTraversalSet,
   BriefId,
-  Dialog,
   HostCallBrief,
   InstructionBrief,
   JudgmentBrief,
@@ -26,7 +25,6 @@ import {
 import { structurallyEqual } from "../storage/base.js";
 import {
   assertHostModuleState,
-  assertModuleEffect,
   type HostModuleState,
 } from "../types/host-module.js";
 import type {
@@ -46,6 +44,7 @@ import type {
   TriggerReplayStep,
 } from "../types/replay.js";
 import { stripBrief } from "../types/replay.js";
+import { advanceHostModuleState, assertReplayEffect } from "./replay-state.js";
 
 /** Result of replaying the recorded trigger stream against a candidate runtime. */
 type TriggerReplayResult =
@@ -54,14 +53,14 @@ type TriggerReplayResult =
       arcRef: ArcRef;
       deps: ArcRef[];
       activationTraversals: ArcTraversalSet;
+      hostModules: HostModuleState;
       regenerated: TriggerReplayStep[];
     }
   | FailedReplay;
 
 /**
  * Result of replaying the recorded action stream against a candidate runtime.
- * `handoff` records why it stopped; the fork point and installable state are the
- * last `regeneratedCheckpoints` entry (see `handoffCheckpoint`).
+ * The final regenerated checkpoint retains the candidate state reached by reused reports.
  */
 type ActionReplayResult =
   | {
@@ -127,13 +126,48 @@ export function createReplayIso(): ReplayIso {
   };
 }
 
-/**
- * Replay the recorded trigger stream against a runtime holding the candidate.
- *
- * Produces the activation target (`arcRef`, `deps`) and the activation
- * traversals, and registers rename pairings into the shared iso. Requires the
- * replayed trigger to reach `matched === candidateArcRef`.
- */
+/** Stage correspondence additions and publish them only after complete admission. */
+export function stageReplayIso(parent: ReplayIso): {
+  iso: ReplayIso;
+  commit: () => void;
+} {
+  const commits: (() => void)[] = [];
+  const stage = <K, V>(base: BiMap<K, V>): BiMap<K, V> => {
+    const additions = new BiMapImpl<K, V>();
+    return {
+      get: (key) => additions.get(key) ?? base.get(key),
+      getReverse: (value) =>
+        additions.getReverse(value) ?? base.getReverse(value),
+      has: (key) => additions.has(key) || base.has(key),
+      set: (key, value) => {
+        const mapped = additions.get(key) ?? base.get(key);
+        const reverse = additions.getReverse(value) ?? base.getReverse(value);
+        if (
+          (mapped !== undefined && mapped !== value) ||
+          (reverse !== undefined && reverse !== key)
+        )
+          throw new ReplayMismatch(
+            "Iso contradiction in tentative correspondence.",
+          );
+        if (mapped === value) return;
+        additions.set(key, value);
+        commits.push(() => base.set(key, value));
+      },
+    };
+  };
+  return {
+    iso: {
+      arcs: stage(parent.arcs),
+      nodes: stage(parent.nodes),
+      briefIds: stage(parent.briefIds),
+    },
+    commit: () => {
+      for (const commit of commits) commit();
+    },
+  };
+}
+
+/** Replay a provisional trigger episode, publishing its facts only on selection. */
 export function alignTriggerReplay(args: {
   triggerRuntime: Runtime;
   steps: readonly ReplayStep[];
@@ -141,350 +175,391 @@ export function alignTriggerReplay(args: {
   iso: ReplayIso;
   reactivationCount: number;
   seedTraversals?: ArcTraversalSet;
+  hostModules?: HostModuleState;
   arcRefs?: readonly ArcRef[];
 }): TriggerReplayResult {
-  const { triggerRuntime, candidateArcRef, iso } = args;
-  const reactivationCount = args.reactivationCount;
+  const { triggerRuntime, candidateArcRef } = args;
+  const staged = stageReplayIso(args.iso);
+  const iso = staged.iso;
   const triggerSteps = args.steps.filter(
     (step) =>
       isTriggerStep(step) &&
-      step.position.reactivationCount === reactivationCount,
+      step.position.reactivationCount === args.reactivationCount,
   );
-  const triggerPosition = (index: number): TriggerReplayPosition => ({
+  const briefSteps = triggerSteps.filter(
+    (step) => step.kind === "trigger-brief",
+  );
+  const positionAt = (index: number): TriggerReplayPosition => ({
     stage: "trigger",
     index,
-    reactivationCount,
+    reactivationCount: args.reactivationCount,
   });
-  const briefSteps = triggerSteps.filter(
-    (step): step is Extract<TriggerReplayStep, { kind: "trigger-brief" }> =>
-      step.kind === "trigger-brief",
-  );
-  const reportStepFor = (
-    position: TriggerReplayPosition,
-  ): Extract<TriggerReplayStep, { kind: "trigger-report" }> | undefined =>
-    triggerSteps.find(
-      (step): step is Extract<TriggerReplayStep, { kind: "trigger-report" }> =>
-        step.kind === "trigger-report" &&
-        step.position.index === position.index,
-    );
-
-  const firstBrief = briefSteps[0];
-  if (!firstBrief) {
-    return {
-      status: "incompatible",
-      position: triggerPosition(1),
-      reason: "No recorded trigger brief to replay.",
-    };
-  }
-
+  const first = briefSteps[0];
+  if (!first) throw new Error("Missing recorded trigger episode.");
   const regenerated: TriggerReplayStep[] = [];
-  let lastPosition = triggerPosition(1);
+  let position = positionAt(1);
+  let hostModules = structuredClone(args.hostModules ?? { calls: [] });
   try {
-    let dialog: Dialog = firstBrief.dialog;
+    let dialog = first.dialog;
     let generated = triggerRuntime.startTrigger(
       args.seedTraversals ?? [],
       dialog,
       { arcRefs: args.arcRefs },
     );
+    hostModules = advanceHostModuleState(
+      hostModules,
+      generated,
+      undefined,
+      true,
+    ).hostModules;
     let index = 1;
-
-    for (const briefStep of briefSteps) {
-      const position = triggerPosition(index);
-      lastPosition = position;
-      matchTriggerBrief(briefStep.brief, generated, iso);
+    for (const source of briefSteps) {
+      position = positionAt(index);
+      const boundary = stageReplayIso(iso);
+      matchTriggerBrief(source.brief, generated, boundary.iso);
+      hostModules = transferHostModuleSetup(
+        hostModules,
+        source.hostModules,
+        source.brief.hostCalls,
+        generated.hostCalls,
+        boundary.iso,
+      );
+      boundary.commit();
       regenerated.push({
         kind: "trigger-brief",
         position,
-        dialog: briefStep.dialog,
+        dialog,
         brief: stripBrief(generated),
-        hostModules: rewriteHostModuleState(briefStep.hostModules, iso),
+        hostModules: structuredClone(hostModules),
       });
-
-      const reportStep = reportStepFor(briefStep.position);
-      if (!reportStep) break;
-
-      if (reportStep.moduleEffect) assertModuleEffect(reportStep.moduleEffect);
-      const rewritten = rewriteTriggerReport(reportStep.report, iso);
+      const report = triggerSteps.find(
+        (step) =>
+          step.kind === "trigger-report" && step.position.index === index,
+      );
+      if (!report || report.kind !== "trigger-report") break;
+      const rewritten = rewriteTriggerReport(report.report, iso);
       assertTriggerApplicable(rewritten, generated, position);
+      assertReplayEffect(report.moduleEffect, rewritten, hostModules);
+      const next = triggerRuntime.progressTrigger(
+        generated,
+        rewritten,
+        report.dialog,
+      );
+      const projected = advanceHostModuleState(
+        hostModules,
+        next,
+        report.moduleEffect,
+      );
+      if (report.moduleEffect && !projected.effectAdmitted)
+        throw new ReplayMismatch(
+          "Recorded trigger outcome is not admitted by the candidate.",
+          position,
+        );
       regenerated.push({
-        kind: "trigger-report",
+        ...structuredClone(report),
         position,
-        dialog: reportStep.dialog,
         report: rewritten,
-        origin: reportStep.origin,
-        ...(reportStep.moduleEffect
-          ? { moduleEffect: structuredClone(reportStep.moduleEffect) }
-          : {}),
       });
-      dialog = reportStep.dialog;
-      generated = triggerRuntime.progressTrigger(generated, rewritten, dialog);
+      generated = next;
+      hostModules = projected.hostModules;
+      dialog = report.dialog;
       index += 1;
     }
-
-    // Drive the candidate to its selection. When the candidate coexists with the
-    // source arc, the recorded auto-match does not recur, so a preferred-match
-    // selection (the same mechanism a normal activation uses) is synthesized.
+    // Fan-out recordings can need an explicit selection when source and candidate coexist.
     if (generated.matched !== candidateArcRef) {
-      const selectReport: TriggerReport = { preferredMatch: candidateArcRef };
-      if (validateTriggerReport(generated, selectReport).rejected) {
-        return {
-          status: "incompatible",
-          position: triggerPosition(index),
-          reason: `Replayed trigger selected ${String(generated.matched)}, candidate ${candidateArcRef} is not matchable.`,
-        };
-      }
+      const report: TriggerReport = { preferredMatch: candidateArcRef };
+      if (validateTriggerReport(generated, report).rejected)
+        throw new ReplayMismatch(
+          `Candidate ${candidateArcRef} is not matchable.`,
+          positionAt(index),
+        );
+      const next = triggerRuntime.progressTrigger(generated, report, dialog);
+      hostModules = advanceHostModuleState(hostModules, next).hostModules;
       regenerated.push({
         kind: "trigger-report",
-        position: triggerPosition(index),
+        position: positionAt(index),
         dialog,
-        report: selectReport,
+        report,
         origin: "host-preferred-match",
       });
-      generated = triggerRuntime.progressTrigger(
-        generated,
-        selectReport,
-        dialog,
-      );
+      generated = next;
       index += 1;
       regenerated.push({
         kind: "trigger-brief",
-        position: triggerPosition(index),
+        position: positionAt(index),
         dialog,
         brief: stripBrief(generated),
-        hostModules: rewriteHostModuleState(
-          briefSteps.at(-1)!.hostModules,
-          iso,
-        ),
+        hostModules: structuredClone(hostModules),
       });
     }
-
-    if (generated.matched !== candidateArcRef) {
-      return {
-        status: "incompatible",
-        position: triggerPosition(index),
-        reason: `Replayed trigger did not select candidate ${candidateArcRef} (matched ${String(generated.matched)}).`,
-      };
-    }
-
+    if (generated.matched !== candidateArcRef)
+      throw new ReplayMismatch(
+        `Replayed trigger did not select candidate ${candidateArcRef}.`,
+        positionAt(index),
+      );
+    staged.commit();
     return {
       status: "compatible",
       arcRef: candidateArcRef,
       deps: [...generated.deps],
       activationTraversals: generated.traversals,
+      hostModules,
       regenerated,
     };
   } catch (error) {
-    if (error instanceof ReplayMismatch) {
+    if (error instanceof ReplayMismatch)
       return {
         status: "incompatible",
-        position: error.position ?? lastPosition,
+        position: error.position ?? position,
         reason: error.message,
       };
-    }
     throw error;
   }
 }
 
-/**
- * Replay the recorded action stream against a candidate runtime, forward from
- * the activation seed.
- *
- * The first checkpoint gates compatibility: action checkpoint 0 must equal the
- * seed modulo iso. Once it matches, the candidate is committed to, and the walk
- * hands off at the last reproduced checkpoint as soon as the candidate matches
- * to the end or parts from the recording.
- */
+/** Preserve candidate progress independently of comparison with the next source output. */
 export function alignActionReplay(args: {
   snapshotRuntime: Runtime;
   steps: readonly ReplayStep[];
   checkpoints: readonly ReplayCheckpoint[];
   seedTraversals: ArcTraversalSet;
+  hostModules?: HostModuleState;
   iso: ReplayIso;
   untilPosition?: ActionReplayPosition;
   reactivationCount: number;
 }): ActionReplayResult {
-  const { snapshotRuntime, seedTraversals, iso, untilPosition } = args;
-  const reactivationCount = args.reactivationCount;
+  const {
+    snapshotRuntime,
+    seedTraversals,
+    iso,
+    untilPosition,
+    reactivationCount,
+  } = args;
   const actionPosition = (index: number): ActionReplayPosition => ({
     stage: "action",
     index,
     reactivationCount,
   });
-  // Index steps and checkpoints by position once; positions are unique per
-  // (output/report, index) by the store's idempotency contract, so the loop
-  // below gets each in O(1).
-  const outputSteps = new Map<
-    number,
-    Extract<ActionReplayStep, { kind: "action-brief" | "terminal-brief" }>
-  >();
-  const reportSteps = new Map<
-    number,
-    Extract<ActionReplayStep, { kind: "action-report" }>
-  >();
-  for (const step of args.steps
+  const steps = args.steps
     .filter(isActionStep)
-    .filter((step) => step.position.reactivationCount === reactivationCount)) {
-    if (step.kind === "action-report") {
-      reportSteps.set(step.position.index, step);
-    } else {
-      outputSteps.set(step.position.index, step);
-    }
-  }
-  const checkpointTraversals = new Map<number, ArcTraversalSet>(
-    args.checkpoints
-      .filter(
-        (checkpoint) =>
-          checkpoint.position.reactivationCount === reactivationCount,
-      )
-      .map((checkpoint) => [checkpoint.position.index, checkpoint.traversals]),
+    .filter((step) => step.position.reactivationCount === reactivationCount);
+  const outputs = new Map(
+    steps
+      .filter((step) => step.kind !== "action-report")
+      .map((step) => [step.position.index, step]),
   );
-  const outputStepAt = (n: number) => outputSteps.get(n);
-  const reportStepAt = (n: number) => reportSteps.get(n);
-  const checkpointAt = (n: number) => checkpointTraversals.get(n);
-  const hostModulesAt = (n: number): HostModuleState => {
-    const checkpoint = args.checkpoints.find(
-      (c) =>
-        c.position.reactivationCount === reactivationCount &&
-        c.position.index === n,
-    );
-    return rewriteHostModuleState(checkpoint?.hostModules, iso);
-  };
-
-  const regeneratedSteps: ActionReplayStep[] = [];
-  const regeneratedCheckpoints: ReplayCheckpoint[] = [
-    {
-      position: actionPosition(0),
-      traversals: seedTraversals,
-      hostModules: hostModulesAt(0),
-    },
-  ];
-  const handoff = (reason: ReplayHandoffReason): ActionReplayResult => ({
-    status: "compatible",
-    handoff: reason,
-    regeneratedSteps,
-    regeneratedCheckpoints,
-  });
-
-  // Activation gate: the candidate's seed must equal recorded checkpoint 0, the
-  // one action-stage incompatibility. This is a defensive guard — a matching
-  // trigger replay produces a seed equal to checkpoint 0 modulo iso (a body
-  // change instead surfaces as a brief-1 divergence, with checkpoint 0 intact),
-  // so a trigger-matching candidate reaching a different seed could not be
-  // constructed. It stays to catch a wrong seed reaching an installed run. See
-  // the "trigger matches but the body differs" test.
-  const checkpoint0 = checkpointAt(0);
-  if (
-    checkpoint0 === undefined ||
-    !traversalsEqualModuloIso(checkpoint0, seedTraversals, iso)
-  ) {
+  const reports = new Map(
+    steps
+      .filter((step) => step.kind === "action-report")
+      .map((step) => [step.position.index, step]),
+  );
+  const checkpoints = new Map(
+    args.checkpoints
+      .filter((cp) => cp.position.reactivationCount === reactivationCount)
+      .map((cp) => [cp.position.index, cp]),
+  );
+  const seed = checkpoints.get(0);
+  if (!seed) throw new Error("Missing recorded activation checkpoint.");
+  for (const index of outputs.keys())
+    if (!checkpoints.has(index))
+      throw new Error(`Missing replay checkpoint at action:${index}.`);
+  if (!traversalsEqualModuloIso(seed.traversals, seedTraversals, iso))
     return {
       status: "incompatible",
       position: actionPosition(0),
       reason:
         "Activation traversals differ from recorded action checkpoint 0 modulo iso.",
     };
-  }
 
-  // No recorded action work after activation: the run is reproduced at the seed.
-  const firstOutput = outputStepAt(1);
-  if (!firstOutput) return handoff("reproduced");
+  let hostModules = structuredClone(args.hostModules ?? { calls: [] });
+  // The seed contains only accepted trigger history and retained earlier action resources.
+  assertSeedHostModules(hostModules, seed.hostModules);
+  let continuation: ReplayCheckpoint = {
+    position: actionPosition(0),
+    traversals: seedTraversals,
+    hostModules: structuredClone(hostModules),
+  };
+  const regeneratedSteps: ActionReplayStep[] = [];
+  const regeneratedCheckpoints = [continuation];
+  const handoff = (reason: ReplayHandoffReason): ActionReplayResult => ({
+    status: "compatible",
+    handoff: reason,
+    regeneratedSteps,
+    regeneratedCheckpoints,
+  });
+  if (untilPosition?.index === 0 || !outputs.has(1))
+    return handoff("reproduced");
 
-  try {
-    let generated = snapshotRuntime.start(seedTraversals, firstOutput.dialog);
-    let n = 1;
-    for (;;) {
-      const position = actionPosition(n);
-      // The recording ran out at an output boundary — the candidate matched
-      // everything recorded.
-      const outputStep = outputStepAt(n);
-      if (!outputStep) return handoff("reproduced");
-
-      const { extra } = matchActionOutput(outputStep.brief, generated, iso);
-      regeneratedSteps.push(
-        generated.canProgress
-          ? {
-              kind: "action-brief",
-              position,
-              dialog: outputStep.dialog,
-              brief: stripBrief(generated),
-            }
-          : {
-              kind: "terminal-brief",
-              position,
-              dialog: outputStep.dialog,
-              brief: stripBrief(generated),
-            },
-      );
-      regeneratedCheckpoints.push({
-        position,
-        traversals: generated.traversals,
-        hostModules: hostModulesAt(n),
-      });
-
-      // The candidate's brief asks for more than the recording answered — it
-      // parts from the run here.
-      if (extra) return handoff("diverged");
-
-      const checkpoint = checkpointAt(n);
-      if (
-        checkpoint === undefined ||
-        !traversalsEqualModuloIso(checkpoint, generated.traversals, iso)
-      ) {
-        return handoff("diverged");
-      }
-
-      if (untilPosition?.index === n) return handoff("reproduced");
-
-      const reportStep = reportStepAt(n);
-      if (!generated.canProgress) {
-        if (reportStep) {
-          throw new ReplayMismatch(
-            "Recorded action report follows a terminal generated brief.",
+  let dialog = outputs.get(1)!.dialog;
+  let generated = snapshotRuntime.start(seedTraversals, dialog);
+  hostModules = advanceHostModuleState(
+    hostModules,
+    generated,
+    undefined,
+    true,
+  ).hostModules;
+  let index = 1;
+  for (;;) {
+    const position = actionPosition(index);
+    // Capture the output before matching, so divergence retains the preceding report.
+    regeneratedSteps.push(
+      generated.canProgress
+        ? {
+            kind: "action-brief",
             position,
-          );
-        }
-        const continuation = outputStepAt(n + 1);
-        if (generated.outcome === "interrupted" && continuation) {
-          generated = snapshotRuntime.start(
-            generated.traversals,
-            continuation.dialog,
-          );
-          n += 1;
-          continue;
-        }
-        return handoff("reproduced");
-      }
-      if (!reportStep) return handoff("reproduced");
-
-      if (reportStep.moduleEffect) assertModuleEffect(reportStep.moduleEffect);
-      const rewritten = rewriteActionReport(reportStep.report, iso);
-      assertActionApplicable(rewritten, generated, position);
-      regeneratedSteps.push({
-        kind: "action-report",
-        position,
-        dialog: reportStep.dialog,
-        report: rewritten,
-        origin: reportStep.origin,
-        ...(reportStep.moduleEffect
-          ? { moduleEffect: structuredClone(reportStep.moduleEffect) }
-          : {}),
-        ...(reportStep.moduleEffect === undefined
-          ? {}
-          : { moduleEffect: reportStep.moduleEffect }),
-      });
-      generated = snapshotRuntime.progress(
-        generated,
-        rewritten,
-        reportStep.dialog,
+            dialog,
+            brief: stripBrief(generated),
+          }
+        : {
+            kind: "terminal-brief",
+            position,
+            dialog,
+            brief: stripBrief(generated),
+          },
+    );
+    continuation = {
+      position,
+      traversals: generated.traversals,
+      hostModules: structuredClone(hostModules),
+    };
+    regeneratedCheckpoints.push(continuation);
+    const source = outputs.get(index);
+    const checkpoint = checkpoints.get(index);
+    if (!source || !checkpoint)
+      throw new Error(
+        `Missing recorded output or checkpoint at action:${index}.`,
       );
-      n += 1;
+    const boundary = stageReplayIso(iso);
+    try {
+      if (
+        matchActionOutput(source.brief, generated, boundary.iso).extra ||
+        !traversalsEqualModuloIso(
+          checkpoint.traversals,
+          generated.traversals,
+          boundary.iso,
+        )
+      )
+        return handoff("diverged");
+      hostModules = transferHostModuleSetup(
+        hostModules,
+        checkpoint.hostModules,
+        source.brief.canProgress ? source.brief.hostCalls : [],
+        generated.canProgress ? generated.hostCalls : [],
+        boundary.iso,
+      );
+      boundary.commit();
+    } catch (error) {
+      if (error instanceof ReplayMismatch) return handoff("diverged");
+      throw error;
     }
-  } catch (error) {
-    // A recorded brief or report differs from the regenerated one: the
-    // candidate diverged. Hand off the reproduced prefix to live execution.
-    if (error instanceof ReplayMismatch) return handoff("diverged");
-    throw error;
+    continuation.hostModules = structuredClone(hostModules);
+    if (untilPosition?.index === index) return handoff("reproduced");
+    const report = reports.get(index);
+    if (!generated.canProgress) {
+      if (report) throw new Error("Recorded report follows a terminal output.");
+      const next = outputs.get(index + 1);
+      if (generated.outcome !== "interrupted" || !next)
+        return handoff("reproduced");
+      dialog = next.dialog;
+      generated = snapshotRuntime.start(generated.traversals, dialog);
+      hostModules = advanceHostModuleState(
+        hostModules,
+        generated,
+        undefined,
+        true,
+      ).hostModules;
+      index += 1;
+      continue;
+    }
+    if (!report) return handoff("reproduced");
+    let rewritten: ActionReport;
+    try {
+      rewritten = rewriteActionReport(report.report, iso);
+      assertActionApplicable(rewritten, generated, position);
+    } catch (error) {
+      if (error instanceof ReplayMismatch) return handoff("diverged");
+      throw error;
+    }
+    assertReplayEffect(report.moduleEffect, rewritten, hostModules);
+    const next = snapshotRuntime.progress(generated, rewritten, report.dialog);
+    const projected = advanceHostModuleState(
+      hostModules,
+      next,
+      report.moduleEffect,
+    );
+    if (report.moduleEffect && !projected.effectAdmitted)
+      return handoff("diverged");
+    regeneratedSteps.push({
+      ...structuredClone(report),
+      position,
+      report: rewritten,
+    });
+    hostModules = projected.hostModules;
+    generated = next;
+    dialog = report.dialog;
+    index += 1;
   }
+}
+
+/** Transfer setup only for captured calls on a completely matched frontier. */
+function transferHostModuleSetup(
+  retained: HostModuleState,
+  source: HostModuleState,
+  sourceCalls: readonly HostCallBrief[],
+  candidateCalls: readonly HostCallBrief[],
+  iso: ReplayIso,
+): HostModuleState {
+  assertHostModuleState(source);
+  const result = structuredClone(retained);
+  const rewritten = rewriteHostModuleState(source, iso);
+  for (let index = 0; index < source.calls.length; index++) {
+    const record = source.calls[index]!;
+    const mapped = rewritten.calls[index]!;
+    const existing = result.calls.find(
+      (item) => item.call.hostCallId === record.call.hostCallId,
+    );
+    if (existing) {
+      if (!structurallyEqual(existing.effects, record.effects))
+        throw new Error(
+          "Replay checkpoint contains outcomes outside the reused inputs.",
+        );
+      // Reconstruction can acknowledge setup on an already captured occurrence.
+      existing.acknowledged = record.acknowledged;
+      existing.call.moduleData = structuredClone(record.call.moduleData);
+      continue;
+    }
+    const call = sourceCalls.find((call) => call.id === record.runtimeCallId);
+    const candidate =
+      call && candidateCalls.find((call) => call.id === mapped.runtimeCallId);
+    if (
+      !call ||
+      !candidate ||
+      !structurallyEqual(hostCallFields(call), hostCallFields(record.call))
+    )
+      throw new Error("Replay checkpoint contains an uncaptured host call.");
+    if (record.effects.length)
+      throw new Error("New replay setup contains an unplayed outcome.");
+    result.calls.push(mapped);
+  }
+  return result;
+}
+
+function assertSeedHostModules(
+  retained: HostModuleState,
+  source: HostModuleState,
+): void {
+  assertHostModuleState(source);
+  if (
+    retained.calls.length !== source.calls.length ||
+    retained.calls.some(
+      (record, index) =>
+        record.call.hostCallId !== source.calls[index]!.call.hostCallId ||
+        !structurallyEqual(record.effects, source.calls[index]!.effects),
+    )
+  )
+    throw new Error(
+      "Activation host module state differs from the accepted trigger/action history.",
+    );
 }
 
 // Matching ------------------------------------------------------------------
@@ -661,7 +736,11 @@ function pairFrontier<T extends Frontier>(
 }
 
 function judgmentFields(item: JudgmentBrief): unknown {
-  return { question: item.question, hostParams: item.hostParams };
+  return {
+    question: item.question,
+    guidance: item.guidance,
+    hostParams: item.hostParams,
+  };
 }
 
 function observationFields(
@@ -670,6 +749,7 @@ function observationFields(
   if ("fields" in item) {
     return {
       mode: item.mode,
+      guidance: item.guidance,
       hostParams: item.hostParams,
       fields: item.fields.map((field) => ({
         cell: field.cell,
@@ -683,18 +763,25 @@ function observationFields(
     cell: item.cell,
     mode: item.mode,
     question: item.question,
+    guidance: item.guidance,
     currentValue: item.currentValue,
     meta: item.meta,
     hostParams: item.hostParams,
   };
 }
 
-function hostCallFields(item: HostCallBrief): unknown {
+function hostCallFields(
+  item: Pick<
+    HostCallBrief,
+    "module" | "target" | "operation" | "arguments" | "guidance" | "hostParams"
+  >,
+): unknown {
   return {
     module: item.module,
     target: item.target,
     operation: item.operation,
     arguments: item.arguments,
+    guidance: item.guidance,
     hostParams: item.hostParams,
   };
 }
@@ -704,6 +791,7 @@ function instructionFields(item: InstructionBrief): unknown {
     mode: item.mode,
     phase: item.phase,
     text: item.text,
+    guidance: item.guidance,
     hostParams: item.hostParams,
   };
 }

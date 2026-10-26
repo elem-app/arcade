@@ -220,7 +220,7 @@ export class OpenAiSdkTstWorker implements Worker {
   #agent(task: SemanticTask): Agent<any, any> {
     return new Agent({
       name: `Arcade semantic ${task.role}`,
-      instructions: buildSemanticSystemPrompt(),
+      instructions: buildSemanticSystemPrompt("trigger"),
       model: this.#model,
     });
   }

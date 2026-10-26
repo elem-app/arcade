@@ -165,7 +165,6 @@ function arcadeConfig(config: AppConfig): StartArcadeOptions["config"] {
     dataDir: config.dataDir,
     arcsDir: config.arcsDir,
     workers: config.workers,
-    workerHub: config.workerHub,
     arcHost: config.arcHost,
     logging: config.logging,
   };

@@ -36,6 +36,7 @@ describe("WorkerHubService Claude SDK semantic routing", () => {
     });
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:claude-sdk",
       role: DEFAULT_WORKER_ROLE,
       stage: "trigger",
@@ -94,6 +95,7 @@ describe("WorkerHubService Claude SDK semantic routing", () => {
     const { arcHost } = await firstTaskWithArcHost();
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:action-sdk",
       role: DEFAULT_WORKER_ROLE,
       stage: "action",

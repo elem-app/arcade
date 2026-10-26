@@ -22,12 +22,20 @@ import {
 } from "./utils.js";
 
 /** Build the system prompt for resolving a semantic frontier (judge / observe). */
-export function buildSemanticSystemPrompt(base?: string): string {
+export function buildSemanticSystemPrompt(
+  stage: SemanticTask["stage"],
+  base?: string,
+): string {
   const parts = [
     base,
     "You are a semantic resolver for one managed workflow.",
     "Each request is either a judgment (boolean answer), a single observation (typed value extraction), or a grouped observation (several typed cells extracted together).",
-    "Answer strictly from the supplied dialog snapshot and any active instruction context.",
+    stage === "trigger"
+      ? "Answer strictly from the supplied dialog snapshot and each request's question."
+      : "Answer strictly from the supplied dialog snapshot and any active instruction context.",
+    stage === "action"
+      ? "Apply each request's standing guidance when interpreting its question and resolving its value; use active-instruction guidance when assessing that instruction. Guidance applies only to its associated work in the current assignment."
+      : undefined,
     'Return ONLY one JSON object: {"report": {"outcome": "completed", "semantic": {"judgments": {...}, "observations": {...}}}}.',
     "Include a key for every request id under judgments (boolean) or observations. A single observation maps to {status, value?}; a grouped observation maps to {fields: {<cell>: {status, value?}}} with an entry for every listed cell.",
     'For observations, status is "resolved" (with value), "unknown" (cannot determine), or "needs-user" (observeOrAsk only; user reply would help).',
@@ -44,7 +52,7 @@ export function buildSemanticPrompt(
 ): string {
   const dialog = renderDialogTurns(task.dialog.lastTurns);
   const requests = task.requests.map((request) =>
-    renderSemanticRequestForPrompt(request, context, target),
+    renderSemanticRequestForPrompt(request, context, target, task.stage),
   );
   const parts: string[] = [
     xmlBlock(
@@ -56,7 +64,7 @@ export function buildSemanticPrompt(
     "",
     xmlBlock("semantic-requests", JSON.stringify(requests, null, 2)),
   ];
-  if (task.activeInstruction) {
+  if (task.stage === "action" && task.activeInstruction) {
     const active = renderActiveInstructionForPrompt(
       task.activeInstruction,
       context,

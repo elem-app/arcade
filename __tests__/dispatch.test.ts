@@ -295,6 +295,7 @@ function Watch() {
     );
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:latest-trigger-node",
       role: DEFAULT_WORKER_ROLE,
       stage: "trigger",
@@ -341,6 +342,7 @@ function Watch() {
           restored = true;
           const persistedTask: InstructionTask = {
             kind: "instruction",
+            allowedDispositions: [],
             briefIds: ["instruction:persisted-context"],
             role: "researcher",
             texts: ["Watch for updates."],
@@ -472,6 +474,7 @@ function Watch() {
     });
     const triggerTask: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:general-backend-trigger",
       role: actionTask.role,
       stage: "trigger",
@@ -728,6 +731,7 @@ function Main() {
     const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:default",
       role: DEFAULT_WORKER_ROLE,
       stage: "trigger",
@@ -801,6 +805,7 @@ function Main() {
     const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:no-default",
       role: DEFAULT_WORKER_ROLE,
       stage: "trigger",
@@ -829,6 +834,7 @@ function Main() {
     const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:fast",
       role: DEFAULT_WORKER_ROLE,
       stage: "trigger",
@@ -872,6 +878,7 @@ function Main() {
     const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:action",
       role: DEFAULT_WORKER_ROLE,
       stage: "action",
@@ -930,6 +937,7 @@ function Main() {
     const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:override",
       role: DEFAULT_WORKER_ROLE,
       stage: "trigger",
@@ -1017,6 +1025,7 @@ function Main() {
     const provisionalPath = join(root, "provisional");
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       stage: "trigger",
       batchId: "temporary-workspace",
       role: actionTask.role,
@@ -1259,7 +1268,7 @@ function Ready() {
     expect((await stat(workspacePath!)).isDirectory()).toBe(true);
   });
 
-  it("serializes role workers by per-role concurrency cap", async () => {
+  it("serializes routines sharing one worker run and context", async () => {
     const { arcHost, task } = await firstTaskWithArcHost();
     const briefId = task.briefIds[0];
     const secondTask = {
@@ -1277,7 +1286,7 @@ function Ready() {
     };
     const { workerHub } = makeWorkerHub({
       arcHost,
-      roleConcurrency: { researcher: 1 },
+
       workers: { researcher: worker },
     });
 

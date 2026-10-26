@@ -35,6 +35,37 @@ describe("web work event status formatting", () => {
     expect(formatWorkEventDetail(event)).toBe("1 request, 20 tokens, $0.0042");
     expect(formatWorkEventOutcome(event)).toBeUndefined();
   });
+
+  it("formats a finished routine by the disposition it reported", () => {
+    const base = {
+      id: "work-event:finished",
+      arcRunId: "run:web",
+      createdAt: "2026-10-24T00:00:00.000Z",
+      kind: "routine:finished",
+      routineId: "routine:1",
+      role: "$default-worker",
+      backend: "openai-sdk",
+      nodeName: "Analyze",
+    } as const;
+    const completed: WorkEvent = { ...base, outcome: "completed" };
+    const deflected: WorkEvent = {
+      ...base,
+      outcome: "disposition",
+      disposition: "deflect",
+    };
+    const interrupted: WorkEvent = {
+      ...base,
+      outcome: "disposition",
+      disposition: "interrupt",
+    };
+
+    expect(formatWorkEventText(completed)).toBe("Routine completed");
+    expect(formatWorkEventOutcome(completed)).toBe("completed");
+    expect(formatWorkEventText(deflected)).toBe("Routine deflected");
+    expect(formatWorkEventOutcome(deflected)).toBe("deflect");
+    expect(formatWorkEventText(interrupted)).toBe("Routine interrupted");
+    expect(formatWorkEventOutcome(interrupted)).toBe("interrupt");
+  });
 });
 
 describe("node transition event formatting", () => {

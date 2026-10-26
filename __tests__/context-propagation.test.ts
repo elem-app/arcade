@@ -48,6 +48,8 @@ describe("connector-to-provider context propagation", () => {
     const inboundFact = `inbound-fact-${randomUUID()}`;
     const triggerText = `trigger-text-${randomUUID()}`;
     const actionText = `action-text-${randomUUID()}`;
+    const triggerGuidance = `trigger-guidance-${randomUUID()}`;
+    const actionGuidance = `action-guidance-${randomUUID()}`;
     const artifactName = `artifact-${randomUUID()}.txt`;
     const replyContent = `reply-content-${randomUUID()}`;
     const submittedContent = `Please handle this request. Reference: ${inboundFact}.`;
@@ -123,6 +125,8 @@ describe("connector-to-provider context propagation", () => {
         contextPropagationArc({
           triggerText,
           actionText,
+          triggerGuidance,
+          actionGuidance,
           artifactName,
         }),
       ),
@@ -184,6 +188,11 @@ describe("connector-to-provider context propagation", () => {
     expect(triggerRun).toHaveBeenCalledTimes(1);
     expect(triggerInput?.prompt).toContain(inboundFact);
     expect(triggerInput?.prompt).toContain(triggerText);
+    expect(triggerInput?.prompt).not.toContain(triggerGuidance);
+    expect(triggerInput?.prompt).not.toContain(actionGuidance);
+    expect(String(triggerInput?.agent.instructions)).not.toContain(
+      "Apply each request's standing guidance",
+    );
 
     // (4) Action instruction task: the persisted routine belongs to the run and
     // the writer role; its role-projected dialog holds the inbound fact; the
@@ -202,6 +211,8 @@ describe("connector-to-provider context propagation", () => {
     const structuredInstruction = JSON.stringify(task.texts);
     expect(structuredInstruction).toContain(actionText);
     expect(structuredInstruction).not.toContain(inboundFact);
+    expect(JSON.stringify(task.guidance)).toContain(actionGuidance);
+    expect(JSON.stringify(task.guidance)).not.toContain(triggerGuidance);
 
     // (5) Effective provider input: the mocked instruction runner receives a
     // fresh prompt carrying the inbound fact, instruction, rendered artifact
@@ -210,6 +221,12 @@ describe("connector-to-provider context propagation", () => {
     const prompt = instructionInput?.prompt ?? "";
     expect(prompt).toContain(inboundFact);
     expect(prompt).toContain(actionText);
+    expect(prompt).toContain("<guidance>");
+    expect(prompt).toContain(actionGuidance);
+    expect(prompt).not.toContain(triggerGuidance);
+    expect(String(instructionInput?.agent.instructions)).toContain(
+      "Apply standing guidance",
+    );
     expect(prompt).toContain(`/workspace/${artifactName}`);
     expect(prompt).toContain("- user -> originator");
     expect(instructionInput?.previousResponseId).toBeUndefined();
@@ -224,6 +241,9 @@ describe("connector-to-provider context propagation", () => {
       }),
     ]);
     expect(instructionRoutine.error).toBeUndefined();
+    expect(await arcHost.getRunView(arcRunId!)).toMatchObject({
+      artifactCount: 1,
+    });
     expect(instructionRoutine.backendDetails).toMatchObject({
       backend: "openai-sdk",
     });
@@ -320,12 +340,15 @@ describe("connector-to-provider context propagation", () => {
 function contextPropagationArc(markers: {
   triggerText: string;
   actionText: string;
+  triggerGuidance: string;
+  actionGuidance: string;
   artifactName: string;
 }): string {
   return `
 "arc";
 
 function Main() {
+  this.guidance = \`${markers.triggerGuidance}: interpret requests using the current dialog.\`;
   this.hostParams = {
     workerRole: "triager",
   };
@@ -340,7 +363,8 @@ function Main() {
       workerRole: "writer",
     };
     let output = Artifact("${markers.artifactName}");
-    $instruct(\`${markers.actionText}: carry out the latest user request and reply to \${user}. Record the outcome in \${output}.\`);
+    this.guidance = \`${markers.actionGuidance}: address replies to \${user}; follow the format in \${output}.\`;
+    $instruct(\`${markers.actionText}: carry out the latest user request and reply with the outcome.\`);
   }
 }
 `;

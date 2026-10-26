@@ -33,6 +33,88 @@ describe("WebAppConnector", () => {
     );
   });
 
+  it.each(["workspace", "run-choice", "arc-choice"] as const)(
+    "accepts Web decline for %s after rejecting mixed and malformed decisions",
+    async (kind) => {
+      const harness = await makeHarness();
+      const channel = new HotAsyncQueue<InboundLifecycleEvent>();
+      channel.push({
+        kind: "handshake-required",
+        arcRunId: "run:selection",
+        handshakeId: "handshake:decline",
+        arcRef: "arc:test:Main",
+        requirement:
+          kind === "run-choice"
+            ? { kind, freshAvailable: false, candidates: [] }
+            : { kind },
+      });
+      harness.submitInbound.mockReturnValueOnce(channel);
+      harness.handshake.mockImplementationOnce(async () => {
+        channel.push({
+          kind: "rejected",
+          arcRef: "arc:test:Main",
+          reason: "Arc activation declined by client.",
+        });
+        channel.close();
+        return { status: "ok" };
+      });
+      await harness.connector.start();
+      const entry = await fetch(`${harness.origin}/api/entry/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: "start" }),
+      });
+      await expect(entry.json()).resolves.toMatchObject({
+        receipt: { status: "handshake-required" },
+      });
+      const url = `${harness.origin}/api/handshakes/${encodeURIComponent("handshake:decline")}/resolve`;
+      for (const values of [
+        { decline: false },
+        { decline: false, workspace: "/tmp/workspace" },
+        { decline: "true" },
+        { decline: null },
+        { decline: true, workspace: "/tmp/workspace" },
+        { decline: true, runChoice: { action: "fresh" } },
+        { decline: true, arcChoice: { activate: false } },
+        { decline: true, arcChoice: null },
+      ]) {
+        const invalid = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ values }),
+        });
+        expect(invalid.status).toBe(400);
+        await expect(invalid.json()).resolves.toEqual({
+          error: "invalid-handshake-resolution",
+        });
+        expect(harness.handshake).not.toHaveBeenCalled();
+      }
+      const values = { decline: true };
+      const result = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(kind === "workspace" ? values : { values }),
+      });
+      expect(harness.handshake).toHaveBeenCalledExactlyOnceWith(
+        "handshake:decline",
+        { decline: true },
+        "web-local",
+      );
+      await expect(result.json()).resolves.toMatchObject({
+        receipt: {
+          status: "rejected",
+          rejectionMessage: "Arcade did not start a run for that request.",
+        },
+      });
+      expect(harness.logRecords).toContainEqual(
+        expect.objectContaining({
+          event: "connector.web_app.entry.rejected",
+          reason: "Arc activation declined by client.",
+        }),
+      );
+    },
+  );
+
   it("submits entry messages to the worker hub", async () => {
     const harness = await makeHarness();
     await harness.connector.start();
@@ -629,6 +711,11 @@ describe("WebAppConnector", () => {
       wired: true,
       receipt: { status: "activated", arcRunId: "run:already-earned" },
     });
+    expect(harness.handshake).toHaveBeenCalledWith(
+      "handshake:decline-after-success",
+      { arcChoice: { activate: false } },
+      "web-local",
+    );
   });
 
   it("chooses a deterministic Web branch fallback across handshake rounds", async () => {

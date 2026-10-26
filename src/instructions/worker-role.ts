@@ -18,6 +18,7 @@ import type {
   ContextIsolation,
   InstructionIssue,
   InstructionTask,
+  TaskDisposition,
 } from "../types/task.js";
 
 export type WorkerInstruction = {
@@ -97,6 +98,7 @@ export function buildInstructionTaskFromBriefs(args: {
   arcRunId: ArcRunId;
   dialog: Dialog;
   contextIsolation: ContextIsolation;
+  allowedDispositions: readonly TaskDisposition[];
 }): InstructionTask {
   const first = args.items[0];
   if (!first) {
@@ -107,11 +109,13 @@ export function buildInstructionTaskFromBriefs(args: {
   // instruction host params match, so the first item carries the shared
   // worker-role metadata for the whole batch.
   const sharedInstruction = first.instruction;
+  const guidance = args.items.map(({ brief }) => brief.guidance ?? null);
   return {
     kind: "instruction",
     briefIds: asInstructionBriefIds(args.items.map((item) => item.brief.id)),
     role: sharedInstruction.role,
     texts: asInstructionTexts(args.items.map((item) => item.instruction.text)),
+    ...(guidance.some((text) => text !== null) ? { guidance } : {}),
     tools: sharedInstruction.tools,
     cells: snapshotCells(args.traversals, args.active),
     arcRunId: args.arcRunId,
@@ -119,6 +123,7 @@ export function buildInstructionTaskFromBriefs(args: {
     sourceRef,
     contextIsolation: args.contextIsolation,
     phase: first.brief.phase,
+    allowedDispositions: args.allowedDispositions,
   };
 }
 

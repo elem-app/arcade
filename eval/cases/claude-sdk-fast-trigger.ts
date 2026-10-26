@@ -81,12 +81,6 @@ defineManagedEvalGroup(
       routineDiagnosticsStore: new FileRoutineDiagnosticsStore(
         join(root, "routine-diagnostics"),
       ),
-      scheduling: {
-        default: { concurrency: 3, maxQueueSize: 64 },
-        roles: {
-          [SEMANTIC_ROLE]: { concurrency: 3, maxQueueSize: 64 },
-        },
-      },
       bindings: { roles: { responder: "in-process" } },
       fastTriggerBackend: "claude-sdk-tst",
       claudeSdkTstOptions: {

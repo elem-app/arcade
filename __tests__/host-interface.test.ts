@@ -35,6 +35,68 @@ import {
 } from "./helpers.js";
 
 describe("Arc host interface", () => {
+  it("omits node guidance from every request in a shared trigger role batch", async () => {
+    const host = makeArcHost();
+    await host.registerArc(
+      "guided-triggers",
+      parse(`"arc";
+function First() {
+  this.guidance = \`First policy.\`;
+  this.trigger = () => judge(\`Requested?\`);
+}
+function Second() {
+  this.guidance = \`Second policy.\`;
+  this.trigger = () => judge(\`Requested?\`);
+}
+function Third() {
+  this.trigger = () => judge(\`Requested?\`);
+}`),
+      { workspaceScope: "arc", bundle: {}, contextIsolation: "role" },
+    );
+    const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+    const [step] = await host.begin({
+      dialog,
+      principal: ALICE_OWNER,
+      inbound: { content: "go" },
+      projectDialog: projectorFor(dialog),
+    });
+    if (step?.kind !== "trigger") throw new Error("Expected trigger work");
+    expect(step.frontier.tasks).toHaveLength(1);
+    const task = step.frontier.tasks[0]!;
+    if (task.kind !== "semantic") throw new Error("Expected semantic task");
+    expect(
+      task.requests.map(({ sourceRef, guidance }) => ({ sourceRef, guidance })),
+    ).toEqual([
+      { sourceRef: "node:guided-triggers:First", guidance: undefined },
+      { sourceRef: "node:guided-triggers:Second", guidance: undefined },
+      { sourceRef: "node:guided-triggers:Third", guidance: undefined },
+    ]);
+  });
+
+  it("carries grouped observation guidance from Arc into worker requests", async () => {
+    const host = await makeArcHostWithSource(
+      "guided-group",
+      GROUPED_OBSERVE_SOURCE.replace(
+        "function LearnPreferences() {",
+        "function LearnPreferences() { this.guidance = `Use only explicit preferences.`;",
+      ),
+    );
+    const frontier = await beginActivatedView(host, {
+      cursor: { user: 0, self: 0 },
+      lastTurns: [],
+    });
+    expect(frontier.tasks).toEqual([
+      expect.objectContaining({
+        requests: [
+          expect.objectContaining({
+            kind: "observation-group",
+            guidance: "Use only explicit preferences.",
+          }),
+        ],
+      }),
+    ]);
+  });
+
   it("exposes preparing between accepted workspace and execution commit and cleans failed commits", async () => {
     for (const fail of [false, true]) {
       const store = new InMemoryArcHostStore();
@@ -196,6 +258,7 @@ function Main() {
         `"arc";
 function Main() {
   this.trigger = () => true;
+  this.guidance = \`Use the current completion criteria.\`;
   let done = Bool();
   done.observing = \`finished\`;
   $instructLoop(\`Work.\`, { resolveWhen: () => { ${check} } });
@@ -211,6 +274,11 @@ function Main() {
       ).toHaveLength(1);
       expect(brief.tasks.map((task) => task.kind)).toEqual(["instruction"]);
       const instruction = brief.tasks[0]!;
+      if (instruction.kind !== "instruction")
+        throw new Error("expected instruction task");
+      expect(instruction.guidance).toEqual([
+        "Use the current completion criteria.",
+      ]);
       const postcheck = await advanceView(driver, dialog, {
         reports: [],
         instructionCoverage: { [taskId(instruction)]: "applied" },
@@ -221,6 +289,12 @@ function Main() {
         throw new Error("expected semantic task");
       expect(semantic.requests).toHaveLength(1);
       expect(semantic.requests[0]?.kind).toBe(kind);
+      expect(semantic.requests[0]?.guidance).toBe(
+        "Use the current completion criteria.",
+      );
+      expect(semantic.activeInstruction?.guidance).toEqual(
+        instruction.guidance,
+      );
       expect(semantic.activeInstruction?.phase).toBe("postcheck");
     },
   );

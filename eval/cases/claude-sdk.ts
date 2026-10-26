@@ -139,14 +139,14 @@ defineManagedEvalGroup(
     );
     expect(routineDetails(sdkRoutines[0]!)).toMatchObject({
       sessionCacheEnabled: true,
-      sessionCacheHit: false,
+      liveSessionReused: false,
       preparedStartUsed: true,
       cwd: workspace,
     });
     expect(routineDetails(sdkRoutines[1]!)).toMatchObject({
       sessionCacheEnabled: true,
-      sessionCacheHit: true,
-      preparedStartUsed: false,
+      liveSessionReused: false,
+      preparedStartUsed: true,
       cwd: workspace,
     });
     const secondMetadata = routineDetails(sdkRoutines[1]!);
@@ -250,8 +250,8 @@ defineManagedEvalGroup(
         contextIsolation === "role" ? 1 : 2,
       );
       expect(
-        routines.map((routine) => routineDetails(routine).sessionCacheHit),
-      ).toEqual(contextIsolation === "role" ? [false, true] : [false, false]);
+        routines.map((routine) => routineDetails(routine).liveSessionReused),
+      ).toEqual([false, false]);
       await workerHub.stop();
     }
   },
@@ -326,7 +326,7 @@ defineManagedEvalGroup(
     expect(sdkRoutine?.backendDetails).toMatchObject({
       backend: "claude-sdk",
       sessionCacheEnabled: true,
-      sessionCacheHit: false,
+      liveSessionReused: false,
       preparedStartUsed: true,
     });
     const outbounds = emitted.filter(

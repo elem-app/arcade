@@ -1,5 +1,6 @@
 import { parse } from "@elem-app/arc/parser";
 import { describe, expect, it, vi } from "vitest";
+import { renderInstructionTaskForPrompt } from "../src/index.js";
 import { renderInstructionTaskText } from "../src/testing.js";
 
 import "../eval/cases/index.js";
@@ -23,6 +24,7 @@ describe("instruction communication eval cases", () => {
   it("dispatches every case through real Arc source and prompt rendering", async () => {
     const cases = communicationDecisionCases("unit");
     expect(cases.map((item) => item.name)).toEqual([
+      "standing-guidance-instruction",
       "reply-to-user",
       "show-user",
       "notify-supervisor",
@@ -38,6 +40,7 @@ describe("instruction communication eval cases", () => {
         cases.map((item) => [item.name, item.expected?.audience ?? null]),
       ),
     ).toEqual({
+      "standing-guidance-instruction": "supervisor",
       "reply-to-user": "originator",
       "show-user": "originator",
       "notify-supervisor": "supervisor",
@@ -89,6 +92,15 @@ describe("instruction communication eval cases", () => {
 
       await waitFor(() => handler.mock.calls.length === 1);
       expect(captured, item.name).toBeDefined();
+      if (item.name === "standing-guidance-instruction") {
+        const rendered = renderInstructionTaskForPrompt(
+          captured!.task,
+          captured!.context,
+          { kind: "host" },
+        );
+        expect(rendered.guidance).toContain("<audience:supervisor>");
+        expect(rendered.text).toBe("Send the requested status notice.");
+      }
       renderedByCase.set(
         item.name,
         renderInstructionTaskText(captured!.task, captured!.context, {
@@ -136,9 +148,11 @@ describe("instruction communication eval cases", () => {
 
     for (const item of cases) {
       if (!item.expected) continue;
-      // reply-from-user-request carries its reply content only in the inbound
-      // message, so the rendered Arc instruction must NOT contain it.
-      if (item.name === "reply-from-user-request") {
+      // These cases derive reply content from the inbound or standing guidance.
+      if (
+        item.name === "reply-from-user-request" ||
+        item.name === "standing-guidance-instruction"
+      ) {
         expect(renderedByCase.get(item.name), item.name).not.toContain(
           item.expected.content,
         );

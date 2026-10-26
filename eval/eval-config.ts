@@ -19,13 +19,11 @@ import type {
   OutboundContent,
   OutboundMessage,
   RoleWorker,
-  WorkerHubSchedulingConfigInput,
 } from "../src/testing.js";
 import { registerEvalCleanup, writeEvalEvidence } from "./case-runtime.js";
 
 type EvalWorkerHubOptions = WorkerHubServiceOptions & {
   piAgentOptions?: PiAgentBackendOptions;
-  scheduling?: WorkerHubSchedulingConfigInput;
   bindings?: {
     default?: string;
     roles?: Record<string, string>;
@@ -44,7 +42,6 @@ export async function createWorkerHubEvalRuntime(
 ): Promise<WorkerHubService> {
   const {
     piAgentOptions,
-    scheduling,
     bindings,
     fastTriggerBackend,
     claudeSdkOptions,
@@ -98,10 +95,6 @@ export async function createWorkerHubEvalRuntime(
           fastTriggerBackend === null
             ? null
             : { backend: fastTriggerBackend ?? "pi-agent" },
-      },
-      scheduling: scheduling ?? {
-        default: { concurrency: 1, maxQueueSize: 64 },
-        roles: {},
       },
     });
   } catch (startError) {

@@ -23,7 +23,6 @@
       "apiKeySecret": "openai.api_key",
       // "sessionCache": {
       //   "enabled": true,
-      //   "maxLiveSessions": 16,
       //   "maxPreparedStarts": 4,
       //   "idleTtlMs": 300000,
       //   "initializeTimeoutMs": 30000,
@@ -33,16 +32,6 @@
     // "roles": {
     //   "researcher": { "backend": "researcher-custom", "model": "..." },
     // },
-  },
-
-  // -- Hub scheduling --
-  // Cap active and waiting work per role to protect backend capacity. "default"
-  // applies to every role; add "roles" overrides where different limits are needed.
-  "workerHub": {
-    "scheduling": {
-      "default": { "concurrency": 2, "maxQueueSize": 64 },
-      "roles": {},
-    },
   },
 
   // -- Secrets --

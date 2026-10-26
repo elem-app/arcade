@@ -38,6 +38,7 @@ describe("observation eval cases", () => {
       "grouped-observation",
       "array-observation",
       "grouped-observe-or-ask",
+      "standing-guidance-observation",
     ]);
     const registry = new Map(listEvalCases().map((item) => [item.id, item]));
     for (const item of cases) {

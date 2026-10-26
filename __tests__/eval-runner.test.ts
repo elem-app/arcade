@@ -175,10 +175,10 @@ console.log(JSON.stringify(summary));
     expect(() => parseEvalInvocation(["positional"])).toThrow();
   });
 
-  it("registers 30 unique case ids and disjoint smoke/extended plans", () => {
+  it("registers 33 unique case ids and disjoint smoke/extended plans", () => {
     const cases = listEvalCases();
-    expect(cases).toHaveLength(30);
-    expect(new Set(cases.map((item) => item.id)).size).toBe(30);
+    expect(cases).toHaveLength(33);
+    expect(new Set(cases.map((item) => item.id)).size).toBe(33);
 
     const smoke = planEvalExecutions(invocation({ profile: "smoke" }), cases);
     const extended = planEvalExecutions(
@@ -187,8 +187,8 @@ console.log(JSON.stringify(summary));
     );
     const all = planEvalExecutions(invocation(), cases);
     expect(smoke.executions).toHaveLength(21);
-    expect(extended.executions).toHaveLength(30);
-    expect(all.executions).toHaveLength(51);
+    expect(extended.executions).toHaveLength(36);
+    expect(all.executions).toHaveLength(57);
     const smokeIds = new Set(
       smoke.executions.map((execution) => execution.caseId),
     );

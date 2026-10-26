@@ -2,10 +2,6 @@ import type { RoutineEffects } from "./types/routine.js";
 
 export type { ArcRef, Dialog, PayloadValue } from "@elem-app/arc/runtime";
 export type { PrimitiveValue } from "@elem-app/arc/types";
-export type {
-  WorkerHubSchedulingConfig,
-  WorkerHubSchedulingConfigInput,
-} from "./service/worker-hub-config.js";
 export type { ArcDocumentSnapshotId, ArcRunId } from "./types/core.js";
 export type { CapacityLimit } from "./types/execution-control.js";
 export type {
@@ -61,6 +57,7 @@ export {
   type CompatibleReplay,
   type FailedReplay,
   type JumpedReplay,
+  type RegeneratedReplay,
   type ReplayCheckpoint,
   type ReplayHandoffReason,
   type ReplayPosition,

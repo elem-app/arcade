@@ -81,7 +81,7 @@ Defaults are `--targets=all`, all profiles, and `--repetitions=1`. Supplying `--
 --dry-run
 ```
 
-The registry has 30 stable case IDs. A default all-profile invocation expands to 51 target/case executions. The disjoint smoke tier contains 21 executions and the extended tier contains the remaining 30, so running both tiers never repeats a case. Shared general-SDK behavior is registered once per case and has separate Claude and OpenAI target executions. Claude-only artifact, permission, prepared-start, trigger-pool, and MCP handshake behavior remains explicitly target-specific.
+The registry has 33 stable case IDs. A default all-profile invocation expands to 57 target/case executions. The disjoint smoke tier contains 21 executions and the extended tier contains the remaining 36, so running both tiers never repeats a case. Shared general-SDK behavior is registered once per case and has separate Claude and OpenAI target executions. Claude-only artifact, permission, prepared-start, trigger-pool, and MCP handshake behavior remains explicitly target-specific.
 
 Examples:
 
@@ -93,9 +93,11 @@ pnpm eval --targets=claude-mcp-client --cases=mcp-active-run-choice --debug
 
 OpenAI targets require `ARCADE_OPENAI_API_KEY`. The MCP client target uses `ARCADE_EVAL_CLAUDE_COMMAND`, defaulting to `claude`, and preflights its version before execution. Claude SDK targets use ambient Claude Agent SDK authentication. The general Claude worker eval is pinned to `claude-sonnet-4-6`; `ARCADE_EVAL_CLAUDE_SDK_MODEL` can override it for an intentional model-specific probe. Claude fast-trigger evals remain pinned to `claude-haiku-4-5`. An unavailable target is classified once; its remaining executions are marked skipped while other targets continue, and the command exits nonzero.
 
+The `standing-guidance-instruction` and `standing-guidance-observation` cases check guidance-dependent reply formatting, audience selection, and record extraction on both general SDKs; their distinguishing policies appear only in `this.guidance`. The `standing-guidance-trigger` case checks both fast-trigger backends against conflicting action guidance: selection follows the authored trigger questions while node guidance stays outside the prompts.
+
 ### Behavioral eval rules
 
-Live evals are black-box behavioral checks. Every fact that distinguishes success lives in exactly one source — the inbound message, the Arc instruction, or an output artifact — and the Arc source never repeats an inbound-only fact. A worker that reaches for a missing fact by asking a question is answered with a fixed non-secret answer (`FIXED_UNEXPECTED_QUESTION_ANSWER` in `eval/eval-config.ts`) that carries no task fact, so the run terminates; `trackUnexpectedQuestions` records the question and the case fails afterward. Permission asks are not questions and do not count against a case's zero-question requirement.
+Live evals are black-box behavioral checks. Every fact that distinguishes success lives in exactly one source — the inbound message, the Arc instruction, standing guidance, or an output artifact — and the Arc source never repeats an inbound-only fact. A worker that reaches for a missing fact by asking a question is answered with a fixed non-secret answer (`FIXED_UNEXPECTED_QUESTION_ANSWER` in `eval/eval-config.ts`) that carries no task fact, so the run terminates; `trackUnexpectedQuestions` records the question and the case fails afterward. Permission asks are not questions and do not count against a case's zero-question requirement.
 
 Interaction cases state audience intent in ordinary Arc-author language. They do not name managed-worker tools, reproduce tool argument shapes, or use tool-specific trigger phrases to force the expected behavior; selecting the correct interaction tool is part of the behavior under evaluation.
 

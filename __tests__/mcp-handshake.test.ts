@@ -188,6 +188,20 @@ function Main() {
         expect(text).toContain("To join");
         expect(text).not.toContain("start fresh");
         expect(text).not.toContain('"action": "fresh"');
+        const before = await collectStates(env.arcHostStore);
+        const declined = await client.callTool({
+          name: "arcade_resolve_handshake",
+          arguments: { id: readHandshakeId(text), values: { decline: true } },
+        });
+        expect(toolText(declined)).toBe(
+          "Arcade did not start a run for that request.",
+        );
+        expect(await collectStates(env.arcHostStore)).toEqual(before);
+        const repeated = await client.callTool({
+          name: "arcade_resolve_handshake",
+          arguments: { id: readHandshakeId(text), values: { decline: true } },
+        });
+        expect(toolText(repeated)).toContain("No pending handshake");
       } finally {
         await client.close();
       }

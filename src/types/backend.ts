@@ -55,11 +55,21 @@ export interface WorkerHost {
   state: WorkerStateStore;
 }
 
-/** Configured live instance of one backend implementation. */
+/**
+ * Configured live instance of one backend implementation.
+ * The hub serializes preparation, invocation, and continuity writes for each
+ * worker/run/context. Distinct contexts may warm and run concurrently, including
+ * in the same workspace. Each invocation owns its handlers and execution state;
+ * shared workspace files remain subject to concurrent modification.
+ */
 export interface Worker {
   warm?(input: WorkerWarmupInput): Promise<void>;
   run(input: RoutineInput): Promise<RoutineReport>;
-  /** Idempotently release this routine's continuation after its invocation settles. */
+  /**
+   * Idempotently release this routine's resources after its invocation settles.
+   * Disposal may overlap another context's invocation or a successor in the
+   * same context, and must preserve resources owned by those routines.
+   */
   disposeRoutine(input: {
     arcRunId: ArcRunId;
     routineId: string;

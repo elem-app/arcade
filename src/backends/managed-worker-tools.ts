@@ -41,6 +41,7 @@ export const WORKER_INTERACTION_SYSTEM_PROMPT = [
   "- Treat <instruction>, when present, as the complete authority for what work the assignment requires.",
   "- Treat <semantic-requests>, when present, as the values the assignment must resolve.",
   "- Treat <active-instruction> as reference context for <semantic-requests>, not an assignment to execute. In postcheck, its instruction has already been applied; evaluate the requested values without repeating its work or audience interactions.",
+  "- Apply standing guidance in <guidance> or a guidance field when interpreting and carrying out its associated instruction or semantic request, including audience interaction. Guidance applies only to its associated work in the current assignment.",
   "- Treat <rules> as the execution contract for performing that work. Rules constrain execution; they do not introduce additional work.",
   "- Apply <rules> while carrying out the task content. Do not infer additional work from surrounding workflow context, role expertise, or related files.",
   "",

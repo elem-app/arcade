@@ -1114,7 +1114,7 @@ function Main() {
     expect(handler).toHaveBeenCalledTimes(2);
   });
 
-  it("pauses a routine waiting behind the role concurrency limit before it starts", async () => {
+  it("pauses a routine waiting for its worker context before it starts", async () => {
     const { arcHost, task } = await instructionTaskFromRun();
     const second = {
       ...task,
@@ -1132,13 +1132,13 @@ function Main() {
     });
     const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
-      roleConcurrency: { researcher: 1 },
+
       workers: { researcher: handler as unknown as RoleWorker },
     });
 
     const first = workerHub.handleTask(task, routineContext(task));
     await waitFor(() => started.length === 1);
-    // Dispatched while the cap is full, so this one waits outside its worker.
+    // Dispatched into the same context, so this one waits outside its worker.
     const waiting = workerHub.handleTask(second, routineContext(second));
     await expect(workerHub.requestPause(task.arcRunId)).resolves.toMatchObject({
       outcome: "requested",
@@ -1147,7 +1147,7 @@ function Main() {
 
     releaseFirst();
     await expect(first).resolves.toMatchObject({ status: "finished" });
-    // Taking the freed slot, the waiting routine checks the pause first and
+    // Acquiring the context, the waiting routine checks the pause first and
     // parks at its start boundary instead of entering the worker.
     const queued = await waiting;
     expect(queued).toMatchObject({ status: "queued" });

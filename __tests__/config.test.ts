@@ -8,7 +8,6 @@ import {
   parseAppConfig,
   parseArcadeConfig,
 } from "../src/config.js";
-import { parseWorkerHubSchedulingConfig } from "../src/service/worker-hub-config.js";
 
 describe("parseArcadeConfig", () => {
   it("keeps connector configuration outside the Arcade library config", () => {
@@ -16,12 +15,6 @@ describe("parseArcadeConfig", () => {
       dataDir: ".arcade-data",
       arcsDir: ".arcade/arcs",
       workers: { roles: {} },
-      workerHub: {
-        scheduling: {
-          default: { concurrency: 1, maxQueueSize: 64 },
-          roles: {},
-        },
-      },
       arcHost: { snapshotRuntimeCacheSize: 32 },
       logging: { level: "info", format: "json" },
     });
@@ -40,36 +33,15 @@ describe("parseAppConfig", () => {
     expect(result.workers).toEqual({ roles: {} });
   });
 
-  it("applies worker hub scheduling defaults", () => {
+  it("applies App defaults without role scheduling", () => {
     expect(parseAppConfig("{}", "test.jsonc")).toEqual({
       dataDir: ".arcade-data",
       arcsDir: ".arcade/arcs",
       workers: { roles: {} },
-      workerHub: {
-        scheduling: {
-          default: { concurrency: 1, maxQueueSize: 64 },
-          roles: {},
-        },
-      },
       deliveryRules: [],
       connectors: {},
       arcHost: { snapshotRuntimeCacheSize: 32 },
       logging: { level: "info", format: "json" },
-    });
-  });
-
-  it("applies nested defaults to programmatic worker hub scheduling input", () => {
-    expect(parseWorkerHubSchedulingConfig({})).toEqual({
-      default: { concurrency: 1, maxQueueSize: 64 },
-      roles: {},
-    });
-    expect(
-      parseWorkerHubSchedulingConfig({
-        roles: { researcher: { concurrency: 2 } },
-      }),
-    ).toEqual({
-      default: { concurrency: 1, maxQueueSize: 64 },
-      roles: { researcher: { concurrency: 2 } },
     });
   });
 
@@ -94,14 +66,6 @@ describe("parseAppConfig", () => {
             },
           },
         },
-        workerHub: {
-          scheduling: {
-            default: { concurrency: 3, maxQueueSize: 20 },
-            roles: {
-              researcher: { concurrency: 2, maxQueueSize: 5 },
-            },
-          },
-        },
       }),
       "test.jsonc",
     );
@@ -119,10 +83,6 @@ describe("parseAppConfig", () => {
       backend: "researcher-custom",
       endpoint: "https://workers.example.test",
       nested: { retries: 2 },
-    });
-    expect(result.workerHub.scheduling).toEqual({
-      default: { concurrency: 3, maxQueueSize: 20 },
-      roles: { researcher: { concurrency: 2, maxQueueSize: 5 } },
     });
   });
 
@@ -175,37 +135,16 @@ describe("parseAppConfig", () => {
     ).toThrow(/backend/);
   });
 
-  it("rejects non-positive or fractional worker hub concurrency", () => {
-    for (const concurrency of [0, -1, 1.5]) {
-      expect(() =>
-        parseAppConfig(
-          JSON.stringify({
-            workerHub: {
-              scheduling: {
-                default: { concurrency, maxQueueSize: 64 },
-              },
-            },
-          }),
-          "bad-concurrency.jsonc",
-        ),
-      ).toThrow(/failed validation/);
-    }
-  });
-
-  it("rejects negative or fractional worker hub queue size", () => {
-    for (const maxQueueSize of [-1, 1.5]) {
-      expect(() =>
-        parseAppConfig(
-          JSON.stringify({
-            workerHub: {
-              scheduling: {
-                default: { concurrency: 1, maxQueueSize },
-              },
-            },
-          }),
-          "bad-queue.jsonc",
-        ),
-      ).toThrow(/failed validation/);
+  it("rejects removed worker hub scheduling configuration", () => {
+    for (const parse of [parseAppConfig, parseArcadeConfig]) {
+      for (const workerHub of [
+        {},
+        { scheduling: { default: { concurrency: 1, maxQueueSize: 64 } } },
+      ]) {
+        expect(() =>
+          parse(JSON.stringify({ workerHub }), "removed-scheduling.jsonc"),
+        ).toThrow(/unrecognized key/i);
+      }
     }
   });
 

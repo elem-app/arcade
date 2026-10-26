@@ -215,7 +215,7 @@ const CompletedReportShape = {
   outcome: z.literal("completed"),
   semantic: SemanticReportSchema.optional(),
 };
-const DeflectedReportShape = { outcome: z.literal("deflected") };
+const DispositionReportShape = { outcome: z.literal("disposition") };
 const FailedReportShape = {
   error: z.literal("failed"),
   code: z.string().min(1).default("agent-failed"),
@@ -238,17 +238,33 @@ export const AgentRoutineReportSchema = z.union([
 
 /**
  * Agent-authored report subset. Agents can complete or report a permanent
- * failure; deflection, backend control outcomes, and evidence are worker-owned.
+ * failure; dispositions, backend control outcomes, and evidence are worker-owned.
  */
 export type AgentRoutineReport =
-  | OutcomeReport<typeof AgentCompletedReportSchema>
-  | ErrorReport<typeof AgentFailedReportSchema>;
+  | ReportVariant<typeof AgentCompletedReportSchema>
+  | ReportVariant<typeof AgentFailedReportSchema>;
 
 const CompletedRoutineReportSchema = z
   .strictObject({ ...CompletedReportShape, ...BackendDetailsShape })
   .superRefine(rejectExplicitUndefined("semantic", "backendDetails"));
-const DeflectedRoutineReportSchema = z
-  .strictObject({ ...DeflectedReportShape, ...BackendDetailsShape })
+const DeflectRoutineReportSchema = z
+  .strictObject({
+    ...DispositionReportShape,
+    deflect: z.strictObject({}),
+    ...BackendDetailsShape,
+  })
+  .superRefine(rejectExplicitUndefined("backendDetails"));
+const InterruptRoutineReportSchema = z
+  .strictObject({
+    ...DispositionReportShape,
+    interrupt: z
+      .strictObject({
+        id: z.string().min(1),
+        reason: z.string().optional(),
+      })
+      .superRefine(rejectExplicitUndefined("reason")),
+    ...BackendDetailsShape,
+  })
   .superRefine(rejectExplicitUndefined("backendDetails"));
 const FailedRoutineReportSchema = z
   .strictObject({ ...FailedReportShape, ...BackendDetailsShape })
@@ -288,7 +304,8 @@ const UnavailableRoutineReportSchema = z
 /** Zod schema for the complete structural result returned by `Worker.run(...)`. */
 export const RoutineReportSchema = z.union([
   CompletedRoutineReportSchema,
-  DeflectedRoutineReportSchema,
+  DeflectRoutineReportSchema,
+  InterruptRoutineReportSchema,
   FailedRoutineReportSchema,
   PausedRoutineReportSchema,
   CancelledRoutineReportSchema,
@@ -300,23 +317,30 @@ export const RoutineReportSchema = z.union([
 /**
  * Complete worker report protocol.
  *
- * Exactly one discriminator is present: `outcome` for successful completion
- * or deflection, `suspension` for retained work that can continue,
- * `cancellation` for superseded work, or `error` for a failed or unavailable result.
+ * Exactly one discriminator is present: `outcome` for a completed routine,
+ * `suspension` for retained work that can continue, `cancellation` for
+ * superseded work, or `error` for a failed or unavailable result.
+ *
+ * A completed routine either answers its task (`outcome: "completed"`) or
+ * reports a disposition (`outcome: "disposition"`): exactly one of `deflect`
+ * or `interrupt`. A disposition concludes the task's whole frontier rather
+ * than answering the task, and is accepted only when listed in the task's
+ * `allowedDispositions`. The run's resulting state remains Arc's decision.
  *
  * `backendDetails` is a patch over the routine's durable backend evidence:
  * omission retains the prior value, `null` clears it, and any other canonical
  * JSON value replaces it.
  */
 export type RoutineReport =
-  | OutcomeReport<typeof CompletedRoutineReportSchema>
-  | OutcomeReport<typeof DeflectedRoutineReportSchema>
-  | ErrorReport<typeof FailedRoutineReportSchema>
-  | SuspensionReport<typeof PausedRoutineReportSchema>
-  | SuspensionReport<typeof CapacityLimitedRoutineReportSchema>
-  | SuspensionReport<typeof TransportLostRoutineReportSchema>
-  | CancellationReport<typeof CancelledRoutineReportSchema>
-  | ErrorReport<typeof UnavailableRoutineReportSchema>;
+  | ReportVariant<typeof CompletedRoutineReportSchema>
+  | ReportVariant<typeof DeflectRoutineReportSchema>
+  | ReportVariant<typeof InterruptRoutineReportSchema>
+  | ReportVariant<typeof FailedRoutineReportSchema>
+  | ReportVariant<typeof PausedRoutineReportSchema>
+  | ReportVariant<typeof CapacityLimitedRoutineReportSchema>
+  | ReportVariant<typeof TransportLostRoutineReportSchema>
+  | ReportVariant<typeof CancelledRoutineReportSchema>
+  | ReportVariant<typeof UnavailableRoutineReportSchema>;
 
 /** Validate the complete `Worker.run(...)` result protocol. */
 export function validateRoutineReport(
@@ -369,29 +393,22 @@ function isArcRefValue(value: unknown): value is ArcRef {
   return typeof value === "string" && isArcRef(value);
 }
 
-type OutcomeReport<TSchema extends z.ZodType> = z.output<TSchema> & {
-  suspension?: never;
-  cancellation?: never;
-  error?: never;
-};
+/** Every top-level field that selects or shapes a routine report variant. */
+type ReportKey =
+  | "outcome"
+  | "suspension"
+  | "cancellation"
+  | "error"
+  | "semantic"
+  | "deflect"
+  | "interrupt";
 
-type SuspensionReport<TSchema extends z.ZodType> = z.output<TSchema> & {
-  outcome?: never;
-  cancellation?: never;
-  error?: never;
-  semantic?: never;
-};
-
-type CancellationReport<TSchema extends z.ZodType> = z.output<TSchema> & {
-  outcome?: never;
-  suspension?: never;
-  error?: never;
-  semantic?: never;
-};
-
-type ErrorReport<TSchema extends z.ZodType> = z.output<TSchema> & {
-  outcome?: never;
-  suspension?: never;
-  cancellation?: never;
-  semantic?: never;
+/**
+ * One report variant, with each `ReportKey` it does not carry typed as an
+ * absent `never`. Every variant then exposes every key, so callers can test
+ * `report.error === "failed"` or `report.interrupt` on the whole union and
+ * narrow by it.
+ */
+type ReportVariant<TSchema extends z.ZodType> = z.output<TSchema> & {
+  [K in Exclude<ReportKey, keyof z.output<TSchema>>]?: never;
 };

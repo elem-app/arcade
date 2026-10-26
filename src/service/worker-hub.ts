@@ -74,10 +74,9 @@ import type {
   RoutineReport,
   ToolEventInput,
 } from "../types/routine.js";
-import { taskId, type Task } from "../types/task.js";
+import { taskId, type Task, type TaskDisposition } from "../types/task.js";
 import type { BlockedEventFields, WorkEvent } from "../types/work-event.js";
 import type { BackendName, RawWorkersConfig } from "../types/worker-slot.js";
-import { AsyncLimiter } from "../utils/async-limiter.js";
 import { HotAsyncQueue } from "../utils/hot-async-queue.js";
 import { KeyedSerializer } from "../utils/keyed-serializer.js";
 import type { ArcHostService, NodeInfo } from "./arc-host.js";
@@ -95,12 +94,6 @@ import {
 import { validateRoutineReport } from "./utils.js";
 import type { WorkEventService } from "./work-events.js";
 import { taskSourceRef, workerContextKey } from "./worker-context.js";
-import {
-  DEFAULT_WORKER_HUB_SCHEDULING,
-  parseWorkerHubSchedulingConfig,
-  type WorkerHubSchedulingConfig,
-  type WorkerHubSchedulingConfigInput,
-} from "./worker-hub-config.js";
 import { WorkerRegistry, type ResolvedWorker } from "./worker-registry.js";
 
 /**
@@ -154,7 +147,6 @@ export type WorkerHubServiceOptions = {
 /** One-shot startup input resolved against the registered backend implementations. */
 export type WorkerHubStartOptions = {
   workers?: RawWorkersConfig;
-  scheduling?: WorkerHubSchedulingConfigInput;
 };
 
 type Lifecycle =
@@ -402,11 +394,9 @@ export class WorkerHubService {
   readonly #controlMutations = new KeyedSerializer<ArcRunId>();
   readonly #workerRegistry: WorkerRegistry;
   readonly #routineWorkers = new Map<string, ResolvedWorker>();
-  #scheduling: WorkerHubSchedulingConfig = DEFAULT_WORKER_HUB_SCHEDULING;
   #lifecycle: Lifecycle = "registering";
   #startupPromise?: Promise<void>;
   #stopPromise?: Promise<void>;
-  readonly #roleLimiters = new Map<string, AsyncLimiter>();
   /**
    * Three-level lookup tree for outbound handler dispatch: role → audience →
    * cause. Each level has an `exact` map keyed by the literal value and an
@@ -936,7 +926,6 @@ export class WorkerHubService {
 
     let startup: Promise<void>;
     try {
-      this.#scheduling = parseWorkerHubSchedulingConfig(options.scheduling);
       startup = this.#workerRegistry.start(options.workers ?? {});
     } catch (error) {
       this.#lifecycle = "failed";
@@ -996,7 +985,6 @@ export class WorkerHubService {
       this.#workScopes.clear();
       this.#pausedContinuations.clear();
       this.#routineWorkers.clear();
-      this.#roleLimiters.clear();
       this.#lifecycle = "stopped";
     }
   }
@@ -1265,8 +1253,8 @@ export class WorkerHubService {
   }
 
   /**
-   * Resolve a pending activation handshake and schedule the stored inbound
-   * through the regular queue path.
+   * Resolve a pending activation handshake through the regular queue path.
+   * A decline settles its branch with a rejection on the originating channel.
    */
   async handshake(
     id: string,
@@ -1858,20 +1846,23 @@ export class WorkerHubService {
 
     this.#retireAcceptedResults(workScope, event.results);
 
-    if (hasFailedResult) {
+    const probeFailed = event.results.some(
+      (result) => triggerFailureReason(result) !== undefined,
+    );
+    if (probeFailed) {
       // Failure retires this probe. A queued task in the same result batch must
       // not leave a retry or retained worker for the retired probe.
       this.#clearCapacityRetry(event.arcRunId);
       for (const result of event.results) {
         if (result.status === "queued")
           this.#routineWorkers.delete(result.routineId);
-        if (result.status !== "finished" || result.report.error !== "failed")
-          continue;
+        const reason = triggerFailureReason(result);
+        if (result.status !== "finished" || reason === undefined) continue;
         this.#submissionChannel(event.submissionId)?.push({
           kind: "failed",
           arcRunId: event.arcRunId,
           routineId: result.routineId,
-          reason: result.report.message,
+          reason,
         });
       }
     }
@@ -1903,11 +1894,7 @@ export class WorkerHubService {
     }
     // Settled: finish this (volatile) trigger lap and dispatch the fork onto
     // fresh per-run drains, recording the held inbound into each activated run.
-    this.#finishLap(
-      lap,
-      hasFailedResult ? "failed" : "activated",
-      "fanned-out",
-    );
+    this.#finishLap(lap, probeFailed ? "failed" : "activated", "fanned-out");
     const inbound =
       event.submissionId !== undefined
         ? this.#submissions.get(event.submissionId)?.inbound
@@ -2006,8 +1993,9 @@ export class WorkerHubService {
    * Execute the work described by an Arc-derived task.
    *
    * Tasks are persisted as routines and dispatched to the registered role
-   * handler with per-role concurrency caps.
+   * handler under worker context serialization.
    */
+  // Despite being public, this method is only ever used by tests.
   async handleTask(
     task: Task,
     context: RoutineContext,
@@ -2127,7 +2115,14 @@ export class WorkerHubService {
         workScope,
       );
       results.push(result);
-      if (result.status === "queued" || scopeCancelled(workScope)) break;
+      // A disposition concludes the whole frontier, so the batch's remaining
+      // tasks would answer work that no longer stands.
+      if (
+        result.status === "queued" ||
+        isDispositionResult(result) ||
+        scopeCancelled(workScope)
+      )
+        break;
     }
     const affectedRuns = new Set(entries.map((entry) => entry.task.arcRunId));
     await Promise.all(
@@ -2232,7 +2227,6 @@ export class WorkerHubService {
       contexts = new KeyedSerializer<string>();
       this.#workerContexts.set(selected.worker, contexts);
     }
-    let entered = false;
     try {
       let report = await contexts.run<RoutineReport | TaskResult>(
         JSON.stringify([routine.arcRunId, contextKey]),
@@ -2240,79 +2234,70 @@ export class WorkerHubService {
           try {
             if (scopeCancelled(workScope) && owned)
               return this.#skipSupersededRoutine(owned);
-            return await this.#roleLimiter(routine.role).run<
-              RoutineReport | TaskResult
-            >(async () => {
-              entered = true;
-              let report: RoutineReport;
-              const scope = this.#effectsForRoutine(
+            let report: RoutineReport;
+            const scope = this.#effectsForRoutine(
+              routine,
+              backend,
+              node,
+              workScope,
+            );
+            try {
+              const paused = await this.#pauseRequested(routine.arcRunId);
+              if (scopeCancelled(workScope) && owned) {
+                return this.#skipSupersededRoutine(owned);
+              }
+              if (paused) {
+                await this.#markRoutinePaused(routine, "routine-start", owned);
+                if (scopeCancelled(workScope) && owned)
+                  return this.#skipSupersededRoutine(owned);
+                return { status: "queued", routineId: routine.id };
+              }
+              await this.#emitRoutineEvent(
                 routine,
                 backend,
                 node,
-                workScope,
+                "routine:started",
               );
-              try {
-                const paused = await this.#pauseRequested(routine.arcRunId);
-                if (scopeCancelled(workScope) && owned) {
-                  return this.#skipSupersededRoutine(owned);
-                }
-                if (paused) {
-                  await this.#markRoutinePaused(
-                    routine,
-                    "routine-start",
-                    owned,
-                  );
-                  if (scopeCancelled(workScope) && owned)
-                    return this.#skipSupersededRoutine(owned);
-                  return { status: "queued", routineId: routine.id };
-                }
-                await this.#emitRoutineEvent(
-                  routine,
-                  backend,
-                  node,
-                  "routine:started",
+              // Preparation shares the context serializer with invocation and
+              // continuity writes; independent contexts can prepare concurrently.
+              context = await this.#prepareRoutineContext(task, context);
+              if (this.#unusableWorkers.has(selected.worker))
+                throw new Error(
+                  "Worker resource release failed; this worker cannot be reused.",
                 );
-                // Prepare inside the role queue so filesystem latency cannot reorder
-                // direct handleTask calls before they acquire their execution slots.
-                context = await this.#prepareRoutineContext(task, context);
-                if (this.#unusableWorkers.has(selected.worker))
-                  throw new Error(
-                    "Worker resource release failed; this worker cannot be reused.",
-                  );
-                // Resumption consumes live provider state retained by this worker.
-                if (!options.resume)
-                  await this.#warmWorker(selected, task, context, contextKey);
-                const input: RoutineInput = {
-                  routine: describeRoutine(routine, contextKey),
-                  context,
-                  effects: scope.effects,
-                  diagnostics,
-                };
-                if (scopeCancelled(workScope) && owned) {
-                  return this.#skipSupersededRoutine(owned);
-                }
-                if (this.#unusableWorkers.has(selected.worker))
-                  throw new Error(
-                    "Worker resource release failed; this worker cannot be reused.",
-                  );
-                let rawReport: unknown;
-                try {
-                  rawReport = await selected.worker.run(input);
-                } catch (error) {
-                  rawReport = backendFailureReport(error);
-                }
-                report = await this.#validateReportForTask(
-                  rawReport,
-                  routine,
-                  diagnostics,
-                  backend,
-                );
-              } finally {
-                scope.dispose();
+              // Resumption consumes live provider state retained by this worker.
+              if (!options.resume)
+                await this.#warmWorker(selected, task, context, contextKey);
+              const input: RoutineInput = {
+                routine: describeRoutine(routine, contextKey),
+                context,
+                effects: scope.effects,
+                diagnostics,
+              };
+              if (scopeCancelled(workScope) && owned) {
+                return this.#skipSupersededRoutine(owned);
               }
+              if (this.#unusableWorkers.has(selected.worker))
+                throw new Error(
+                  "Worker resource release failed; this worker cannot be reused.",
+                );
+              let rawReport: unknown;
+              try {
+                rawReport = await selected.worker.run(input);
+              } catch (error) {
+                rawReport = backendFailureReport(error);
+              }
+              report = await this.#validateReportForTask(
+                rawReport,
+                routine,
+                diagnostics,
+                backend,
+              );
+            } finally {
+              scope.dispose();
+            }
 
-              return report;
-            });
+            return report;
           } finally {
             finishInvocation?.();
           }
@@ -2390,6 +2375,7 @@ export class WorkerHubService {
         report.error === "failed" ? "routine:failed" : "routine:finished",
         {
           outcome: report.outcome,
+          disposition: reportDisposition(report),
           error:
             report.error === "failed"
               ? { code: report.code, message: report.message }
@@ -2408,16 +2394,12 @@ export class WorkerHubService {
       await this.#reconcilePauseRequestedIfQuiescent(routine.arcRunId);
       return { status: "finished", routineId: routine.id, report };
     } catch (error) {
-      if (entered) {
-        this.#routineWorkers.delete(routine.id);
-        // A failed backend disposal must still terminate the old routine's
-        // local record; otherwise it remains a false running/resume owner.
-        if (scopeCancelled(workScope) && owned)
-          await this.#skipSupersededRoutine(owned);
-        throw error;
-      }
-      // Limiter rejected the work (e.g., queue full). The worker never ran.
-      return this.#skipRoutine(routine, node, "queue-full", error, backend);
+      this.#routineWorkers.delete(routine.id);
+      // A failed backend disposal must still terminate the old routine's
+      // local record; otherwise it remains a false running/resume owner.
+      if (scopeCancelled(workScope) && owned)
+        await this.#skipSupersededRoutine(owned);
+      throw error;
     } finally {
       finishInvocation?.();
       if (owned) {
@@ -2498,18 +2480,6 @@ export class WorkerHubService {
       );
     }
     return selected;
-  }
-
-  #roleLimiter(role: string): AsyncLimiter {
-    const existing = this.#roleLimiters.get(role);
-    if (existing) return existing;
-    const override = this.#scheduling.roles?.[role];
-    const limiter = new AsyncLimiter(
-      override?.concurrency ?? this.#scheduling.default.concurrency,
-      override?.maxQueueSize ?? this.#scheduling.default.maxQueueSize,
-    );
-    this.#roleLimiters.set(role, limiter);
-    return limiter;
   }
 
   async #newRoutine(
@@ -3720,7 +3690,11 @@ export class WorkerHubService {
       continuation.pausedTaskIndex + 1,
     );
     let remainingResults: TaskResult[] = [];
-    if (result.status !== "queued" && !scopeCancelled(workScope))
+    if (
+      result.status !== "queued" &&
+      !isDispositionResult(result) &&
+      !scopeCancelled(workScope)
+    )
       remainingResults = await this.#handleTasks(remainingTasks, workScope);
     this.#scheduleRun(routine.arcRunId, [
       {
@@ -3787,7 +3761,8 @@ export class WorkerHubService {
       "routine:usage" | "routine:capacity-limited" | "routine:transport-lost"
     >,
     opts?: {
-      outcome?: "completed" | "deflected";
+      outcome?: "completed" | "disposition";
+      disposition?: TaskDisposition;
       error?: { code: string; message: string };
     },
   ): Promise<WorkEvent> {
@@ -3802,6 +3777,9 @@ export class WorkerHubService {
         ? { nodeDescription: node.description }
         : {}),
       ...(opts?.outcome !== undefined ? { outcome: opts.outcome } : {}),
+      ...(opts?.disposition !== undefined
+        ? { disposition: opts.disposition }
+        : {}),
       ...(opts?.error !== undefined ? { error: opts.error } : {}),
     });
   }
@@ -3931,12 +3909,44 @@ function isInactiveRun(run: ArcRunView | undefined): boolean {
   return run?.stage === "actioning" && run.lifecycle !== "active";
 }
 
+/** Whether a task result reports a disposition, which ends its batch. */
+function isDispositionResult(result: TaskResult): boolean {
+  return (
+    result.status === "finished" && result.report.outcome === "disposition"
+  );
+}
+
+/**
+ * Why a trigger task result fails its probe, if it does. Trigger tasks accept
+ * no disposition, so one fails the probe like failed work.
+ */
+function triggerFailureReason(result: TaskResult): string | undefined {
+  if (result.status !== "finished") return undefined;
+  if (result.report.error === "failed") return result.report.message;
+  const disposition = reportDisposition(result.report);
+  if (disposition === undefined) return undefined;
+  return `Worker reported disposition "${disposition}" on a trigger task, which accepts none.`;
+}
+
+/** The disposition a report carries, if any. */
+function reportDisposition(report: RoutineReport): TaskDisposition | undefined {
+  if (report.deflect) return "deflect";
+  if (report.interrupt) return "interrupt";
+  return undefined;
+}
+
 function flatReportLogFields(report: RoutineReport): {
   reportDiscriminator: "outcome" | "suspension" | "cancellation" | "error";
   reportValue: string;
+  disposition?: TaskDisposition;
 } {
   if (report.outcome !== undefined) {
-    return { reportDiscriminator: "outcome", reportValue: report.outcome };
+    const disposition = reportDisposition(report);
+    return {
+      reportDiscriminator: "outcome",
+      reportValue: report.outcome,
+      ...(disposition ? { disposition } : {}),
+    };
   }
   if (report.suspension !== undefined) {
     return {
@@ -4001,8 +4011,11 @@ function advanceInputFromResults(
     const coverageIds = task.briefIds;
     if (result.status === "finished") {
       let coverageStatus: InstructionCoverage[string];
-      if (result.report.outcome === "deflected") {
+      const disposition = reportDisposition(result.report);
+      if (disposition === "deflect") {
         coverageStatus = "deflected";
+      } else if (disposition === "interrupt") {
+        coverageStatus = "ignored";
       } else if (result.report.error === "failed") {
         coverageStatus = "failed";
       } else {

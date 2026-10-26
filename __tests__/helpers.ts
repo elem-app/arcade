@@ -72,6 +72,17 @@ export const OTHER_ARC_RUN_ID: ArcRunId = "run-bob-thread-2";
 export const ALICE_OWNER = "alice";
 export const BOB_OWNER = "bob";
 
+/** Explicit asynchronous boundary for deterministic overlapping invocations. */
+export function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, fail) => {
+    resolve = accept;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 export const HOST_MODULE_DECLARATIONS = {
   booleanMatchFromString: hmd.define({
     match: (value = hmd.Str()) => hmd.Bool(),
@@ -267,10 +278,7 @@ export function makeWorkerHub(opts: {
   runner?: NonNullable<PiAgentBackendOptions["runner"]>;
   workers?: Record<string, RoleWorker>;
   backends?: Record<string, Backend>;
-  defaultConcurrency?: number;
-  maxQueueSize?: number;
   routineDiagnosticsDir?: string;
-  roleConcurrency?: Record<string, number>;
   workerSlots?: {
     default?: string;
     roles?: Record<string, string>;
@@ -354,20 +362,6 @@ export function makeWorkerHub(opts: {
           : opts.fastTriggerBackend === undefined
             ? undefined
             : { backend: opts.fastTriggerBackend },
-    },
-    scheduling: {
-      default: {
-        concurrency: opts.defaultConcurrency ?? 1,
-        maxQueueSize: opts.maxQueueSize ?? 64,
-      },
-      roles: Object.fromEntries(
-        Object.entries(opts.roleConcurrency ?? {}).map(
-          ([role, concurrency]) => [
-            role,
-            { concurrency, maxQueueSize: opts.maxQueueSize ?? 64 },
-          ],
-        ),
-      ),
     },
   });
   return { workerHub, historyStore, routineStore, workEventStore };

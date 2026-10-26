@@ -1,9 +1,9 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Agent, Runner, type Model } from "@openai/agents";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createOpenAiSdkBackendForTesting } from "../src/backends/openai-sdk-backend.js";
 import type { JsonValue, RoutineInput, WorkerHost } from "../src/index.js";
@@ -25,6 +25,16 @@ import {
   runBackend,
 } from "./backend-helpers.js";
 import { ARC_RUN_ID, createCapturingLogger, firstTask } from "./helpers.js";
+
+const workspaces: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    workspaces
+      .splice(0)
+      .map((workspace) => rm(workspace, { recursive: true, force: true })),
+  );
+});
 
 describe("OpenAiSdkWorker", () => {
   it("resumes the SDK after connection loss without repeating a delivered notification", async () => {
@@ -158,8 +168,7 @@ describe("OpenAiSdkWorker", () => {
     }
   });
   it("passes cwd, model, timeout signal, tools, and sandbox config", async () => {
-    const workspace = join(tmpdir(), "arcade-openai-sdk-workspace-basic");
-    await mkdir(workspace, { recursive: true });
+    const workspace = await tempWorkspace("arcade-openai-sdk-workspace-basic");
     const task: InstructionTask = {
       ...(await firstTask()),
       dialog: {
@@ -179,6 +188,13 @@ describe("OpenAiSdkWorker", () => {
         ] as const,
       ] as const,
     };
+    task.guidance = [
+      [
+        { kind: "text", value: "Follow " },
+        { kind: "artifact", path: "policy.md" },
+        { kind: "text", value: "." },
+      ],
+    ];
     const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return { lastResponseId: "resp-basic", rawResponses: [] };
@@ -218,6 +234,9 @@ describe("OpenAiSdkWorker", () => {
     );
     expect(call.prompt).toContain("- user -> originator");
     expect(call.prompt).not.toContain(join(workspace, "example.txt"));
+    expect(call.prompt).toContain(
+      "<guidance>\nFollow /workspace/policy.md.\n</guidance>",
+    );
     expect(call.prompt).toContain("Execute only the current assigned task.");
     expect(call.prompt).not.toContain("current Arc instruction task");
     expect(call.prompt).toContain("Do not create, edit, delete, or move");
@@ -242,6 +261,7 @@ describe("OpenAiSdkWorker", () => {
     expect(call.previousResponseId).toBeUndefined();
     expect(call.agent.model).toBe("gpt-test");
     const systemInstructions = String((call.agent as any).instructions);
+    expect(systemInstructions).toContain("Apply standing guidance");
     expect(systemInstructions).toContain(
       "Treat <instruction>, when present, as the complete authority",
     );
@@ -408,8 +428,7 @@ describe("OpenAiSdkWorker", () => {
   });
 
   it("primes the dialog only on the first prompt into a threaded session", async () => {
-    const workspace = join(tmpdir(), "arcade-openai-dialog-prime");
-    await mkdir(workspace, { recursive: true });
+    const workspace = await tempWorkspace("arcade-openai-dialog-prime");
     const task: InstructionTask = {
       ...(await firstTask()),
       dialog: {
@@ -455,8 +474,7 @@ describe("OpenAiSdkWorker", () => {
   });
 
   it("gives node-isolated instructions independent response chains", async () => {
-    const workspace = join(tmpdir(), "arcade-openai-node-isolation");
-    await mkdir(workspace, { recursive: true });
+    const workspace = await tempWorkspace("arcade-openai-node-isolation");
     const first: InstructionTask = {
       ...(await firstTask()),
       contextIsolation: "node",
@@ -531,8 +549,7 @@ describe("OpenAiSdkWorker", () => {
   });
 
   it("passes baseUrl to the OpenAI run function", async () => {
-    const workspace = join(tmpdir(), "arcade-openai-sdk-base-url");
-    await mkdir(workspace, { recursive: true });
+    const workspace = await tempWorkspace("arcade-openai-sdk-base-url");
     const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return { lastResponseId: "resp-base-url" };
@@ -559,8 +576,7 @@ describe("OpenAiSdkWorker", () => {
   });
 
   it("roots the sandbox session at the workspace without leaking the host path", async () => {
-    const workspace = join(tmpdir(), "arcade-openai-sdk-workspace-root");
-    await mkdir(workspace, { recursive: true });
+    const workspace = await tempWorkspace("arcade-openai-sdk-workspace-root");
     const task = await firstTask();
     const pwdOutputs: string[] = [];
     const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
@@ -604,7 +620,7 @@ describe("OpenAiSdkWorker", () => {
 
   it("roots the sandbox session at the resolved workspace from RoutineContext", async () => {
     const task = await firstTask();
-    const workspacePath = join(tmpdir(), "arcade-openai-sdk-context-root");
+    const workspacePath = await tempWorkspace("arcade-openai-sdk-context-root");
     const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
       const session = await input.sandboxClient.create!();
       try {
@@ -639,6 +655,7 @@ describe("OpenAiSdkWorker", () => {
   it("renders active instruction cells in semantic prompts", async () => {
     const task: Task = {
       kind: "semantic",
+      allowedDispositions: [],
       batchId: "semantic:cells",
       role: "researcher",
       stage: "action",
@@ -666,6 +683,7 @@ describe("OpenAiSdkWorker", () => {
       ],
       activeInstruction: {
         kind: "instruction",
+        allowedDispositions: [],
         briefIds: ["instruction:active"],
         role: "researcher",
         texts: [
@@ -737,10 +755,8 @@ describe("OpenAiSdkWorker", () => {
 
   it("resumes only when the stored cwd matches the new cwd", async () => {
     const task = await firstTask();
-    const firstWorkspace = join(tmpdir(), "arcade-openai-sdk-resume-1");
-    const secondWorkspace = join(tmpdir(), "arcade-openai-sdk-resume-2");
-    await mkdir(firstWorkspace, { recursive: true });
-    await mkdir(secondWorkspace, { recursive: true });
+    const firstWorkspace = await tempWorkspace("arcade-openai-sdk-resume-1");
+    const secondWorkspace = await tempWorkspace("arcade-openai-sdk-resume-2");
     let runCount = 0;
     const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
       runCount += 1;
@@ -780,11 +796,9 @@ describe("OpenAiSdkWorker", () => {
   });
 
   it("starts a fresh OpenAI response chain when deflected re-entry advances the context epoch", async () => {
-    const workspace = join(
-      tmpdir(),
+    const workspace = await tempWorkspace(
       "arcade-openai-sdk-deflected-reentry-epoch",
     );
-    await mkdir(workspace, { recursive: true });
     const task: InstructionTask = {
       ...(await firstTask()),
       dialog: {
@@ -823,8 +837,7 @@ describe("OpenAiSdkWorker", () => {
   });
 
   it("parks a paused streamed run and resumes with native RunState", async () => {
-    const workspace = join(tmpdir(), "arcade-openai-sdk-workspace-park");
-    await mkdir(workspace, { recursive: true });
+    const workspace = await tempWorkspace("arcade-openai-sdk-workspace-park");
     const task = await firstTask();
     const parkedState = {
       _currentTurnInProgress: false,
@@ -1942,6 +1955,13 @@ async function callOpenAiToolRaw(
  * its own temp directory, and merging the two would make both suites write into
  * the same workspace.
  */
+/** Create a unique workspace directory that is removed after the test. */
+async function tempWorkspace(prefix: string): Promise<string> {
+  const workspace = await mkdtemp(join(tmpdir(), `${prefix}-`));
+  workspaces.push(workspace);
+  return workspace;
+}
+
 function context(
   opts: {
     workspacePath?: string;
