@@ -94,9 +94,15 @@ function WorkEventStatusBar({
   const pauseStatus = pause?.status ?? "running";
   const capacityLimited = pauseStatus === "capacity-limited";
   const transportLost = pauseStatus === "transport-lost";
-  // Both sibling parks (capacity-limited and transport-lost) park the run and
-  // recover the same way, so they share the Retry button and auto-retry banner.
-  const parked = capacityLimited || transportLost;
+  // Host and hub parks: resuming rebuilds the run, and none retries
+  // automatically.
+  const stalled =
+    pauseStatus === "internal-error" ||
+    pauseStatus === "uncaught-interruption" ||
+    pauseStatus === "hub-restarted";
+  // Every park shares the resume button and cause banner; only the sibling
+  // provider parks (capacity-limited and transport-lost) retry automatically.
+  const parked = capacityLimited || transportLost || stalled;
   const canContinue = pauseStatus === "paused";
   const showPausing =
     pauseStatus === "pauseRequested" ||
@@ -113,12 +119,24 @@ function WorkEventStatusBar({
   // A parked run reuses the execution-control slot for a manual retry, which
   // resumes the parked routine (and resets the auto-retry budget). Narrow on the
   // view's discriminant so each park reads only its own reason.
-  const parkReason =
+  const parkReason: { reason: string; message: string } | undefined =
     pause?.status === "capacity-limited"
       ? pause.capacityReason
       : pause?.status === "transport-lost"
         ? pause.transportReason
-        : undefined;
+        : pause?.status === "internal-error"
+          ? { reason: "internal error", message: pause.error.message }
+          : pause?.status === "uncaught-interruption"
+            ? {
+                reason: "uncaught interruption",
+                message: pause.interruption.reason,
+              }
+            : pause?.status === "hub-restarted"
+              ? {
+                  reason: "hub restarted",
+                  message: "Arcade restarted while this run was executing.",
+                }
+              : undefined;
   const autoRetry =
     pause?.status === "capacity-limited" || pause?.status === "transport-lost"
       ? pause.autoRetry
@@ -164,9 +182,13 @@ function WorkEventStatusBar({
             type="button"
             disabled={busy}
             onClick={() => onContinueRun(event.arcRunId)}
-            title="Resume now instead of waiting for the next automatic retry."
+            title={
+              stalled
+                ? "Resume to restart the run's current work."
+                : "Resume now instead of waiting for the next automatic retry."
+            }
           >
-            Retry
+            {stalled ? "Resume" : "Retry"}
           </button>
         ) : null}
         {showPausing ? (

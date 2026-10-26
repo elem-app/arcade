@@ -264,9 +264,12 @@ function buildSemanticPrompt(
   return parts.join("\n");
 }
 
+/** Turn the Claude worker sends to continue retained work. */
+const CONTINUATION_TURN = "Continue";
+
 function appendResumeMessage(parts: string[], context: RoutineContext): void {
-  if (context.routineResume?.delivery !== "rendered-context") return;
-  parts.push("", xmlBlock("resume-message", context.routineResume.message));
+  if (context.routineResume?.delivery !== "continue") return;
+  parts.push("", xmlBlock("resume-message", CONTINUATION_TURN));
 }
 
 function sdkUserMessage(text: string): SDKUserMessage {
@@ -881,8 +884,8 @@ function claudeSessionResume(
   input: RoutineInput,
 ): ClaudeSdkSessionResume | undefined {
   const resume = input.context.routineResume;
-  return resume?.delivery === "rendered-context"
-    ? { delivery: "session-message", message: resume.message }
+  return resume?.delivery === "continue"
+    ? { delivery: "session-message", message: CONTINUATION_TURN }
     : undefined;
 }
 

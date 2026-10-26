@@ -5,7 +5,9 @@ import { executionControlFor, workEventsFor } from "./work-event-fixtures.js";
 import { describe, expect, it, vi } from "vitest";
 
 const fakeAgent = vi.hoisted(() => ({
-  response: '{"report":{"outcome":"completed"}}',
+  response: '{"report":{"outcome":"completed"}}' as
+    | string
+    | ((prompt: string) => string),
   usage: undefined as Record<string, unknown> | undefined,
   prompts: [] as string[],
   systems: [] as Array<string | undefined>,
@@ -27,7 +29,15 @@ vi.mock("@earendil-works/pi-agent-core", () => ({
         {
           role: "assistant",
           model: "pi-test",
-          content: [{ type: "text", text: fakeAgent.response }],
+          content: [
+            {
+              type: "text",
+              text:
+                typeof fakeAgent.response === "function"
+                  ? fakeAgent.response(prompt)
+                  : fakeAgent.response,
+            },
+          ],
           ...(fakeAgent.usage ? { usage: fakeAgent.usage } : {}),
         },
       ];
@@ -36,7 +46,13 @@ vi.mock("@earendil-works/pi-agent-core", () => ({
 }));
 
 import { createPiAgentBackend } from "../src/backends/pi-agent-backend.js";
-import type { Backend, WorkerHost, WorkerSlot } from "../src/index.js";
+import type {
+  Backend,
+  RoutineInput,
+  RoutineReport,
+  WorkerHost,
+  WorkerSlot,
+} from "../src/index.js";
 import {
   FileRoutineDiagnosticsStore,
   InMemoryHistoryStore,
@@ -44,8 +60,19 @@ import {
   type ArcHostService,
   type Task,
 } from "../src/testing.js";
-import { firstTaskWithArcHost, makeArcHost } from "./helpers.js";
-import { routineContext } from "./worker-hub-helpers.js";
+import {
+  makeArcHost,
+  makeArcHostWithSource,
+  waitFor,
+  WATCH_SOURCE,
+} from "./helpers.js";
+import {
+  recordAdvanceInputs,
+  routineContext,
+  semanticRequestIds,
+  settleFirstRoutine,
+  submitActivation,
+} from "./worker-hub-helpers.js";
 
 describe("PI backend shared protocol adapter", () => {
   it("creates independent PI workers for configured slots", async () => {
@@ -90,46 +117,43 @@ describe("PI backend shared protocol adapter", () => {
 
   it("executes instruction and semantic routines through the stock PI worker", async () => {
     resetFakeAgent();
-    const { arcHost, task: instruction } = await firstTaskWithArcHost();
-    instruction.guidance = ["Use the PI instruction policy."];
+    fakeAgent.response = (prompt) =>
+      prompt.includes("<semantic-requests>")
+        ? JSON.stringify({
+            report: {
+              outcome: "completed",
+              semantic: {
+                judgments: Object.fromEntries(
+                  requestIds(prompt).map((id) => [id, true]),
+                ),
+              },
+            },
+          })
+        : '{"report":{"outcome":"completed"}}';
+    const arcHost = await makeArcHostWithSource(
+      "guided",
+      `"arc";
+function Watch() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "researcher" };
+  this.guidance = \`Use the PI policy.\`;
+  $instructLoop(\`Watch for updates.\`, {
+    resolveWhen: \`the updates are collected\`,
+  });
+}`,
+    );
     const { workerHub } = await makePiHub(arcHost, createPiAgentBackend());
 
-    await expect(
-      workerHub.handleTask(instruction, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: { outcome: "completed" },
-    });
-    fakeAgent.response = JSON.stringify({
-      report: {
-        outcome: "completed",
-        semantic: { judgments: { "judge:required": true } },
-      },
-    });
-    const semantic = semanticTaskFor(instruction);
-    if (semantic.kind !== "semantic") throw new Error("Expected semantic task");
-    semantic.requests[0]!.guidance = "Use the PI judgment policy.";
-    await expect(
-      workerHub.handleTask(semantic, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: {
-        outcome: "completed",
-        semantic: { judgments: { "judge:required": true } },
-      },
-    });
+    const arcRunId = await submitActivation(workerHub, "start");
+    await waitForRunEnd(workerHub, arcRunId);
 
+    // The instruction's apply phase, then its postcheck judgment.
+    expect(fakeAgent.prompts).toHaveLength(2);
     expect(fakeAgent.prompts[0]).toContain("Work item:");
     expect(fakeAgent.prompts[1]).toContain("<semantic-requests>");
-    expect(fakeAgent.prompts[0]).toContain(
-      '"guidance": "Use the PI instruction policy."',
-    );
-    expect(fakeAgent.prompts[1]).toContain(
-      '"guidance": "Use the PI judgment policy."',
-    );
-    expect(fakeAgent.prompts[1]).toContain(
-      '"guidance": "Use the PI instruction policy."',
-    );
+    expect(fakeAgent.prompts[0]).toContain('"guidance": "Use the PI policy."');
+    expect(fakeAgent.prompts[1]).toContain('"guidance": "Use the PI policy."');
+    expect(fakeAgent.prompts[1]).toContain("<active-instruction>");
     expect(fakeAgent.systems[0]).toContain(
       "Apply the work item's standing guidance",
     );
@@ -141,17 +165,18 @@ describe("PI backend shared protocol adapter", () => {
   it("accepts flat reports from stock and injected PI runners", async () => {
     resetFakeAgent();
     fakeAgent.response = '{"report":{"outcome":"completed"}}';
-    const { arcHost, task } = await firstTaskWithArcHost();
-    const stock = await makePiHub(arcHost, createPiAgentBackend());
-    await expect(
-      stock.workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: { outcome: "completed" },
-    });
+    const stockHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const stock = await makePiHub(stockHost, createPiAgentBackend());
+    const { routine: stockRoutine } = await settleFirstRoutine(
+      stock.workerHub,
+      executionControlFor(stockHost),
+    );
+    expect(stockRoutine).toMatchObject({ status: "finished" });
+    expect(stockRoutine.error).toBeUndefined();
 
+    const injectedHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const injected = await makePiHub(
-      arcHost,
+      injectedHost,
       createPiAgentBackend({
         runner: async () => ({
           error: "failed",
@@ -160,16 +185,18 @@ describe("PI backend shared protocol adapter", () => {
         }),
       }),
     );
-    await expect(
-      injected.workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
+    const { routine } = await settleFirstRoutine(
+      injected.workerHub,
+      executionControlFor(injectedHost),
+    );
+    expect(routine).toMatchObject({
       status: "finished",
-      report: { error: "failed", code: "agent-refused" },
+      error: { code: "agent-refused" },
     });
   });
 
   it("validates flat reports from an injected PI runner", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const { workerHub } = await makePiHub(
       arcHost,
       createPiAgentBackend({
@@ -178,11 +205,13 @@ describe("PI backend shared protocol adapter", () => {
       }),
     );
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
+    const { routine } = await settleFirstRoutine(
+      workerHub,
+      executionControlFor(arcHost),
+    );
+    expect(routine).toMatchObject({
       status: "finished",
-      report: { error: "failed", code: "backend-error" },
+      error: { code: "backend-error" },
     });
   });
 
@@ -196,12 +225,15 @@ describe("PI backend shared protocol adapter", () => {
       cacheWrite: 1,
       cost: { total: 0.1 },
     };
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const { workerHub } = await makePiHub(arcHost, createPiAgentBackend());
 
-    await workerHub.handleTask(task, routineContext());
+    const { arcRunId } = await settleFirstRoutine(
+      workerHub,
+      executionControlFor(arcHost),
+    );
 
-    await expect(workerHub.listWorkEvents(task.arcRunId)).resolves.toEqual(
+    await expect(workerHub.listWorkEvents(arcRunId)).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           kind: "routine:usage",
@@ -216,9 +248,9 @@ describe("PI backend shared protocol adapter", () => {
   });
 
   it("translates expected PI capacity and transport failures inside the worker", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const capacityHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const capacity = await makePiHub(
-      arcHost,
+      capacityHost,
       createPiAgentBackend({
         runner: async () => {
           throw Object.assign(new Error("Rate limit reached"), {
@@ -229,12 +261,15 @@ describe("PI backend shared protocol adapter", () => {
       }),
       { provider: "openai", model: "gpt-test" },
     );
-    await expect(
-      capacity.workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({ status: "queued" });
+    const { routine: capacityRoutine } = await settleFirstRoutine(
+      capacity.workerHub,
+      executionControlFor(capacityHost),
+    );
+    expect(capacityRoutine.status).toBe("capacity-limited");
 
+    const transportHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const transport = await makePiHub(
-      arcHost,
+      transportHost,
       createPiAgentBackend({
         runner: async () => {
           throw Object.assign(new Error("socket hang up"), {
@@ -244,9 +279,11 @@ describe("PI backend shared protocol adapter", () => {
       }),
       { provider: "openai", model: "gpt-test" },
     );
-    await expect(
-      transport.workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({ status: "queued" });
+    const { routine: transportRoutine } = await settleFirstRoutine(
+      transport.workerHub,
+      executionControlFor(transportHost),
+    );
+    expect(transportRoutine.status).toBe("transport-lost");
   });
 
   it("translates PI provider rate limits to capacity interrupts", async () => {
@@ -297,40 +334,51 @@ describe("PI backend shared protocol adapter", () => {
   it("rejects removed status reports from stock and injected PI runners", async () => {
     resetFakeAgent();
     fakeAgent.response = '{"report":{"status":"queued"}}';
-    const { arcHost, task } = await firstTaskWithArcHost();
-    const stock = await makePiHub(arcHost, createPiAgentBackend());
-    await expect(
-      stock.workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
+    const stockHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const stock = await makePiHub(stockHost, createPiAgentBackend());
+    const { routine: stockRoutine } = await settleFirstRoutine(
+      stock.workerHub,
+      executionControlFor(stockHost),
+    );
+    expect(stockRoutine).toMatchObject({
       status: "finished",
-      report: { error: "failed", code: "backend-error" },
+      error: { code: "backend-error" },
     });
 
+    const injectedHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const injected = await makePiHub(
-      arcHost,
+      injectedHost,
       createPiAgentBackend({
         runner: async () => ({ status: "queued" }) as never,
       }),
     );
-    await expect(
-      injected.workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
+    const { routine } = await settleFirstRoutine(
+      injected.workerHub,
+      executionControlFor(injectedHost),
+    );
+    expect(routine).toMatchObject({
       status: "finished",
-      report: { error: "failed", code: "backend-error" },
+      error: { code: "backend-error" },
     });
   });
 
   it("routes only trigger-stage semantic work through a PI fast-trigger worker", async () => {
-    const { arcHost, task: instruction } = await firstTaskWithArcHost();
-    const piRunner = vi.fn(async (task: Task) =>
-      task.kind === "semantic"
-        ? {
-            outcome: "completed" as const,
-            semantic: { judgments: { "judge:required": true } },
-          }
-        : { outcome: "completed" as const },
+    // A judged trigger, then an action judgment and the instruction it gates.
+    const arcHost = await makeArcHostWithSource(
+      "judged",
+      `"arc";
+function Watch() {
+  this.trigger = () => judge(\`should this start?\`);
+  this.hostParams = { workerRole: "researcher" };
+  if (judge(\`is the work ready?\`)) {
+    $instruct(\`Proceed.\`);
+  }
+}`,
     );
-    const ordinaryRun = vi.fn(async () => ({ outcome: "completed" }) as const);
+    const piRunner = vi.fn(async (task: Task) => answerAll(task));
+    const ordinaryRun = vi.fn(async (input: RoutineInput) =>
+      answerAll(input.routine.task),
+    );
     const workerHub = createWorkerHub(arcHost);
     workerHub.addBackend(
       "pi-agent",
@@ -350,15 +398,8 @@ describe("PI backend shared protocol adapter", () => {
       },
     });
 
-    await workerHub.handleTask(
-      semanticTaskFor(instruction, "trigger"),
-      routineContext(),
-    );
-    await workerHub.handleTask(
-      semanticTaskFor(instruction, "action"),
-      routineContext(),
-    );
-    await workerHub.handleTask(instruction, routineContext());
+    const arcRunId = await submitActivation(workerHub, "start");
+    await waitForRunEnd(workerHub, arcRunId);
 
     expect(piRunner).toHaveBeenCalledTimes(1);
     expect(ordinaryRun).toHaveBeenCalledTimes(2);
@@ -366,28 +407,40 @@ describe("PI backend shared protocol adapter", () => {
 
   it("accepts a complete semantic report through the stock PI text path", async () => {
     resetFakeAgent();
-    fakeAgent.response = JSON.stringify({
-      report: {
-        outcome: "completed",
-        semantic: { judgments: { "judge:required": true } },
-      },
-    });
-    const { arcHost, task: instruction } = await firstTaskWithArcHost();
+    // Declining the judgment keeps the run to its semantic routine.
+    fakeAgent.response = (prompt) =>
+      JSON.stringify({
+        report: {
+          outcome: "completed",
+          semantic: {
+            judgments: Object.fromEntries(
+              requestIds(prompt).map((id) => [id, false]),
+            ),
+          },
+        },
+      });
+    const arcHost = await makeArcHostWithSource("judge", JUDGE_SOURCE);
+    const advanceInputs = recordAdvanceInputs(arcHost);
     const { workerHub } = await makePiHub(arcHost, createPiAgentBackend());
 
-    await expect(
-      workerHub.handleTask(semanticTaskFor(instruction), routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: {
-        outcome: "completed",
-        semantic: { judgments: { "judge:required": true } },
-      },
+    const { routine } = await settleFirstRoutine(
+      workerHub,
+      executionControlFor(arcHost),
+    );
+    expect(routine).toMatchObject({ status: "finished" });
+    await waitFor(() => advanceInputs.length === 1);
+    expect(advanceInputs[0]).toMatchObject({
+      reports: [
+        expect.objectContaining({
+          outcome: "completed",
+          semantic: { judgments: { [judgmentId(routine.task)]: false } },
+        }),
+      ],
     });
   });
 
   it("rejects an incomplete semantic report through an injected PI runner", async () => {
-    const { arcHost, task: instruction } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("judge", JUDGE_SOURCE);
     const { workerHub } = await makePiHub(
       arcHost,
       createPiAgentBackend({
@@ -395,24 +448,27 @@ describe("PI backend shared protocol adapter", () => {
       }),
     );
 
-    await expect(
-      workerHub.handleTask(semanticTaskFor(instruction), routineContext()),
-    ).resolves.toMatchObject({
+    const { routine } = await settleFirstRoutine(
+      workerHub,
+      executionControlFor(arcHost),
+    );
+    expect(routine).toMatchObject({
       status: "finished",
-      report: { error: "failed", code: "backend-error" },
+      error: { code: "backend-error" },
     });
   });
 
   it("records unrequested PI semantic ids through central validation", async () => {
-    const { arcHost, task: instruction } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("judge", JUDGE_SOURCE);
+    const advanceInputs = recordAdvanceInputs(arcHost);
     const { workerHub } = await makePiHub(
       arcHost,
       createPiAgentBackend({
-        runner: async () => ({
+        runner: async (task) => ({
           outcome: "completed",
           semantic: {
             judgments: {
-              "judge:required": true,
+              [judgmentId(task)]: false,
               "judge:extra": false,
             },
           },
@@ -420,14 +476,18 @@ describe("PI backend shared protocol adapter", () => {
       }),
     );
 
-    await expect(
-      workerHub.handleTask(semanticTaskFor(instruction), routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: {
-        outcome: "completed",
-        semantic: { judgments: { "judge:required": true } },
-      },
+    const { routine } = await settleFirstRoutine(
+      workerHub,
+      executionControlFor(arcHost),
+    );
+    await waitFor(() => advanceInputs.length === 1);
+    expect(advanceInputs[0]).toMatchObject({
+      reports: [
+        expect.objectContaining({
+          outcome: "completed",
+          semantic: { judgments: { [judgmentId(routine.task)]: false } },
+        }),
+      ],
     });
   });
 });
@@ -475,42 +535,54 @@ async function makePiHub(
   return { workerHub };
 }
 
-function semanticTaskFor(
-  instruction: Extract<Task, { kind: "instruction" }>,
-  stage: "trigger" | "action" = "action",
-): Task {
-  return {
-    kind: "semantic",
-    allowedDispositions: [],
-    batchId: `semantic:pi:${stage}`,
-    role: instruction.role,
-    stage,
-    contextIsolation: instruction.contextIsolation,
-    arcRunId: instruction.arcRunId,
-    dialog: instruction.dialog,
-    activeInstruction: instruction,
-    requests: [
-      {
-        kind: "judgment",
-        briefId: "judge:required",
-        role: instruction.role,
-        question: "Is it ready?",
-        sourceRef: instruction.sourceRef,
-        tool: {
-          type: "function",
-          name: "judge_required",
-          description: "Resolve readiness.",
-          strict: true,
-          parameters: {
-            type: "object",
-            properties: { result: { type: "boolean" } },
-            required: ["result"],
-            additionalProperties: false,
-          },
+const JUDGE_SOURCE = `"arc";
+function Watch() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "researcher" };
+  if (judge(\`is it ready?\`)) {
+    $instruct(\`Proceed.\`);
+  }
+}`;
+
+/** The id of the single judgment a semantic task requests. */
+function judgmentId(task: Task): string {
+  if (task.kind !== "semantic") throw new Error("expected semantic task");
+  return task.requests[0]!.briefId;
+}
+
+/** Request ids in a PI semantic prompt's request block. */
+function requestIds(prompt: string): string[] {
+  const block =
+    prompt.split("<semantic-requests>")[1]?.split("</semantic-requests>")[0] ??
+    "";
+  return semanticRequestIds(block);
+}
+
+/** Answer every semantic request true, and complete instruction work. */
+function answerAll(task: Task): RoutineReport {
+  return task.kind === "semantic"
+    ? {
+        outcome: "completed",
+        semantic: {
+          judgments: Object.fromEntries(
+            task.requests.map((request) => [request.briefId, true]),
+          ),
         },
-      },
-    ],
-  };
+      }
+    : { outcome: "completed" };
+}
+
+/** Wait until the run's work events record its end. */
+async function waitForRunEnd(
+  workerHub: WorkerHubService,
+  arcRunId: string,
+): Promise<void> {
+  await waitFor(async () =>
+    (await workerHub.listWorkEvents(arcRunId)).some(
+      (event) =>
+        event.kind === "run:completed" || event.kind === "run:poisoned",
+    ),
+  );
 }
 
 function workerHost(): WorkerHost {

@@ -98,21 +98,11 @@ describe("Submission failure settlement and executor boundaries", () => {
         "failed-event",
         "bookkeeping",
       ] as const) {
-        const setup = await fixture(stage, async () => failure);
-        const error = new Error(`${stage} ${boundary} unavailable`);
-        const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
-        const [step] = await setup.arcHost.begin({
-          dialog,
-          inbound,
-          principal: ALICE_OWNER,
-          projectDialog: async () => dialog,
+        const logging = createCapturingLogger();
+        const setup = await fixture(stage, async () => failure, {
+          logger: logging.logger,
         });
-        if (step?.kind !== "trigger" && step?.kind !== "action")
-          throw new Error("Expected work.");
-        const task = step.frontier.tasks[0]!;
-        const context = await setup.arcHost.getRunWorkspaceContext(
-          task.arcRunId,
-        );
+        const error = new Error(`${stage} ${boundary} unavailable`);
         const put = setup.routineStore.putRoutine.bind(setup.routineStore);
         const append = setup.workEventStore.appendEvent.bind(
           setup.workEventStore,
@@ -176,9 +166,22 @@ describe("Submission failure settlement and executor boundaries", () => {
           });
         }
         try {
-          await expect(setup.workerHub.handleTask(task, context)).rejects.toBe(
-            error,
+          // Trigger work fails its submission; action work fails its lap at
+          // the background boundary.
+          const submission = collectAsync(
+            setup.workerHub.submitInbound(inbound),
           );
+          if (stage === "trigger") await expect(submission).rejects.toBe(error);
+          else {
+            await submission;
+            await waitFor(() =>
+              logging.records.some(
+                (record) =>
+                  record.event === "worker_hub.lap.failed" &&
+                  record["message"] === String(error),
+              ),
+            );
+          }
           expect(injected).toBe(true);
           const routines = await collectAsync(
             setup.routineStore.listRoutines(),
@@ -186,11 +189,12 @@ describe("Submission failure settlement and executor boundaries", () => {
           expect(
             routines.some((routine) => routine.error?.code === "queue-full"),
           ).toBe(false);
-          expect(
-            (await setup.workerHub.listWorkEvents(task.arcRunId)).some(
-              (event) => event.kind === "routine:skipped",
-            ),
-          ).toBe(false);
+          for (const routine of routines)
+            expect(
+              (await setup.workerHub.listWorkEvents(routine.arcRunId)).some(
+                (event) => event.kind === "routine:skipped",
+              ),
+            ).toBe(false);
         } finally {
           await setup.workerHub.stop();
         }
@@ -256,38 +260,47 @@ describe("Submission failure settlement and executor boundaries", () => {
         await release.promise;
         return failure;
       });
-      const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
-      const [step] = await setup.arcHost.begin({
-        dialog,
-        inbound,
-        principal: ALICE_OWNER,
-        projectDialog: async () => dialog,
-      });
-      if (step?.kind !== "trigger" && step?.kind !== "action")
-        throw new Error("Expected work.");
-      const task = step.frontier.tasks[0]!;
-      const context = await setup.arcHost.getRunWorkspaceContext(task.arcRunId);
-      const independent =
-        task.kind === "semantic" && task.stage === "trigger"
-          ? { ...task, batchId: task.batchId + ":independent" }
-          : { ...task, contextIsolation: "node" as const };
-      const pending = [
-        setup.workerHub.handleTask(task, context),
-        setup.workerHub.handleTask(independent, context),
-      ];
+      // Trigger probes of one submission share a batch, so independent trigger
+      // work comes from a second submission. Independent action work comes
+      // from a second matching arc activated by the same submission.
+      if (stage === "action")
+        await setup.arcHost.registerArc(
+          "failure-boundary-independent",
+          parse(`"arc";
+function Independent() {
+  this.trigger = () => true;
+  $instruct(\`Do the independent work.\`);
+}`),
+        );
+      const submission = Promise.all(
+        Array.from({ length: stage === "trigger" ? 2 : 1 }, () =>
+          collectAsync(setup.workerHub.submitInbound(inbound)),
+        ),
+      );
       try {
         await entered.promise;
         release.resolve();
-        for (const result of await Promise.all(pending))
-          expect(result).toEqual({
+        await submission;
+        await waitFor(
+          async () =>
+            (await collectAsync(setup.routineStore.listRoutines())).filter(
+              (routine) => routine.status === "finished",
+            ).length === 2,
+        );
+        const routines = await collectAsync(setup.routineStore.listRoutines());
+        expect(routines).toHaveLength(2);
+        for (const routine of routines)
+          expect(routine).toMatchObject({
             status: "finished",
-            routineId: expect.any(String),
-            report: failure,
+            error: {
+              code: "test-worker-failed",
+              message: "Worker cannot continue.",
+            },
           });
         expect(calls).toBe(2);
       } finally {
         release.resolve();
-        await Promise.allSettled(pending);
+        await submission.catch(() => undefined);
         await setup.workerHub.stop();
       }
     }

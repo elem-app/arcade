@@ -16,7 +16,6 @@ import {
   InMemoryHistoryStore,
   arcRunKey,
   type ArcRunId,
-  type InstructionTask,
   type OutboundMessage,
   type RoleWorker,
   type Task,
@@ -25,12 +24,10 @@ import {
 } from "../src/testing.js";
 import {
   ALICE_OWNER,
-  ARC_RUN_ID,
   GREET_SOURCE,
   WATCH_SOURCE,
   collectAsync,
   createCapturingLogger,
-  firstTaskWithArcHost,
   makeArcHost,
   makeArcHostWithSource,
   makeWorkerHub,
@@ -38,13 +35,13 @@ import {
 } from "./helpers.js";
 import {
   recordAdvanceInputs,
-  routineContext,
+  settleFirstRoutine,
   submitActivation,
 } from "./worker-hub-helpers.js";
 
 describe("Routines, dialog projection, and work events", () => {
   it("maps an escaping worker exception to backend-error", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
     const { workerHub } = makeWorkerHub({
       arcHost,
@@ -58,73 +55,73 @@ describe("Routines, dialog projection, and work events", () => {
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: {
-        error: "failed",
-        code: "backend-error",
-        message: "openai failed",
-      },
-    });
-    const routines = await collectAsync(routineStore.listRoutines());
-    expect(routines[0]).toMatchObject({
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine).toMatchObject({
       status: "finished",
       error: { code: "backend-error", message: "openai failed" },
     });
   });
 
   it("projects each dispatched task's dialog for its own worker role", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    // The first routine stands in for audience traffic recorded before the
+    // second routine dispatches.
+    const arcHost = await makeArcHostWithSource(
+      "watch",
+      `"arc";
+function Watch() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "researcher" };
+  $instruct(\`Collect the replies.\`);
+  $instruct(\`Watch for updates.\`);
+}`,
+    );
     const historyStore = new InMemoryHistoryStore();
     const at = "2026-05-21T00:00:00.000Z";
-    await historyStore.appendEntry(task.arcRunId, {
-      from: { kind: "audience", name: "originator" },
-      to: { kind: "arcade" },
-      content: "watch it",
-      at,
-    });
-    await historyStore.appendEntry(task.arcRunId, {
-      from: { kind: "audience", name: "supervisor", ofRole: task.role },
-      to: { kind: "role", id: task.role },
-      content: "approved",
-      at,
-    });
-    await historyStore.appendEntry(task.arcRunId, {
-      from: { kind: "audience", name: "supervisor", ofRole: "other-role" },
-      to: { kind: "role", id: "other-role" },
-      content: "secret",
-      at,
-    });
-
-    let captured: Task | undefined;
+    const received: Task[] = [];
     const { workerHub } = makeWorkerHub({
       arcHost,
       historyStore,
       workers: {
-        [task.role]: async (received) => {
-          captured = received;
+        researcher: async (task) => {
+          received.push(task);
+          if (received.length === 1) {
+            await historyStore.appendEntry(task.arcRunId, {
+              from: { kind: "audience", name: "supervisor", ofRole: task.role },
+              to: { kind: "role", id: task.role },
+              content: "approved",
+              at,
+            });
+            await historyStore.appendEntry(task.arcRunId, {
+              from: {
+                kind: "audience",
+                name: "supervisor",
+                ofRole: "other-role",
+              },
+              to: { kind: "role", id: "other-role" },
+              content: "secret",
+              at,
+            });
+          }
           return { outcome: "completed" };
         },
       },
     });
 
-    await workerHub.handleTask(task, routineContext());
+    await submitActivation(workerHub, "watch it");
+    await waitFor(() => received.length === 2);
 
     // The worker sees the principal's shared turn and its own forwarded audience
-    // reply, but not another role's scoped traffic — even though arc host handed
-    // the task an empty run-level dialog.
-    expect(captured?.dialog.lastTurns).toEqual([
+    // reply, but not another role's scoped traffic.
+    expect(received[1]?.dialog.lastTurns).toEqual([
       { role: "user", message: "watch it" },
       { role: "self", message: "(forwarded from supervisor) approved" },
     ]);
   });
 
   it("runs registered role workers and marks routines completed", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
+    const advanceInputs = recordAdvanceInputs(arcHost);
     const worker = vi.fn(async () => ({ outcome: "completed" as const }));
     const { workerHub } = makeWorkerHub({
       arcHost,
@@ -132,17 +129,20 @@ describe("Routines, dialog projection, and work events", () => {
       workers: { researcher: worker },
     });
 
-    const result = await workerHub.handleTask(task, routineContext());
+    const { arcRunId } = await settleFirstRoutine(workerHub, routineStore);
 
-    expect(result).toEqual({
-      status: "finished",
-      routineId: expect.any(String),
-      report: { outcome: "completed" },
-    });
+    await waitFor(() => advanceInputs.length === 1);
+    expect(advanceInputs[0]).toMatchObject({ reports: [] });
+    expectAppliedCoverage(advanceInputs[0]);
     expect(worker).toHaveBeenCalledWith(
       // The dispatched task's dialog is re-projected for the worker's own role,
       // so it carries that role's view stamp.
-      { ...task, dialog: { ...task.dialog, view: "researcher" } },
+      expect.objectContaining({
+        kind: "instruction",
+        role: "researcher",
+        arcRunId,
+        dialog: expect.objectContaining({ view: "researcher" }),
+      }),
       expect.objectContaining({
         workspacePath: expect.any(String),
         workspaceBundle: {},
@@ -152,11 +152,7 @@ describe("Routines, dialog projection, and work events", () => {
         logToolEvent: expect.any(Function),
       }),
     );
-    const routines = [];
-    for await (const routine of routineStore.listRoutines(ARC_RUN_ID)) {
-      routines.push(routine);
-    }
-    expect(routines).toEqual([
+    expect(await collectAsync(routineStore.listRoutines(arcRunId))).toEqual([
       expect.objectContaining({
         role: "researcher",
         status: "finished",
@@ -165,53 +161,40 @@ describe("Routines, dialog projection, and work events", () => {
   });
 
   it("normalizes handler reports and failures", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const reportHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const advanceInputs = recordAdvanceInputs(reportHost);
     const reportHandler = vi.fn(async () => ({
       outcome: "completed" as const,
-      semantic: {
-        judgments: { "judge:1": true },
-      },
     }));
-    const { workerHub: reportWorkerHub } = makeWorkerHub({
-      arcHost,
-      workers: { researcher: reportHandler },
-    });
+    const { workerHub: reportWorkerHub, routineStore: reportStore } =
+      makeWorkerHub({
+        arcHost: reportHost,
+        workers: { researcher: reportHandler },
+      });
 
-    await expect(
-      reportWorkerHub.handleTask(task, routineContext()),
-    ).resolves.toEqual({
-      status: "finished",
-      routineId: expect.any(String),
-      report: {
-        outcome: "completed",
-        semantic: {
-          judgments: { "judge:1": true },
-        },
-      },
-    });
+    const { routine: reported } = await settleFirstRoutine(
+      reportWorkerHub,
+      reportStore,
+    );
+    expect(reported).toMatchObject({ status: "finished" });
+    expect(reported.error).toBeUndefined();
+    await waitFor(() => advanceInputs.length === 1);
+    expectAppliedCoverage(advanceInputs[0]);
 
+    const failingHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const failingHandler = vi.fn(async () => {
       throw new Error("boom");
     });
     const { workerHub: failingWorkerHub, routineStore } = makeWorkerHub({
-      arcHost,
+      arcHost: failingHost,
       workers: { researcher: failingHandler },
     });
 
-    const failed = await failingWorkerHub.handleTask(task, routineContext());
-
-    expect(failed).toEqual({
-      status: "finished",
-      routineId: expect.any(String),
-      report: {
-        error: "failed",
-        code: "handler-error",
-        message: "boom",
-      },
-    });
-    if (failed.status !== "finished")
-      throw new Error("Expected a finished routine");
-    expect(await routineStore.getRoutine(failed.routineId)).toEqual(
+    const { routine } = await settleFirstRoutine(
+      failingWorkerHub,
+      routineStore,
+    );
+    expect(routine).toEqual(
       expect.objectContaining({
         status: "finished",
         error: { code: "handler-error", message: "boom" },
@@ -220,8 +203,8 @@ describe("Routines, dialog projection, and work events", () => {
   });
 
   it("maps an in-process callback exception to handler-error", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
-    const { workerHub } = makeWorkerHub({
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workers: {
         researcher: async () => {
@@ -230,17 +213,11 @@ describe("Routines, dialog projection, and work events", () => {
       },
     });
 
-    await expect(workerHub.handleTask(task, routineContext())).resolves.toEqual(
-      {
-        status: "finished",
-        routineId: expect.any(String),
-        report: {
-          error: "failed",
-          code: "handler-error",
-          message: "callback failed",
-        },
-      },
-    );
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine).toMatchObject({
+      status: "finished",
+      error: { code: "handler-error", message: "callback failed" },
+    });
   });
 
   it("applies every flat routine report variant exhaustively", async () => {
@@ -273,25 +250,28 @@ describe("Routines, dialog projection, and work events", () => {
     ];
 
     for (const report of reports) {
-      const { arcHost, task } = await firstTaskWithArcHost();
-      const { workerHub } = makeWorkerHub({
+      const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+      const advanceInputs = recordAdvanceInputs(arcHost);
+      const { workerHub, routineStore } = makeWorkerHub({
         arcHost,
         workers: { researcher: async () => report },
       });
-      const result = await workerHub.handleTask(task, routineContext());
+      const { routine } = await settleFirstRoutine(workerHub, routineStore);
       if (report.suspension !== undefined) {
-        expect(result).toMatchObject({ status: "queued" });
+        expect(routine.status).toBe(
+          report.suspension === "paused" ? "paused" : report.suspension,
+        );
       } else if (report.error === "unavailable") {
-        expect(result).toMatchObject({
+        expect(routine).toMatchObject({
           status: "skipped",
           error: { code: report.code, message: report.message },
         });
       } else {
-        expect(result).toEqual({
-          status: "finished",
-          routineId: expect.any(String),
-          report,
-        });
+        expect(routine.status).toBe("finished");
+        await waitFor(() => advanceInputs.length === 1);
+        if (report.outcome === "completed")
+          expectAppliedCoverage(advanceInputs[0]);
+        else expect(advanceInputs[0]).toMatchObject({ reports: [report] });
       }
     }
   });
@@ -326,24 +306,21 @@ describe("Routines, dialog projection, and work events", () => {
   });
 
   it("passes a disposition on a semantic task through without semantic results", async () => {
-    const { arcHost, task: instruction } = await firstTaskWithArcHost();
-    const task = semanticTaskFor(instruction);
+    const arcHost = await makeArcHostWithSource("judge", JUDGE_SOURCE);
+    const advanceInputs = recordAdvanceInputs(arcHost);
     const report = {
       outcome: "disposition",
       interrupt: { id: "external" },
     } as const;
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workers: { researcher: async () => report },
     });
 
-    await expect(workerHub.handleTask(task, routineContext())).resolves.toEqual(
-      {
-        status: "finished",
-        routineId: expect.any(String),
-        report,
-      },
-    );
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine.task.kind).toBe("semantic");
+    await waitFor(() => advanceInputs.length === 1);
+    expect(advanceInputs[0]).toMatchObject({ reports: [report] });
   });
 
   it("rejects status-shaped and multiply discriminated routine reports", async () => {
@@ -357,24 +334,22 @@ describe("Routines, dialog projection, and work events", () => {
       validateRoutineReport({ outcome: "completed", suspension: "paused" }),
     ).toThrow("failed validation");
 
-    const { arcHost, task } = await firstTaskWithArcHost();
-    const { workerHub } = makeWorkerHub({
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workers: {
         researcher: async () => ({ status: "queued" }) as never,
       },
     });
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine).toMatchObject({
       status: "finished",
-      routineId: expect.any(String),
-      report: { error: "failed", code: "backend-error" },
+      error: { code: "backend-error" },
     });
   });
 
   it("persists backendDetails for every report variant with deterministic resume overwrite", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
     let invocation = 0;
     const { workerHub } = makeWorkerHub({
@@ -400,21 +375,17 @@ describe("Routines, dialog projection, and work events", () => {
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "queued",
-    });
-    const [routine] = await collectAsync(
-      routineStore.listRoutines(task.arcRunId),
+    const { arcRunId, routine } = await settleFirstRoutine(
+      workerHub,
+      routineStore,
     );
-    if (!routine) throw new Error("expected routine");
     await expect(routineStore.getRoutine(routine.id)).resolves.toMatchObject({
       status: "paused",
       backendDetails: { step: 1 },
     });
 
-    await workerHub.resume(task.arcRunId);
+    await waitFor(() => workerHub.getLiveWorkCounts().continuations === 1);
+    await workerHub.resume(arcRunId);
     await waitFor(async () => {
       const current = await routineStore.getRoutine(routine.id);
       return (
@@ -425,7 +396,8 @@ describe("Routines, dialog projection, and work events", () => {
         (current.backendDetails as Record<string, unknown>)["step"] === 2
       );
     });
-    await workerHub.resume(task.arcRunId);
+    await waitFor(() => workerHub.getLiveWorkCounts().continuations === 1);
+    await workerHub.resume(arcRunId);
     await waitFor(
       async () =>
         (await routineStore.getRoutine(routine.id))?.status === "finished",
@@ -436,22 +408,18 @@ describe("Routines, dialog projection, and work events", () => {
   });
 
   it("rejects a custom backend completed semantic report missing a requested id", async () => {
-    const { arcHost, task: instruction } = await firstTaskWithArcHost();
-    const task = semanticTaskFor(instruction);
-    const { workerHub } = makeWorkerHub({
+    const arcHost = await makeArcHostWithSource("judge", JUDGE_SOURCE);
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workers: {
         researcher: async () => ({ outcome: "completed" }),
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine).toMatchObject({
       status: "finished",
-      routineId: expect.any(String),
-      report: {
-        error: "failed",
+      error: {
         code: "backend-error",
         message: expect.stringContaining(
           "worker report.semantic is required for semantic work",
@@ -461,18 +429,18 @@ describe("Routines, dialog projection, and work events", () => {
   });
 
   it("records custom backend semantic drift before applying the normalized report", async () => {
-    const { arcHost, task: instruction } = await firstTaskWithArcHost();
-    const task = semanticTaskFor(instruction);
+    const arcHost = await makeArcHostWithSource("judge", JUDGE_SOURCE);
+    const advanceInputs = recordAdvanceInputs(arcHost);
     const { logger, records } = createCapturingLogger();
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       logger,
       workers: {
-        researcher: async () => ({
+        researcher: async (task) => ({
           outcome: "completed",
           semantic: {
             judgments: {
-              "judge:required": true,
+              [judgmentId(task)]: false,
               "judge:extra": false,
             },
             observations: {
@@ -483,16 +451,19 @@ describe("Routines, dialog projection, and work events", () => {
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: {
-        outcome: "completed",
-        semantic: { judgments: { "judge:required": true } },
-      },
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    await waitFor(() => advanceInputs.length === 1);
+    expect(advanceInputs[0]).toMatchObject({
+      reports: [
+        {
+          outcome: "completed",
+          semantic: { judgments: { [judgmentId(routine.task)]: false } },
+        },
+      ],
     });
+    expect(
+      (advanceInputs[0] as { reports: RoutineReport[] }).reports[0],
+    ).not.toHaveProperty(["semantic", "observations", "observe:extra"]);
     expect(records).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -505,7 +476,7 @@ describe("Routines, dialog projection, and work events", () => {
   });
 
   it("keeps paused handler routines running", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workers: {
@@ -513,14 +484,14 @@ describe("Routines, dialog projection, and work events", () => {
       },
     });
 
-    const result = await workerHub.handleTask(task, routineContext());
+    const { arcRunId, routine } = await settleFirstRoutine(
+      workerHub,
+      routineStore,
+    );
 
-    const routines = [];
-    for await (const routine of routineStore.listRoutines(ARC_RUN_ID)) {
-      routines.push(routine);
-    }
-    expect(result).toEqual({ status: "queued", routineId: routines[0]!.id });
-    expect(routines[0]).toEqual(expect.objectContaining({ status: "paused" }));
+    expect(await collectAsync(routineStore.listRoutines(arcRunId))).toEqual([
+      expect.objectContaining({ id: routine.id, status: "paused" }),
+    ]);
   });
 
   it("emits ordered structured logs for inbound and outbound messages", async () => {
@@ -654,39 +625,28 @@ describe("Routines, dialog projection, and work events", () => {
   });
 });
 
-function semanticTaskFor(instruction: InstructionTask): Task {
-  return {
-    kind: "semantic",
-    allowedDispositions: [],
-    batchId: "semantic:central-validation",
-    role: instruction.role,
-    stage: "action",
-    contextIsolation: instruction.contextIsolation,
-    arcRunId: instruction.arcRunId,
-    dialog: instruction.dialog,
-    activeInstruction: instruction,
-    requests: [
-      {
-        kind: "judgment",
-        briefId: "judge:required",
-        role: instruction.role,
-        question: "Is the work ready?",
-        sourceRef: instruction.sourceRef,
-        tool: {
-          type: "function",
-          name: "judge_required",
-          description: "Resolve readiness.",
-          strict: true,
-          parameters: {
-            type: "object",
-            properties: { result: { type: "boolean" } },
-            required: ["result"],
-            additionalProperties: false,
-          },
-        },
-      },
-    ],
-  };
+/** An action-stage researcher judgment, whose answer gates the instruction. */
+const JUDGE_SOURCE = `"arc";
+function Watch() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "researcher" };
+  if (judge(\`is the work ready\`)) {
+    $instruct(\`Proceed.\`);
+  }
+}`;
+
+/** Assert an advance input applied every instruction it covers. */
+function expectAppliedCoverage(input: unknown): void {
+  const coverage = (input as { instructionCoverage: Record<string, string> })
+    .instructionCoverage;
+  expect(Object.values(coverage)).not.toHaveLength(0);
+  for (const value of Object.values(coverage)) expect(value).toBe("applied");
+}
+
+/** The id of the single judgment a semantic task requests. */
+function judgmentId(task: Task): string {
+  if (task.kind !== "semantic") throw new Error("expected semantic task");
+  return task.requests[0]!.briefId;
 }
 
 describe("transition views and position events", () => {

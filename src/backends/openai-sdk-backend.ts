@@ -339,12 +339,15 @@ function buildSemanticPrompt(
   return parts.join("\n");
 }
 
+/** Turn the OpenAI worker's rendered fallback uses to continue retained work. */
+const CONTINUATION_TURN = "Continue";
+
 function appendResumeMessage(
   parts: string[],
   resume: OpenAiSdkResumeContext | undefined,
 ): void {
-  if (resume?.delivery !== "rendered-context") return;
-  parts.push("", xmlBlock("resume-message", resume.message));
+  if (resume?.delivery !== "continue") return;
+  parts.push("", xmlBlock("resume-message", CONTINUATION_TURN));
 }
 
 function buildOpenAiSdkTools(
@@ -820,7 +823,7 @@ function defaultOpenAiContinuityIdentity(
 function openAiNativeResume(
   input: RoutineInput,
 ): OpenAiSdkResumeContext | undefined {
-  return input.context.routineResume?.delivery === "rendered-context"
+  return input.context.routineResume?.delivery === "continue"
     ? { delivery: "native" }
     : undefined;
 }

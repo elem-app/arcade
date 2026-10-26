@@ -16,9 +16,11 @@ export type RoutineResumeContext =
       delivery: "fresh-start";
     }
   | {
-      /** Render continuation text into the worker's own context mechanism. */
-      delivery: "rendered-context";
-      message: string;
+      /**
+       * Continue retained work through the worker's own mechanism. The worker
+       * chooses which turn, if any, continues its provider context.
+       */
+      delivery: "continue";
     };
 
 /** Hub-owned routine identity and detached task snapshot. */

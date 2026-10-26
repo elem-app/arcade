@@ -29,9 +29,12 @@ import {
   ARC_RUN_ID,
   BOB_OWNER,
   collectAsync,
+  makeArcHostWithSource,
+  makeWorkerHub,
   StubDiscovery,
   StubWorkerHub,
   waitFor,
+  WATCH_SOURCE,
 } from "./helpers.js";
 
 const REPLY_OUTBOUND = {
@@ -364,11 +367,13 @@ describe("McpConnector", () => {
       _meta: { "arcade.principal": ALICE_OWNER },
     });
 
-    await workerHub.emitOutbound({
+    const sharedAsk = {
       ...QUESTION_OUTBOUND,
       arcRunId,
       metadata: { askId: "ask:shared-client" },
-    });
+    };
+    workerHub.asks.push(sharedAsk);
+    await workerHub.emitOutbound(sharedAsk);
     const [item] = await collectAsync(inboxStore.listMessages());
     if (!item) throw new Error("expected shared outbound inbox item");
 
@@ -549,11 +554,13 @@ describe("McpConnector", () => {
       arguments: { content: "Attach and continue." },
       _meta: { "arcade.principal": ALICE_OWNER },
     });
-    await workerHub.emitOutbound({
+    const liveAsk = {
       ...QUESTION_OUTBOUND,
       arcRunId,
       metadata: { askId: "ask:before-follow-up" },
-    });
+    };
+    workerHub.asks.push(liveAsk);
+    await workerHub.emitOutbound(liveAsk);
     const [item] = await collectAsync(inboxStore.listMessages());
     if (!item) throw new Error("expected open outbound inbox item");
 
@@ -1684,6 +1691,355 @@ describe("McpConnector", () => {
       inboxStore.listMessages({ statuses: ["pending"] }),
     );
     expect(items).toHaveLength(1);
+  });
+});
+
+describe("McpConnector ask reconciliation", () => {
+  const QUESTION_POLICY: McpDeliveryPolicy = {
+    situation: QUESTION_OUTBOUND.situation,
+    delivery: "inbox",
+    resolveTargets: () => [ALICE_OWNER],
+  };
+  const JOIN_RUN_ID = "arc-run:reconciled-run";
+
+  /** A question outbound for the joined run under a given askId. */
+  function questionFor(askId: string) {
+    return {
+      ...QUESTION_OUTBOUND,
+      arcRunId: JOIN_RUN_ID,
+      metadata: { askId },
+    };
+  }
+
+  /** Join the run through a run-choice handshake and return the decision. */
+  async function join(
+    workerHub: StubWorkerHub,
+    client: Client,
+  ): Promise<Record<string, unknown>> {
+    const channel = new HotAsyncQueue<InboundLifecycleEvent>();
+    channel.push({
+      kind: "handshake-required",
+      arcRunId: "run:selection",
+      handshakeId: "handshake:join",
+      arcRef: "arc:test:Join",
+      requirement: {
+        kind: "run-choice",
+        freshAvailable: false,
+        candidates: [
+          {
+            arcRunId: JOIN_RUN_ID,
+            arcRef: "arc:test:Join",
+            lifecycle: "active",
+            createdAt: "2026-10-27T00:00:00.000Z",
+            updatedAt: "2026-10-27T00:00:00.000Z",
+            workspacePath: "/tmp/reconciled-run",
+          },
+        ],
+      },
+    });
+    workerHub.submitInbound.mockReturnValueOnce(channel);
+    workerHub.handshake.mockImplementationOnce(async () => {
+      channel.push({
+        kind: "joined",
+        arcRunId: JOIN_RUN_ID,
+        arcRef: "arc:test:Join",
+      });
+      channel.close();
+      return { status: "ok" };
+    });
+    await client.callTool({
+      name: "arcade_submit_user_message",
+      arguments: { content: "Join the run." },
+      _meta: { "arcade.principal": ALICE_OWNER },
+    });
+    const resolved = await client.callTool({
+      name: "arcade_resolve_handshake",
+      arguments: {
+        id: "handshake:join",
+        values: { runChoice: { action: "join", arcRunId: "reconciled-run" } },
+      },
+    });
+    expect(resolved.isError).not.toBe(true);
+    const [content] = resolved.content as [{ text: string }];
+    return JSON.parse(content.text) as Record<string, unknown>;
+  }
+
+  /** Resume the joined run through the tool; the stub reports a rebuild. */
+  async function resumeRebuilt(workerHub: StubWorkerHub, client: Client) {
+    const resume = vi.fn(async () => ({
+      outcome: "resumed" as const,
+      control: {
+        arcRunId: JOIN_RUN_ID,
+        status: "running" as const,
+        updatedAt: "2026-10-27T00:00:00.000Z",
+      },
+    }));
+    Object.assign(workerHub, { resume });
+    const resumed = await client.callTool({
+      name: "arcade_resume",
+      arguments: { arcRunId: JOIN_RUN_ID },
+    });
+    expect(resumed.isError).not.toBe(true);
+    expect(resume).toHaveBeenCalledExactlyOnceWith(JOIN_RUN_ID);
+  }
+
+  async function items(inboxStore: InMemoryMcpOutboundInboxStore) {
+    return collectAsync(inboxStore.listMessages());
+  }
+
+  it("conn.mcp-inbox marks a held item obsolete when its ask is not live at join", async () => {
+    const workerHub = new StubWorkerHub();
+    const { inboxStore, port } = await startConnector({
+      workerHub,
+      policies: [QUESTION_POLICY],
+    });
+    const client = await connectClient(port);
+    await workerHub.emitOutbound(questionFor("ask:lost-at-restart"));
+    const [held] = await items(inboxStore);
+
+    const decision = await join(workerHub, client);
+
+    expect(decision["outbound"]).toEqual([]);
+    await expect(inboxStore.getMessage(held!.id)).resolves.toMatchObject({
+      status: "obsolete",
+    });
+  });
+
+  it("conn.mcp-inbox creates an item for a live ask the connector does not hold when joining", async () => {
+    const workerHub = new StubWorkerHub();
+    workerHub.asks.push(questionFor("ask:never-delivered"));
+    const { inboxStore, port } = await startConnector({
+      workerHub,
+      policies: [QUESTION_POLICY],
+    });
+    const client = await connectClient(port);
+
+    const decision = await join(workerHub, client);
+
+    expect(decision["outbound"]).toEqual([
+      expect.objectContaining({
+        arcRunId: JOIN_RUN_ID,
+        status: "pending",
+        metadata: { askId: "ask:never-delivered" },
+      }),
+    ]);
+  });
+
+  it("conn.mcp-inbox keeps an item for an ask raised during reconciliation", async () => {
+    const workerHub = new StubWorkerHub();
+    const { inboxStore, port } = await startConnector({
+      workerHub,
+      policies: [QUESTION_POLICY],
+    });
+    const client = await connectClient(port);
+    // A rebuilt routine asks while the connector reads the live asks.
+    let raised: Promise<void> | undefined;
+    workerHub.listAsks.mockImplementationOnce(() => {
+      raised = workerHub.emitOutbound(questionFor("ask:raised-meanwhile"));
+      return [];
+    });
+
+    await join(workerHub, client);
+    await raised;
+
+    expect(await items(inboxStore)).toEqual([
+      expect.objectContaining({
+        status: "pending",
+        metadata: { askId: "ask:raised-meanwhile" },
+      }),
+    ]);
+  });
+
+  it("conn.mcp-inbox reports each joined run's control view and resumes nothing", async () => {
+    const workerHub = new StubWorkerHub();
+    const resume = vi.fn();
+    Object.assign(workerHub, { resume });
+    workerHub.controlViews.set(JOIN_RUN_ID, {
+      arcRunId: JOIN_RUN_ID,
+      status: "hub-restarted",
+      updatedAt: "2026-10-27T00:00:00.000Z",
+    });
+    const { port } = await startConnector({
+      workerHub,
+      policies: [QUESTION_POLICY],
+    });
+    const client = await connectClient(port);
+
+    const decision = await join(workerHub, client);
+
+    expect(decision["control"]).toEqual([
+      {
+        arcRunId: JOIN_RUN_ID,
+        status: "hub-restarted",
+        updatedAt: "2026-10-27T00:00:00.000Z",
+      },
+    ]);
+    expect(decision["note"]).toEqual(
+      expect.stringContaining("arcade_resume continues a paused or parked run"),
+    );
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("conn.mcp-inbox marks held asks obsolete after a resume that rebuilds the run", async () => {
+    const workerHub = new StubWorkerHub();
+    workerHub.asks.push(questionFor("ask:before-rebuild"));
+    const { inboxStore, port } = await startConnector({
+      workerHub,
+      policies: [QUESTION_POLICY],
+    });
+    const client = await connectClient(port);
+    await workerHub.emitOutbound(questionFor("ask:before-rebuild"));
+    await join(workerHub, client);
+    const [held] = await items(inboxStore);
+    expect(held).toMatchObject({ status: "pending" });
+
+    // The rebuild leaves no live asks.
+    workerHub.asks.splice(0);
+    await resumeRebuilt(workerHub, client);
+
+    await expect(inboxStore.getMessage(held!.id)).resolves.toMatchObject({
+      status: "obsolete",
+    });
+  });
+
+  it("conn.mcp-inbox rejects an answer to an obsolete item before submission", async () => {
+    const workerHub = new StubWorkerHub();
+    const { inboxStore, port } = await startConnector({
+      workerHub,
+      policies: [QUESTION_POLICY],
+    });
+    const client = await connectClient(port);
+    await workerHub.emitOutbound(questionFor("ask:obsolete"));
+    await join(workerHub, client);
+    const [obsolete] = await items(inboxStore);
+    expect(obsolete).toMatchObject({ status: "obsolete" });
+    const submissions = workerHub.submitInbound.mock.calls.length;
+
+    const answered = await client.callTool({
+      name: "arcade_answer_outbound_message",
+      arguments: { id: obsolete!.id, content: "Too late." },
+      _meta: { "arcade.principal": ALICE_OWNER },
+    });
+
+    expect(answered.isError).toBe(true);
+    expect(workerHub.submitInbound.mock.calls.length).toBe(submissions);
+  });
+
+  it("conn.mcp-inbox creates one item for a live ask that also arrives through its handler", async () => {
+    const workerHub = new StubWorkerHub();
+    const ask = questionFor("ask:both-paths");
+    workerHub.asks.push(ask);
+    const { inboxStore, port } = await startConnector({
+      workerHub,
+      policies: [QUESTION_POLICY],
+    });
+    const client = await connectClient(port);
+
+    await Promise.all([
+      workerHub.emitOutbound(ask),
+      join(workerHub, client),
+      workerHub.emitOutbound(ask),
+    ]);
+
+    expect(await items(inboxStore)).toEqual([
+      expect.objectContaining({ metadata: { askId: "ask:both-paths" } }),
+    ]);
+  });
+
+  it("conn.mcp-inbox gives a live ask whose item failed a fresh answerable item", async () => {
+    const workerHub = new StubWorkerHub();
+    workerHub.asks.push(questionFor("ask:answer-failed"));
+    const { inboxStore, port } = await startConnector({
+      workerHub,
+      policies: [QUESTION_POLICY],
+    });
+    const client = await connectClient(port);
+    await join(workerHub, client);
+    const [first] = await items(inboxStore);
+    await inboxStore.updateMessage(first!.id, { status: "failed" });
+
+    await resumeRebuilt(workerHub, client);
+
+    const fresh = (await items(inboxStore)).find(
+      (item) => item.id !== first!.id,
+    );
+    expect(fresh).toMatchObject({
+      status: "pending",
+      metadata: { askId: "ask:answer-failed" },
+    });
+    const answered = await client.callTool({
+      name: "arcade_answer_outbound_message",
+      arguments: { id: fresh!.id, content: "Second try." },
+      _meta: { "arcade.principal": ALICE_OWNER },
+    });
+    expect(answered.isError).not.toBe(true);
+  });
+});
+
+describe("McpConnector elicitation over a live hub", () => {
+  it("conn.mcp-elicitation publishes blocked events before an elicitation is answered", async () => {
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: {
+        researcher: async (_task, _context, effects) => {
+          await Promise.all([
+            effects.emit({
+              situation: { cause: "question" },
+              content: "Which source?",
+            }),
+            effects.requestPermission({
+              toolCallId: "tool:write",
+              toolName: "Write",
+              input: { file_path: "notes.txt" },
+            }),
+          ]);
+          return { outcome: "completed" };
+        },
+      },
+    });
+    const port = await findFreePort();
+    const connector = new McpConnector({
+      workerHub,
+      discovery: new StubDiscovery() as unknown as DiscoveryService,
+      inboxStore: new InMemoryMcpOutboundInboxStore(),
+      logger: createArcadeLogger("silent", "json"),
+      policies: (["question", "permission-ask"] as const).map((cause) => ({
+        situation: { role: "*", audience: "*", cause },
+        delivery: "elicitation" as const,
+        resolveTargets: () => [ALICE_OWNER],
+      })),
+      transport: { host: "127.0.0.1", port, path: "/mcp" },
+    });
+    await connector.start();
+    activeConnectors.push(connector);
+    const client = await connectClient(port, { elicitation: { form: {} } });
+    // The user never answers.
+    const unanswered = new Promise<never>(() => undefined);
+    let elicitations = 0;
+    client.setRequestHandler(ElicitRequestSchema, async () => {
+      elicitations += 1;
+      return unanswered;
+    });
+
+    await client.callTool({
+      name: "arcade_submit_user_message",
+      arguments: { content: "Start the run." },
+      _meta: { "arcade.principal": ALICE_OWNER },
+    });
+    const [run] = await arcHost.listRunViews();
+
+    await waitFor(async () => {
+      const kinds = (await workerHub.listWorkEvents(run!.arcRunId)).map(
+        (event) => event.kind,
+      );
+      return (
+        kinds.includes("blocked:question") &&
+        kinds.includes("blocked:permission")
+      );
+    });
+    await waitFor(() => elicitations === 2);
+    await workerHub.stop();
   });
 });
 

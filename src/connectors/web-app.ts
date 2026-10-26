@@ -389,11 +389,7 @@ export class WebAppConnector implements Connector {
 
     const resumeMatch = /^\/api\/runs\/([^/]+)\/resume$/.exec(url.pathname);
     if (req.method === "POST" && resumeMatch) {
-      const body = await readJsonBody(req);
-      const result = await this.#resumeRun(
-        decodeURIComponent(resumeMatch[1]!),
-        readStringProperty(body, "message"),
-      );
+      const result = await this.#resumeRun(decodeURIComponent(resumeMatch[1]!));
       if (result.outcome === "run-not-actioning") {
         writeJson(res, 409, { error: result.outcome });
         return;
@@ -854,7 +850,6 @@ export class WebAppConnector implements Connector {
 
   async #resumeRun(
     arcRunId: string,
-    message?: string,
   ): Promise<
     | Awaited<ReturnType<WorkerHubService["resume"]>>
     | { outcome: "forbidden" }
@@ -865,7 +860,7 @@ export class WebAppConnector implements Connector {
       return { outcome: "forbidden" };
     }
     if (view.stage !== "actioning") return { outcome: "run-not-actioning" };
-    return this.#workerHub.resume(arcRunId, message);
+    return this.#workerHub.resume(arcRunId);
   }
 
   async #handleOutbound(message: OutboundMessage): Promise<void> {

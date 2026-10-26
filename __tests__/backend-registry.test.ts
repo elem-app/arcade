@@ -20,14 +20,14 @@ import {
   workerContextKey,
   WorkerHubService,
   type ArcHostService,
-  type Task,
 } from "../src/testing.js";
 import {
   createCapturingLogger,
-  firstTaskWithArcHost,
   makeArcHost,
+  makeArcHostWithSource,
+  WATCH_SOURCE,
 } from "./helpers.js";
-import { routineContext } from "./worker-hub-helpers.js";
+import { settleFirstRoutine, submitActivation } from "./worker-hub-helpers.js";
 
 describe("backend registry", () => {
   it("creates distinct workers for two role slots selecting one backend", async () => {
@@ -497,7 +497,8 @@ describe("backend registry", () => {
   });
 
   it("warms the selected worker before non-trigger dispatch with resolved identity", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const routineStore = executionControlFor(arcHost);
     const workerHub = createWorkerHub(arcHost);
     const calls: string[] = [];
     const warm = vi.fn(async () => {
@@ -515,19 +516,24 @@ describe("backend registry", () => {
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
 
-    await workerHub.handleTask(task, routineContext());
+    const { arcRunId, routine } = await settleFirstRoutine(
+      workerHub,
+      routineStore,
+    );
 
     expect(calls).toEqual(["warm", "run"]);
     expect(warm).toHaveBeenCalledWith({
-      arcRunId: task.arcRunId,
-      role: task.role,
-      contextKey: workerContextKey(task, 0),
-      workspacePath: routineContext().workspacePath,
+      arcRunId,
+      role: "researcher",
+      contextKey: workerContextKey(routine.task, 0),
+      workspacePath: (await arcHost.getRunWorkspaceContext(arcRunId))
+        .workspacePath,
     });
   });
 
   it("continues cold worker execution when warm state is absent or warm fails", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const routineStore = executionControlFor(arcHost);
     const workerHub = createWorkerHub(arcHost);
     const run = vi.fn(async () => ({ outcome: "completed" }) as const);
     workerHub.addBackend(
@@ -544,17 +550,15 @@ describe("backend registry", () => {
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: { outcome: "completed" },
-    });
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine).toMatchObject({ status: "finished" });
+    expect(routine.error).toBeUndefined();
     expect(run).toHaveBeenCalledOnce();
   });
 
   it("continues cold worker execution when asynchronous warm fails", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const routineStore = executionControlFor(arcHost);
     const { logger, records } = createCapturingLogger();
     const workerHub = createWorkerHub(arcHost, logger);
     const run = vi.fn(async () => ({ outcome: "completed" }) as const);
@@ -572,12 +576,12 @@ describe("backend registry", () => {
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: { outcome: "completed" },
-    });
+    const { arcRunId, routine } = await settleFirstRoutine(
+      workerHub,
+      routineStore,
+    );
+    expect(routine).toMatchObject({ status: "finished" });
+    expect(routine.error).toBeUndefined();
     expect(run).toHaveBeenCalledOnce();
     expect(records).toEqual(
       expect.arrayContaining([
@@ -585,53 +589,61 @@ describe("backend registry", () => {
           event: "worker_hub.worker.warm_failed",
           backend: "custom-agent",
           role: "researcher",
-          arcRunId: task.arcRunId,
+          arcRunId,
         }),
       ]),
     );
   });
 
   it("warms the fast-trigger worker with the supplied process workspace", async () => {
-    const { arcHost, task: instruction } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource(
+      "fast",
+      '"arc"; function Main() { this.trigger = () => judge("fast?"); }',
+    );
     const workerHub = createWorkerHub(arcHost);
     const warm = vi.fn();
-    const triggerTask: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:fast-trigger-warm",
-      role: instruction.role,
-      stage: "trigger",
-      contextIsolation: instruction.contextIsolation,
-      arcRunId: instruction.arcRunId,
-      dialog: instruction.dialog,
-      requests: [],
-      activeInstruction: instruction,
-    };
+    let captured: RoutineInput["routine"] | undefined;
     workerHub.addBackend(
       "custom-agent",
       backend(["fast-trigger"], () => ({
         disposeRoutine: async () => {},
         warm,
-        run: async () => ({ outcome: "completed" }),
+        run: async (input) => {
+          captured = input.routine;
+          const task = input.routine.task;
+          return {
+            outcome: "completed",
+            semantic: {
+              judgments: Object.fromEntries(
+                task.kind === "semantic"
+                  ? task.requests.map((request) => [request.briefId, true])
+                  : [],
+              ),
+            },
+          };
+        },
       })),
     );
     await workerHub.start({
       workers: { fastTrigger: { backend: "custom-agent" } },
     });
 
-    await expect(
-      workerHub.handleTask(triggerTask, routineContext()),
-    ).resolves.toMatchObject({ status: "finished" });
+    await submitActivation(workerHub, "fast?");
+    expect(captured?.task).toMatchObject({
+      kind: "semantic",
+      stage: "trigger",
+    });
     expect(warm).toHaveBeenCalledExactlyOnceWith({
-      arcRunId: triggerTask.arcRunId,
-      role: triggerTask.role,
-      contextKey: workerContextKey(triggerTask, 0),
+      arcRunId: captured!.arcRunId,
+      role: captured!.task.role,
+      contextKey: workerContextKey(captured!.task, 0),
       workspacePath: process.cwd(),
     });
   });
 
   it("detaches and recursively freezes the routine descriptor at dispatch", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const routineStore = executionControlFor(arcHost);
     const workerHub = createWorkerHub(arcHost);
     let captured: RoutineInput["routine"] | undefined;
     workerHub.addBackend(
@@ -648,21 +660,23 @@ describe("backend registry", () => {
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
 
-    await workerHub.handleTask(task, routineContext());
+    await settleFirstRoutine(workerHub, routineStore);
 
     const descriptor = captured!;
-    expect(descriptor.task).not.toBe(task);
     expect(Object.isFrozen(descriptor)).toBe(true);
     expect(Object.isFrozen(descriptor.task)).toBe(true);
     expect(Object.isFrozen(descriptor.task.dialog)).toBe(true);
     expect(() => {
       descriptor.task.role = "mutated";
     }).toThrow();
-    expect(task.role).toBe("researcher");
+    expect((await routineStore.getRoutine(descriptor.id))?.task.role).toBe(
+      "researcher",
+    );
   });
 
   it("maps an escaping worker exception to backend-error after recording usage", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const routineStore = executionControlFor(arcHost);
     const workerHub = createWorkerHub(arcHost);
     workerHub.addBackend(
       "custom-agent",
@@ -678,17 +692,15 @@ describe("backend registry", () => {
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
+    const { arcRunId, routine } = await settleFirstRoutine(
+      workerHub,
+      routineStore,
+    );
+    expect(routine).toMatchObject({
       status: "finished",
-      report: {
-        error: "failed",
-        code: "backend-error",
-        message: "worker exploded",
-      },
+      error: { code: "backend-error", message: "worker exploded" },
     });
-    await expect(workerHub.listWorkEvents(task.arcRunId)).resolves.toEqual(
+    await expect(workerHub.listWorkEvents(arcRunId)).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           kind: "routine:usage",
@@ -699,27 +711,24 @@ describe("backend registry", () => {
   });
 
   it("keeps in-process callback exceptions on the handler-error path", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const routineStore = executionControlFor(arcHost);
     const workerHub = createWorkerHub(arcHost);
     workerHub.registerRoleWorker("researcher", async () => {
       throw new Error("callback exploded");
     });
     await workerHub.start();
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine).toMatchObject({
       status: "finished",
-      report: {
-        error: "failed",
-        code: "handler-error",
-        message: "callback exploded",
-      },
+      error: { code: "handler-error", message: "callback exploded" },
     });
   });
 
   it("parks a custom backend capacity interrupt without hub classifier changes", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const routineStore = executionControlFor(arcHost);
     const workerHub = createWorkerHub(arcHost);
     workerHub.addBackend(
       "custom-agent",
@@ -739,15 +748,13 @@ describe("backend registry", () => {
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "queued",
-    });
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine.status).toBe("capacity-limited");
   });
 
   it("parks a custom backend transport interrupt without hub classifier changes", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const routineStore = executionControlFor(arcHost);
     const workerHub = createWorkerHub(arcHost);
     workerHub.addBackend(
       "custom-agent",
@@ -766,11 +773,8 @@ describe("backend registry", () => {
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "queued",
-    });
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine.status).toBe("transport-lost");
   });
 
   it("logs every normal shutdown worker failure before aggregating them", async () => {
@@ -821,7 +825,8 @@ describe("backend registry", () => {
   });
 
   it("logs flat backend report discriminators", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const routineStore = executionControlFor(arcHost);
     const { logger, records } = createCapturingLogger();
     const workerHub = createWorkerHub(arcHost, logger);
     workerHub.addBackend(
@@ -835,7 +840,7 @@ describe("backend registry", () => {
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
 
-    await workerHub.handleTask(task, routineContext());
+    await settleFirstRoutine(workerHub, routineStore);
 
     expect(records).toEqual(
       expect.arrayContaining([

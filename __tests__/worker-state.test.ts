@@ -16,8 +16,16 @@ import {
   type ArcRunId,
   type WorkerHubStore,
 } from "../src/testing.js";
-import { firstTaskWithArcHost } from "./helpers.js";
-import { routineContext } from "./worker-hub-helpers.js";
+import {
+  collectAsync,
+  makeArcHostWithSource,
+  waitFor,
+  WATCH_SOURCE,
+} from "./helpers.js";
+import {
+  recordAdvanceInputs,
+  settleFirstRoutine,
+} from "./worker-hub-helpers.js";
 
 const RUN_ID = "arc-run:worker-state" as ArcRunId;
 
@@ -200,8 +208,9 @@ describe("worker state", () => {
   });
 
   it("rejects non-canonical backendDetails before routine persistence", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
+    const advanceInputs = recordAdvanceInputs(arcHost);
     const workerHub = new WorkerHubService({
       arcHost,
       historyStore: new InMemoryHistoryStore(),
@@ -228,16 +237,12 @@ describe("worker state", () => {
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: { error: "failed", code: "backend-error" },
+    const { arcRunId } = await settleFirstRoutine(workerHub, routineStore);
+    await waitFor(() => advanceInputs.length === 1);
+    expect(advanceInputs[0]).toMatchObject({
+      reports: [{ error: "failed", code: "backend-error" }],
     });
-    const routines = [];
-    for await (const routine of routineStore.listRoutines(task.arcRunId)) {
-      routines.push(routine);
-    }
+    const routines = await collectAsync(routineStore.listRoutines(arcRunId));
     expect(routines).toHaveLength(1);
     expect(routines[0]?.backendDetails).toBeUndefined();
   });

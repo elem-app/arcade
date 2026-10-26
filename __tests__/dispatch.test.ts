@@ -13,6 +13,7 @@ import {
   DEFAULT_WORKER_ROLE,
   InMemoryArcHostStore,
   taskId,
+  taskSourceRef,
   workerContextKey,
   type ClaudeSdkQueryFn,
   type ClaudeSdkStartupFn,
@@ -24,15 +25,15 @@ import {
   type OpenAiSdkTstRunFn,
   type RoleWorker,
   type RoutineContext,
+  type RoutineReport,
   type RunFrontier,
   type Task,
 } from "../src/testing.js";
 import { callOpenAiTool } from "./backend-helpers.js";
+import { makeControlledTime } from "./controlled-time.js";
 import {
   ALICE_OWNER,
-  ARC_RUN_ID,
   collectAsync,
-  firstTaskWithArcHost,
   GREET_SOURCE,
   makeArcHost,
   makeArcHostWithSource,
@@ -41,12 +42,13 @@ import {
   WATCH_SOURCE,
 } from "./helpers.js";
 import {
+  callClaudeSdkTool,
   claudeSemanticMessages,
   claudeStreamingQuery,
-  openAiSemanticTask,
+  exampleSemanticReport,
   recordAdvanceInputs,
-  routineContext,
   semanticRequestIds,
+  settleFirstRoutine,
   submitActivation,
 } from "./worker-hub-helpers.js";
 
@@ -179,12 +181,12 @@ function Main() {
   });
 
   it("dispatches instruction tasks to openai-sdk", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return { lastResponseId: "resp-pool" };
     });
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workerSlots: { default: "openai-sdk" },
       openAiSdk: {
@@ -193,55 +195,45 @@ function Main() {
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: { outcome: "completed" },
-    });
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine).toMatchObject({ status: "finished" });
+    expect(routine.error).toBeUndefined();
     expect(run).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects invalid task source refs before persisting a routine", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
-    const invalidTask = { ...task, sourceRef: "node:watch:Missing" as const };
-    const { workerHub, routineStore } = makeWorkerHub({
-      arcHost,
-      workers: {
-        researcher: async () => ({ outcome: "completed" }),
-      },
-    });
-
-    await expect(
-      workerHub.handleTask(invalidTask, routineContext()),
-    ).rejects.toThrow(
-      `Arc run ${ARC_RUN_ID} snapshot has no node for source ref node:watch:Missing.`,
-    );
-    await expect(collectAsync(routineStore.listRoutines())).resolves.toEqual(
-      [],
-    );
-  });
-
   it("resolves pinned action node metadata once per routine after source replacement", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
-    await arcHost.registerArc(
+    const arcHost = await makeArcHostWithSource(
       "watch",
-      parse(`
+      `"arc";
+function Watch() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "researcher" };
+  $instruct(\`Watch for updates.\`);
+  $instruct(\`Report the updates.\`);
+}`,
+    );
+    const nodeInfoForRunRef = vi.spyOn(arcHost, "nodeInfoForRunRef");
+    // The first routine replaces the source; the second resolves its node from
+    // the run's pinned snapshot.
+    const worker = vi.fn<RoleWorker>(async (task, _context, effects) => {
+      if (worker.mock.calls.length === 1) {
+        await arcHost.registerArc(
+          "watch",
+          parse(`
 "arc";
 
 function Replacement() {
   this.trigger = () => true;
 }
 `),
-      { workspaceScope: "run", bundle: {}, contextIsolation: "role" },
-      { replace: true },
-    );
-    expect(() => arcHost.nodeInfoForRef(task.sourceRef)).toThrow(
-      `No registered Arc node for source ref ${task.sourceRef}.`,
-    );
-    const nodeInfoForRunRef = vi.spyOn(arcHost, "nodeInfoForRunRef");
-    const worker = vi.fn<RoleWorker>(async (_task, _context, effects) => {
+          { workspaceScope: "run", bundle: {}, contextIsolation: "role" },
+          { replace: true },
+        );
+        expect(() => arcHost.nodeInfoForRef(taskSourceRef(task))).toThrow(
+          `No registered Arc node for source ref ${taskSourceRef(task)}.`,
+        );
+        return { outcome: "completed" };
+      }
       await effects.logToolEvent({
         kind: "tool:started",
         toolCallId: "tool:pinned-node",
@@ -259,27 +251,26 @@ function Replacement() {
       workers: { researcher: worker },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: { outcome: "completed" },
-    });
-    expect(worker).toHaveBeenCalledOnce();
-    expect(nodeInfoForRunRef).toHaveBeenCalledOnce();
-    await expect(workerHub.listWorkEvents(task.arcRunId)).resolves.toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: "routine:started",
-          nodeName: "Watch",
-        }),
-      ]),
+    const arcRunId = await submitActivation(workerHub, "start");
+    await waitFor(async () =>
+      (await workerHub.listWorkEvents(arcRunId)).some(
+        (event) => event.kind === "run:completed",
+      ),
     );
+    expect(worker).toHaveBeenCalledTimes(2);
+    expect(nodeInfoForRunRef).toHaveBeenCalledTimes(2);
+    expect(
+      (await workerHub.listWorkEvents(arcRunId)).filter(
+        (event) => event.kind === "routine:started",
+      ),
+    ).toEqual([
+      expect.objectContaining({ nodeName: "Watch" }),
+      expect.objectContaining({ nodeName: "Watch" }),
+    ]);
   });
 
   it("resolves trigger task node metadata from the latest runtime", async () => {
-    const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", TRIGGER_JUDGE_SOURCE);
     await arcHost.registerArc(
       "watch",
       parse(`
@@ -287,39 +278,23 @@ function Replacement() {
 
 function Watch() {
   this.description = "Replacement trigger node.";
-  this.trigger = () => true;
+  this.trigger = () => judge(\`should this start?\`);
 }
 `),
       { workspaceScope: "run", bundle: {}, contextIsolation: "role" },
       { replace: true },
     );
-    const task: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:latest-trigger-node",
-      role: DEFAULT_WORKER_ROLE,
-      stage: "trigger",
-      contextIsolation: "role",
-      arcRunId: activeInstruction.arcRunId,
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-      requests: [],
-      activeInstruction,
-    };
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workers: {
-        [DEFAULT_WORKER_ROLE]: async () => ({ outcome: "completed" }),
+        [DEFAULT_WORKER_ROLE]: async (task) => answerAll(task),
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: { outcome: "completed" },
-    });
-    await expect(workerHub.listWorkEvents(task.arcRunId)).resolves.toEqual(
+    await submitActivation(workerHub, "start");
+    const [routine] = await collectAsync(routineStore.listRoutines());
+    expect(routine?.task).toMatchObject({ kind: "semantic", stage: "trigger" });
+    await expect(workerHub.listWorkEvents(routine!.arcRunId)).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           kind: "routine:started",
@@ -410,27 +385,38 @@ function Watch() {
   });
 
   it("starts OpenAI fresh when continuity identity is unavailable", async () => {
-    const workspace = await mkdtemp(
-      join(tmpdir(), "arcade-openai-context-reconstruction-"),
-    );
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    await routineStore.putRoutine({
-      id: "routine:persisted-openai-context",
-      role: task.role,
-      backend: "openai-sdk",
-      arcRunId: task.arcRunId,
-      status: "finished",
-      task,
-      updatedAt: "2026-07-30T00:00:00.000Z",
-      backendDetails: {
-        backend: "openai-sdk",
-        sessionKey: workerContextKey(task, 0),
-        responseId: "response-persisted-context",
-        cwd: workspace,
-        model: "gpt-5.5",
+    const getRunWorkspaceContext = arcHost.getRunWorkspaceContext.bind(arcHost);
+    let restored = false;
+    // A routine from earlier work in the same context, recorded before the
+    // first dispatch reads the run context.
+    vi.spyOn(arcHost, "getRunWorkspaceContext").mockImplementation(
+      async (arcRunId) => {
+        const runContext = await getRunWorkspaceContext(arcRunId);
+        if (!restored) {
+          restored = true;
+          const persistedTask = persistedInstruction(arcRunId);
+          await routineStore.putRoutine({
+            id: "routine:persisted-openai-context",
+            role: persistedTask.role,
+            backend: "openai-sdk",
+            arcRunId,
+            status: "finished",
+            task: persistedTask,
+            updatedAt: "2026-07-30T00:00:00.000Z",
+            backendDetails: {
+              backend: "openai-sdk",
+              sessionKey: workerContextKey(persistedTask, 0),
+              responseId: "response-persisted-context",
+              cwd: runContext.workspacePath,
+              model: "gpt-5.5",
+            },
+          });
+        }
+        return runContext;
       },
-    });
+    );
     const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return { lastResponseId: "response-next-context" };
@@ -442,50 +428,52 @@ function Watch() {
       openAiSdk: { apiKey: "sk-test", run },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext({ workspacePath: workspace })),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: { outcome: "completed" },
-    });
+    await submitActivation(workerHub, "start watching");
+    await waitFor(() => run.mock.calls.length === 1);
     expect(run.mock.calls[0]![0].previousResponseId).toBeUndefined();
   });
 
   it("keeps general-backend trigger continuity separate from action continuity", async () => {
-    const { arcHost, task: actionTask } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource(
+      "watch",
+      `"arc";
+function Watch() {
+  this.trigger = () => judge(\`should this start?\`);
+  this.hostParams = { workerRole: "researcher" };
+}`,
+    );
     const routineStore = executionControlFor(arcHost);
-    const context = routineContext();
-    await routineStore.putRoutine({
-      id: "routine:persisted-action-context",
-      role: actionTask.role,
-      backend: "claude-sdk",
-      arcRunId: actionTask.arcRunId,
-      status: "finished",
-      task: actionTask,
-      updatedAt: "2026-07-30T00:00:00.000Z",
-      backendDetails: {
-        backend: "claude-sdk",
-        sessionKey: workerContextKey(actionTask, 0),
-        sessionId: "session-action-context",
-        cwd: context.workspacePath,
-        model: "claude-opus-4-7",
+    const getRunWorkspaceContext = arcHost.getRunWorkspaceContext.bind(arcHost);
+    let actionTask: InstructionTask | undefined;
+    // An action routine in the same run's role context, recorded before the
+    // trigger dispatch reads its context.
+    vi.spyOn(arcHost, "getRunWorkspaceContext").mockImplementation(
+      async (arcRunId) => {
+        const runContext = await getRunWorkspaceContext(arcRunId);
+        if (!actionTask) {
+          actionTask = persistedInstruction(arcRunId);
+          await routineStore.putRoutine({
+            id: "routine:persisted-action-context",
+            role: actionTask.role,
+            backend: "claude-sdk",
+            arcRunId,
+            status: "finished",
+            task: actionTask,
+            updatedAt: "2026-07-30T00:00:00.000Z",
+            backendDetails: {
+              backend: "claude-sdk",
+              sessionKey: workerContextKey(actionTask, 0),
+              sessionId: "session-action-context",
+              cwd: runContext.workspacePath,
+              model: "claude-opus-4-7",
+            },
+          });
+        }
+        return runContext;
       },
-    });
-    const triggerTask: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:general-backend-trigger",
-      role: actionTask.role,
-      stage: "trigger",
-      contextIsolation: "role",
-      arcRunId: actionTask.arcRunId,
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-      requests: [],
-      activeInstruction: actionTask,
-    };
+    );
     const query = vi.fn((params: Parameters<ClaudeSdkQueryFn>[0]) =>
-      claudeStreamingQuery(params),
+      claudeSemanticQuery(params),
     );
     const { workerHub } = makeWorkerHub({
       arcHost,
@@ -494,27 +482,18 @@ function Watch() {
       claudeSdk: { query, sessionCache: { maxPreparedStarts: 0 } },
     });
 
-    await expect(
-      workerHub.handleTask(triggerTask, context),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: { outcome: "completed" },
-    });
+    await submitActivation(workerHub, "start");
 
     expect(query.mock.calls[0]![0].options?.resume).toBeUndefined();
-    expect(workerContextKey(triggerTask, 0)).not.toBe(
-      workerContextKey(actionTask, 0),
+    const trigger = (await collectAsync(routineStore.listRoutines())).find(
+      (routine) => routine.task.kind === "semantic",
     );
-    const routines = await collectAsync(
-      routineStore.listRoutines(actionTask.arcRunId),
+    expect(workerContextKey(trigger!.task, 0)).not.toBe(
+      workerContextKey(actionTask!, 0),
     );
-    expect(
-      routines.find((routine) => routine.task.kind === "semantic")
-        ?.backendDetails,
-    ).toMatchObject({
+    expect(trigger?.backendDetails).toMatchObject({
       backend: "claude-sdk",
-      sessionKey: workerContextKey(triggerTask, 0),
+      sessionKey: workerContextKey(trigger!.task, 0),
       sessionId: "session-worker-hub-prepared",
     });
   });
@@ -637,18 +616,15 @@ function Main() {
   });
 
   it("dispatches fast trigger tasks to openai-sdk", async () => {
-    const arcHost = await makeArcHostWithSource(
-      "test",
-      `"arc"; function Main() {}`,
-    );
-    vi.spyOn(arcHost, "getRunWorkspaceContext").mockResolvedValue({
-      ...routineContext(),
-      reactivationCount: 0,
-    });
-    const run = vi.fn<OpenAiSdkTstRunFn>(async () => ({
+    const arcHost = await makeArcHostWithSource("test", TRIGGER_JUDGE_SOURCE);
+    const run = vi.fn<OpenAiSdkTstRunFn>(async ({ prompt }) => ({
       finalOutput: JSON.stringify({
         outcome: "completed",
-        semantic: { judgments: { "judge:1": true } },
+        semantic: {
+          judgments: Object.fromEntries(
+            semanticRequestIds(prompt).map((id) => [id, true]),
+          ),
+        },
       }),
       lastResponseId: "resp-semantic",
     }));
@@ -661,40 +637,18 @@ function Main() {
       },
     });
 
-    await expect(
-      workerHub.handleTask(openAiSemanticTask(), routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: {
-        outcome: "completed",
-        semantic: { judgments: { "judge:1": true } },
-      },
-    });
+    await submitActivation(workerHub, "start");
     expect(run).toHaveBeenCalledTimes(1);
   });
 
   it("persists a failed routine for unknown instruction roles", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
     const { workerHub } = makeWorkerHub({ arcHost, routineStore });
 
-    const result = await workerHub.handleTask(task, routineContext());
+    const { arcRunId } = await settleFirstRoutine(workerHub, routineStore);
 
-    expect(result).toEqual({
-      status: "finished",
-      routineId: expect.any(String),
-      report: {
-        error: "failed",
-        code: "role-not-delegated",
-        message: 'No configured worker is available for role "researcher".',
-      },
-    });
-    const routines = [];
-    for await (const routine of routineStore.listRoutines(ARC_RUN_ID)) {
-      routines.push(routine);
-    }
-    expect(routines).toEqual([
+    expect(await collectAsync(routineStore.listRoutines(arcRunId))).toEqual([
       expect.objectContaining({
         role: "researcher",
         status: "finished",
@@ -707,19 +661,16 @@ function Main() {
   });
 
   it("requires an in-process handler for an in-process role slot", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
-    const { workerHub } = makeWorkerHub({
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workerSlots: { roles: { researcher: "in-process" } },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine).toMatchObject({
       status: "finished",
-      routineId: expect.any(String),
-      report: {
-        error: "failed",
+      error: {
         code: "unknown-role",
         message:
           'No in-process handler registered for configured role "researcher".',
@@ -728,126 +679,92 @@ function Main() {
   });
 
   it("routes default-worker semantic work through the default worker slot", async () => {
-    const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
-    const task: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:default",
-      role: DEFAULT_WORKER_ROLE,
-      stage: "trigger",
-      contextIsolation: "role",
-      arcRunId: ARC_RUN_ID,
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-      requests: [],
-      activeInstruction,
-    };
-    const runner = vi.fn(async () => ({
-      outcome: "completed" as const,
-      semantic: { judgments: { "judge:1": true } },
-    }));
+    const arcHost = await makeArcHostWithSource("test", TRIGGER_JUDGE_SOURCE);
+    const runner = vi.fn(async (task: Task) => answerAll(task));
     const { workerHub } = makeWorkerHub({
       arcHost,
       runner,
       workerSlots: { default: "pi-agent" },
     });
 
-    await expect(workerHub.handleTask(task, routineContext())).resolves.toEqual(
-      {
-        status: "finished",
-        routineId: expect.any(String),
-        report: {
-          outcome: "completed",
-          semantic: { judgments: { "judge:1": true } },
-        },
-      },
+    await submitActivation(workerHub, "start");
+    expect(runner).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        kind: "semantic",
+        stage: "trigger",
+        role: DEFAULT_WORKER_ROLE,
+      }),
     );
-    expect(runner).toHaveBeenCalledWith(task);
   });
 
   it("logs PI-agent backend lifecycle events", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const logger = {
       level: "info" as const,
       format: "json" as const,
       info: vi.fn(),
       debug: vi.fn(),
     };
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       runner: async () => ({ outcome: "completed" }),
       workerSlots: { default: "pi-agent" },
       logger,
     });
 
-    await workerHub.handleTask(task, routineContext());
+    const { arcRunId, routine } = await settleFirstRoutine(
+      workerHub,
+      routineStore,
+    );
 
     expect(logger.info).toHaveBeenCalledWith(
       "backend.pi_agent.started",
       expect.objectContaining({
-        arcRunId: ARC_RUN_ID,
+        arcRunId,
         routineId: expect.stringMatching(/^routine:/),
-        role: task.role,
-        kind: task.kind,
+        role: routine.role,
+        kind: routine.task.kind,
       }),
     );
     expect(logger.info).toHaveBeenCalledWith(
       "backend.pi_agent.finished",
       expect.objectContaining({
-        arcRunId: ARC_RUN_ID,
+        arcRunId,
         routineId: expect.stringMatching(/^routine:/),
-        role: task.role,
+        role: routine.role,
         reportKind: "completed",
       }),
     );
   });
 
   it("fails default-worker work when no default worker slot is configured", async () => {
-    const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
-    const task: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:no-default",
-      role: DEFAULT_WORKER_ROLE,
-      stage: "trigger",
-      contextIsolation: "role",
-      arcRunId: ARC_RUN_ID,
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-      requests: [],
-      activeInstruction,
-    };
-    const { workerHub } = makeWorkerHub({ arcHost });
+    const arcHost = await makeArcHostWithSource("test", TRIGGER_JUDGE_SOURCE);
+    const { workerHub, routineStore } = makeWorkerHub({ arcHost });
 
-    await expect(workerHub.handleTask(task, routineContext())).resolves.toEqual(
-      {
-        status: "finished",
-        routineId: expect.any(String),
-        report: {
-          error: "failed",
-          code: "role-not-delegated",
-          message: `No configured worker is available for role "${DEFAULT_WORKER_ROLE}".`,
-        },
-      },
+    const events = await collectAsync(
+      workerHub.submitInbound({
+        content: "start",
+        metadata: { principal: ALICE_OWNER },
+      }),
     );
+    expect(events).toEqual([
+      expect.objectContaining({
+        kind: "failed",
+        reason: `No configured worker is available for role "${DEFAULT_WORKER_ROLE}".`,
+      }),
+    ]);
+    expect(await collectAsync(routineStore.listRoutines())).toEqual([
+      expect.objectContaining({
+        role: DEFAULT_WORKER_ROLE,
+        status: "finished",
+        error: expect.objectContaining({ code: "role-not-delegated" }),
+      }),
+    ]);
   });
 
   it("routes trigger semantic work through the fast-trigger slot", async () => {
-    const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
-    const task: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:fast",
-      role: DEFAULT_WORKER_ROLE,
-      stage: "trigger",
-      contextIsolation: "role",
-      arcRunId: ARC_RUN_ID,
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-      requests: [],
-      activeInstruction,
-    };
-    const piRunner = vi.fn(async () => ({
-      outcome: "completed" as const,
-      semantic: { judgments: { "judge:fast": true } },
-    }));
+    const arcHost = await makeArcHostWithSource("test", TRIGGER_JUDGE_SOURCE);
+    const piRunner = vi.fn(async (task: Task) => answerAll(task));
     const openAiRun = vi.fn<OpenAiSdkRunFn>(async (input) => {
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return {};
@@ -860,40 +777,31 @@ function Main() {
       openAiSdk: { apiKey: "sk-test", run: openAiRun },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: {
-        outcome: "completed",
-        semantic: { judgments: { "judge:fast": true } },
-      },
-    });
+    await submitActivation(workerHub, "start");
     expect(piRunner).toHaveBeenCalledTimes(1);
     expect(openAiRun).not.toHaveBeenCalled();
   });
 
   it("routes action semantic work through the default slot when fast trigger is configured", async () => {
-    const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
-    const task: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:action",
-      role: DEFAULT_WORKER_ROLE,
-      stage: "action",
-      contextIsolation: "role",
-      arcRunId: ARC_RUN_ID,
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-      requests: [],
-      activeInstruction,
-    };
+    const arcHost = await makeArcHostWithSource(
+      "observed",
+      `"arc";
+function Watch() {
+  this.trigger = () => true;
+  let ready = Bool({ observing: "ready?" });
+  $observe(ready);
+}`,
+    );
     const piRunner = vi.fn(async () => ({ outcome: "completed" as const }));
     const openAiRun = vi.fn<OpenAiSdkRunFn>(async (input) => {
-      await callOpenAiTool(input.agent, "report", { outcome: "completed" });
+      await callOpenAiTool(
+        input.agent,
+        "report",
+        exampleSemanticReport(input.prompt ?? ""),
+      );
       return {};
     });
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       runner: piRunner,
       workerSlots: { default: "openai-sdk" },
@@ -901,25 +809,21 @@ function Main() {
       openAiSdk: { apiKey: "sk-test", run: openAiRun },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext()),
-    ).resolves.toMatchObject({
-      status: "finished",
-      routineId: expect.any(String),
-      report: { outcome: "completed" },
-    });
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine).toMatchObject({ status: "finished" });
+    expect(routine.error).toBeUndefined();
     expect(openAiRun).toHaveBeenCalledTimes(1);
     expect(piRunner).not.toHaveBeenCalled();
   });
 
   it("keeps instruction work on its configured role slot", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const piRunner = vi.fn(async () => ({ outcome: "completed" as const }));
     const openAiRun = vi.fn<OpenAiSdkRunFn>(async (input) => {
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return {};
     });
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       runner: piRunner,
       workerSlots: { roles: { researcher: "openai-sdk" } },
@@ -927,74 +831,58 @@ function Main() {
       openAiSdk: { apiKey: "sk-test", run: openAiRun },
     });
 
-    await workerHub.handleTask(task, routineContext());
+    await settleFirstRoutine(workerHub, routineStore);
 
     expect(openAiRun).toHaveBeenCalledTimes(1);
     expect(piRunner).not.toHaveBeenCalled();
   });
 
   it("lets an explicit role slot override the default semantic backend", async () => {
-    const { arcHost, task: activeInstruction } = await firstTaskWithArcHost();
-    const task: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:override",
-      role: DEFAULT_WORKER_ROLE,
-      stage: "trigger",
-      contextIsolation: "role",
-      arcRunId: ARC_RUN_ID,
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-      requests: [],
-      activeInstruction,
-    };
-    const worker = vi.fn(async () => ({
-      outcome: "completed" as const,
-      semantic: { judgments: { "judge:2": false } },
-    }));
+    const arcHost = await makeArcHostWithSource("test", TRIGGER_JUDGE_SOURCE);
+    const worker = vi.fn(async (task: Task) => answerAll(task, false));
     const { workerHub } = makeWorkerHub({
       arcHost,
       workerSlots: { roles: { [DEFAULT_WORKER_ROLE]: "in-process" } },
       workers: { [DEFAULT_WORKER_ROLE]: worker },
     });
 
-    await expect(workerHub.handleTask(task, routineContext())).resolves.toEqual(
-      {
-        status: "finished",
-        routineId: expect.any(String),
-        report: {
-          outcome: "completed",
-          semantic: { judgments: { "judge:2": false } },
-        },
-      },
+    await collectAsync(
+      workerHub.submitInbound({
+        content: "start",
+        metadata: { principal: ALICE_OWNER },
+      }),
     );
-    expect(worker).toHaveBeenCalled();
+    expect(worker).toHaveBeenCalledOnce();
   });
 
   it("materializes task workspace paths before dispatch", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const root = await mkdtemp(
       join(tmpdir(), "arcade-worker-hub-materialize-"),
     );
     const workspacePath = join(root, "missing", "workspace");
+    // The run names a workspace that does not exist yet.
+    const getRunWorkspaceContext = arcHost.getRunWorkspaceContext.bind(arcHost);
+    vi.spyOn(arcHost, "getRunWorkspaceContext").mockImplementation(
+      async (arcRunId) => ({
+        ...(await getRunWorkspaceContext(arcRunId)),
+        workspacePath,
+      }),
+    );
     const worker = vi.fn(async (_task, context: RoutineContext) => {
+      expect(context.workspacePath).toBe(workspacePath);
       expect((await stat(context.workspacePath)).isDirectory()).toBe(true);
       return { outcome: "completed" as const };
     });
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workers: { researcher: worker },
     });
 
-    const result = await workerHub.handleTask(
-      task,
-      routineContext({ workspacePath }),
-    );
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
 
-    expect(result).toEqual({
-      status: "finished",
-      routineId: expect.any(String),
-      report: { outcome: "completed" },
-    });
+    expect(routine).toMatchObject({ status: "finished" });
+    expect(routine.error).toBeUndefined();
     expect((await stat(workspacePath)).isDirectory()).toBe(true);
   });
 
@@ -1020,37 +908,36 @@ function Main() {
       true,
     ],
   ] as const)("%s", async (_name, backend, override) => {
-    const { arcHost, task: actionTask } = await firstTaskWithArcHost();
+    const artifactRoot = await mkdtemp(join(tmpdir(), "arcade-trigger-root-"));
+    const arcHost = createTestArcHost({
+      store: new InMemoryArcHostStore(),
+      artifactRoot,
+    });
+    await arcHost.registerArc(
+      "watch",
+      parse(`"arc";
+function Watch() {
+  this.trigger = () => judge(\`should this start?\`);
+  this.hostParams = { workerRole: "researcher" };
+}`),
+    );
     const root = await mkdtemp(join(tmpdir(), "arcade-standard-trigger-"));
-    const provisionalPath = join(root, "provisional");
-    const task: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      stage: "trigger",
-      batchId: "temporary-workspace",
-      role: actionTask.role,
-      arcRunId: actionTask.arcRunId,
-      contextIsolation: "role",
-      dialog: actionTask.dialog,
-      requests: [],
-      activeInstruction: actionTask,
-    };
     let observedCwd: string | undefined;
     let suppliedWorkspace: string | undefined;
     const routineOptions = ({ context }: { context: RoutineContext }) => {
       suppliedWorkspace = context.workspacePath;
       return undefined;
     };
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
-      workerSlots: { roles: { [task.role]: backend } },
+      workerSlots: { roles: { researcher: backend } },
       claudeSdk: {
         sessionCache: { maxPreparedStarts: 0 },
         cwd: override ? root : undefined,
         routineOptions,
         query: (params) => {
           observedCwd = params.options?.cwd;
-          return claudeStreamingQuery(params);
+          return claudeSemanticQuery(params);
         },
       },
       openAiSdk: {
@@ -1058,9 +945,11 @@ function Main() {
         routineOptions,
         apiKey: "sk-test",
         run: async (input) => {
-          await callOpenAiTool(input.agent, "report", {
-            outcome: "completed",
-          });
+          await callOpenAiTool(
+            input.agent,
+            "report",
+            exampleSemanticReport(input.prompt ?? ""),
+          );
           return { lastResponseId: "temporary-workspace-response" };
         },
         onResponseObserved: async ({ cwd }) => {
@@ -1069,24 +958,19 @@ function Main() {
       },
     });
     try {
-      const result = await workerHub.handleTask(
-        task,
-        routineContext({ workspacePath: provisionalPath }),
-      );
-      expect(result).toMatchObject({
+      await submitActivation(workerHub, "start");
+      const [routine] = await collectAsync(routineStore.listRoutines());
+      expect(routine).toMatchObject({
         status: "finished",
-        routineId: expect.any(String),
-        report: { outcome: "completed" },
+        task: { kind: "semantic", stage: "trigger" },
       });
+      expect(routine?.error).toBeUndefined();
       expect(observedCwd).toBeDefined();
       expect(suppliedWorkspace).toBeDefined();
       expect(suppliedWorkspace).toBe(process.cwd());
       expect(observedCwd).toBe(override ? root : suppliedWorkspace);
       expect((await stat(suppliedWorkspace!)).isDirectory()).toBe(true);
       expect((await stat(observedCwd!)).isDirectory()).toBe(true);
-      await expect(stat(provisionalPath)).rejects.toMatchObject({
-        code: "ENOENT",
-      });
     } finally {
       await workerHub.stop();
     }
@@ -1269,37 +1153,62 @@ function Ready() {
   });
 
   it("serializes routines sharing one worker run and context", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
-    const briefId = task.briefIds[0];
-    const secondTask = {
-      ...task,
-      briefIds: [`${briefId}:second`] as const,
-    };
+    const time = makeControlledTime();
+    const arcHost = createTestArcHost({
+      store: new InMemoryArcHostStore(),
+      ...time,
+    });
+    // A caught timeout reissues the work into the context the superseded
+    // routine still holds.
+    await arcHost.registerArc(
+      "watch",
+      parse(`"arc";
+import Time from "host:time";
+function Watch() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "researcher" };
+  this.catchInterruption = () => true;
+  Time.$addTimeout(25);
+  $instruct(\`Watch for updates.\`);
+}`),
+    );
     const order: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let invocation = 0;
     const worker: RoleWorker = async (current) => {
       if (current.kind !== "instruction")
         throw new Error("expected instruction task");
-      order.push(`start:${current.briefIds.join("+")}`);
-      await Promise.resolve();
-      order.push(`end:${current.briefIds.join("+")}`);
+      const label = ++invocation === 1 ? "first" : "second";
+      order.push(`start:${label}`);
+      if (label === "first") await firstGate;
+      order.push(`end:${label}`);
       return { outcome: "completed" };
     };
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
-
       workers: { researcher: worker },
     });
 
-    await Promise.all([
-      workerHub.handleTask(task, routineContext()),
-      workerHub.handleTask(secondTask, routineContext()),
-    ]);
+    const arcRunId = await submitActivation(workerHub, "start");
+    await waitFor(() => order.length === 1);
+    time.advanceTo(1025);
+    time.fireDue();
+    await waitFor(
+      async () =>
+        (await collectAsync(routineStore.listRoutines(arcRunId))).length === 2,
+    );
+    expect(order).toEqual(["start:first"]);
+    releaseFirst();
+    await waitFor(() => order.length === 4);
 
     expect(order).toEqual([
-      `start:${briefId}`,
-      `end:${briefId}`,
-      `start:${secondTask.briefIds[0]}`,
-      `end:${secondTask.briefIds[0]}`,
+      "start:first",
+      "end:first",
+      "start:second",
+      "end:second",
     ]);
   });
 
@@ -1475,3 +1384,87 @@ function Main() {
     ]);
   });
 });
+
+/** A judged trigger on the default worker role, with no action work. */
+const TRIGGER_JUDGE_SOURCE = `"arc";
+function Watch() {
+  this.trigger = () => judge(\`should this start?\`);
+}`;
+
+/** Answer every semantic request of a task with one value. */
+function answerAll(task: Task, value = true): RoutineReport {
+  if (task.kind !== "semantic") return { outcome: "completed" };
+  return {
+    outcome: "completed",
+    semantic: {
+      judgments: Object.fromEntries(
+        task.requests
+          .filter((request) => request.kind === "judgment")
+          .map((request) => [request.briefId, value]),
+      ),
+      observations: Object.fromEntries(
+        task.requests
+          .filter((request) => request.kind === "observation")
+          .map((request) => [request.briefId, { status: "resolved", value }]),
+      ),
+    },
+  };
+}
+
+/** The Watch instruction an earlier routine of the run carried out. */
+function persistedInstruction(arcRunId: string): InstructionTask {
+  return {
+    kind: "instruction",
+    allowedDispositions: [],
+    briefIds: ["instruction:persisted-context"],
+    role: "researcher",
+    texts: ["Watch for updates."],
+    tools: [],
+    cells: {},
+    arcRunId,
+    dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
+    sourceRef: "node:watch:Watch",
+    contextIsolation: "role",
+    phase: "apply",
+  };
+}
+
+/**
+ * A streaming Claude query that answers each prompt with its semantic report
+ * example, or completes instruction work.
+ */
+function claudeSemanticQuery(
+  params: Parameters<ClaudeSdkQueryFn>[0],
+): ReturnType<ClaudeSdkQueryFn> {
+  const generator = (async function* () {
+    const input = params.prompt as AsyncIterable<{
+      message?: { content?: unknown };
+    }>;
+    for await (const message of input) {
+      const prompt = String(message.message?.content ?? "");
+      await callClaudeSdkTool(
+        params,
+        "report",
+        prompt.includes('{"outcome":"completed","semantic":')
+          ? (exampleSemanticReport(prompt) as Record<string, unknown>)
+          : { outcome: "completed" },
+      );
+      yield {
+        type: "result",
+        subtype: "success",
+        duration_ms: 1,
+        duration_api_ms: 1,
+        is_error: false,
+        num_turns: 1,
+        result: "ok",
+        session_id: "session-worker-hub-prepared",
+      } as unknown;
+    }
+  })() as AsyncGenerator<unknown, void> & {
+    setModel: (model?: string) => Promise<void>;
+    close: () => void;
+  };
+  generator.setModel = async () => undefined;
+  generator.close = () => undefined;
+  return generator as ReturnType<ClaudeSdkQueryFn>;
+}

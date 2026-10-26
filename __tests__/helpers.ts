@@ -64,6 +64,7 @@ import {
   type WorkEventStore,
 } from "../src/testing.js";
 import type { Backend } from "../src/types/backend.js";
+import type { ExecutionControlView } from "../src/types/execution-control.js";
 
 export const ARC_RUN_ID: ArcRunId = "run-alice-thread-1";
 
@@ -504,6 +505,29 @@ export class StubWorkerHub {
   );
   readonly listWorkEvents = vi.fn(async (arcRunId: ArcRunId) =>
     this.workEvents.filter((event) => event.arcRunId === arcRunId),
+  );
+  /** Live asks `listAsks` reports, matched by run and exact-or-`"*"` situation. */
+  asks: OutboundMessage[] = [];
+  readonly listAsks = vi.fn(
+    (arcRunId: ArcRunId, situation: OutboundSituation): OutboundMessage[] =>
+      this.asks.filter(
+        (ask) =>
+          ask.arcRunId === arcRunId &&
+          (situation.role === "*" || situation.role === ask.situation.role) &&
+          (situation.audience === "*" ||
+            situation.audience === ask.situation.audience) &&
+          (situation.cause === "*" || situation.cause === ask.situation.cause),
+      ),
+  );
+  /** Control views by run; an unlisted run reads `running`. */
+  controlViews = new Map<ArcRunId, ExecutionControlView>();
+  readonly getExecutionControlView = vi.fn(
+    async (arcRunId: ArcRunId): Promise<ExecutionControlView> =>
+      this.controlViews.get(arcRunId) ?? {
+        arcRunId,
+        status: "running",
+        updatedAt: "2026-05-07T00:00:00.000Z",
+      },
   );
   readonly handshake = vi.fn<() => Promise<HandshakeReceipt>>(async () => ({
     status: "missing",

@@ -3666,6 +3666,8 @@ export class ArcHostService {
     brief: TerminalBrief,
     transitions: readonly RunTransition[] = [],
   ): RunFrontier {
+    const interruption =
+      brief.outcome === "interrupted" ? rootInterruption(brief) : undefined;
     return {
       status:
         brief.outcome === "covered"
@@ -3689,6 +3691,7 @@ export class ArcHostService {
         instructions: [],
       },
       tasks: [],
+      ...(interruption ? { interruption } : {}),
       transitions: [...transitions],
     };
   }
@@ -4821,6 +4824,18 @@ function statusFromBrief(
   if (hasReturnableFrontier(brief)) return "ready";
   if (!brief.canProgress) return "idle";
   return "blocked";
+}
+
+/** Interruption an interrupted handback's action root ended on. */
+function rootInterruption(
+  brief: TerminalBrief,
+): { id: string; reason: string } | undefined {
+  const control = brief.traversals.find(
+    (item) => item.ref === brief.root,
+  )?.control;
+  return control?.reason === "interrupted"
+    ? { id: control.interruption.id, reason: control.interruption.reason }
+    : undefined;
 }
 
 function lifecycleFromTraversals(

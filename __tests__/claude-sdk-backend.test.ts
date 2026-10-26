@@ -32,15 +32,20 @@ import {
 } from "./backend-helpers.js";
 import {
   ARC_RUN_ID,
+  collectAsync,
   createCapturingLogger,
   deferred,
   firstTask,
-  firstTaskWithArcHost,
   makeArcHostWithSource,
   makeWorkerHub,
   waitFor,
+  WATCH_SOURCE,
 } from "./helpers.js";
-import { drainLifecycle, submitActivation } from "./worker-hub-helpers.js";
+import {
+  drainLifecycle,
+  settleFirstRoutine,
+  submitActivation,
+} from "./worker-hub-helpers.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1323,31 +1328,95 @@ describe("ClaudeSdkWorker", () => {
   });
 
   it("uses a message-only prompt when resuming a session-backed routine", async () => {
-    const workspace = join(tmpdir(), "arcade-sdk-workspace-resume-message");
-    await mkdir(workspace, { recursive: true });
     const task = await firstTask();
-    const { query, states } = streamingQueryReturning([
-      { outcome: "completed" },
-    ]);
-    const backend = new ClaudeSdkWorker({
-      sessionCache: { enabled: false },
-      query: query as unknown as ClaudeSdkQueryFn,
+    const prompts: string[] = [];
+    const close = vi.fn();
+    const query = vi.fn((params: Parameters<ClaudeSdkQueryFn>[0]) => {
+      async function* messages() {
+        const input = params.prompt as AsyncIterable<{
+          message?: { content?: unknown };
+        }>;
+        for await (const message of input) {
+          prompts.push(String(message.message?.content ?? ""));
+          yield {
+            type: "system",
+            subtype: "init",
+            session_id: "session-live",
+            cwd: params.options?.cwd ?? "",
+          } as unknown;
+          if (prompts.length === 1) {
+            // A tool result is a pause boundary; the routine pauses here.
+            yield {
+              type: "user",
+              parent_tool_use_id: null,
+              message: {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "tool:pause",
+                    content: "done",
+                  },
+                ],
+              },
+            } as unknown;
+          } else await callSdkReport(params, { outcome: "completed" });
+          yield {
+            type: "result",
+            subtype: "success",
+            duration_ms: 1,
+            duration_api_ms: 1,
+            is_error: false,
+            num_turns: 1,
+            result: "ok",
+            session_id: "session-live",
+          } as unknown;
+        }
+      }
+      const generator = messages() as AsyncGenerator<unknown, void> & {
+        setModel: ReturnType<typeof vi.fn>;
+        interrupt: ReturnType<typeof vi.fn>;
+        close: typeof close;
+      };
+      generator.setModel = vi.fn(async () => undefined);
+      generator.interrupt = vi.fn(async () => undefined);
+      generator.close = close;
+      return generator;
     });
-    backend.seedSession(workerContextKey(task, 0), "session-prev", workspace);
+    const backend = createClaudeSdkBackendForTesting({
+      query: query as unknown as ClaudeSdkQueryFn,
+      sessionCache: { enabled: true, maxPreparedStarts: 0 },
+      resolveContinuityIdentity: async () => identity("test"),
+    });
+    const worker = await backend.createWorker(continuityHost(), {
+      backend: "claude-sdk",
+      kind: "role",
+      role: task.role,
+    });
+    const input: RoutineInput = {
+      routine: routine(task),
+      context: context(),
+      effects: noopRoutineEffects({
+        checkSignal: async () => ({ kind: "pause" }),
+      }),
+      diagnostics: noopDiagnostics,
+    };
 
-    await backend.run(
-      {
-        routine: routine(task, { contextKey: workerContextKey(task, 0) }),
-        context: context({ workspacePath: workspace }),
+    await expect(worker.run(input)).resolves.toMatchObject({
+      suspension: "paused",
+    });
+    // `continue` delivery carries no text; the backend supplies its own turn.
+    await expect(
+      worker.run({
+        ...input,
+        context: context({ routineResume: { delivery: "continue" } }),
         effects: noopRoutineEffects(),
-        diagnostics: noopDiagnostics,
-      },
-      { message: "Continue", delivery: "session-message" },
-    );
+      }),
+    ).resolves.toMatchObject({ outcome: "completed" });
 
-    const call = query.mock.calls[0]![0];
-    expect(states[0]!.prompts[0]).toBe("Continue");
-    expect(call.options?.resume).toBe("session-prev");
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(prompts[1]).toBe("Continue");
+    await worker.stop?.();
   });
 
   it("uses canUseTool with workspace fast-path permission grants", async () => {
@@ -1420,9 +1489,7 @@ describe("ClaudeSdkWorker", () => {
   });
 
   it("does not fast-path relative paths that resolve outside the workspace", async () => {
-    const workspace = join(tmpdir(), "arcade-sdk-workspace-outside");
-    await mkdir(workspace, { recursive: true });
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const emitted: OutboundMessage[] = [];
     const query = vi.fn((params: Parameters<ClaudeSdkQueryFn>[0]) =>
       sdkMessages(
@@ -1442,7 +1509,7 @@ describe("ClaudeSdkWorker", () => {
         },
       ),
     );
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workerSlots: { roles: { researcher: "claude-sdk" } },
       claudeSdk: {
@@ -1463,25 +1530,24 @@ describe("ClaudeSdkWorker", () => {
           await expect(
             drainLifecycle(
               workerHub.submitInbound({
-                arcRunId: ARC_RUN_ID,
+                arcRunId: message.arcRunId,
                 content: "deny",
                 metadata: { askId, decision: "deny" },
               }),
             ),
-          ).resolves.toEqual([{ kind: "continued", arcRunId: ARC_RUN_ID }]);
+          ).resolves.toEqual([
+            { kind: "continued", arcRunId: message.arcRunId },
+          ]);
         }
       },
     );
 
-    await workerHub.handleTask(task, {
-      workspacePath: workspace,
-      workspaceBundle: {},
-    });
+    const { arcRunId } = await settleFirstRoutine(workerHub, routineStore);
 
     expect(
       emitted.filter((m) => m.situation.cause === "permission-ask"),
     ).toHaveLength(1);
-    const workEvents = await workerHub.listWorkEvents(ARC_RUN_ID);
+    const workEvents = await workerHub.listWorkEvents(arcRunId);
     expect(
       workEvents.filter(
         (event) =>
@@ -1559,11 +1625,10 @@ describe("ClaudeSdkWorker", () => {
   });
 
   it("routes Bash through permission ask before running from the SDK workspace", async () => {
-    const workspace = join(tmpdir(), "arcade-sdk-workspace-bash");
-    await mkdir(workspace, { recursive: true });
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const emitted: OutboundMessage[] = [];
     let observedStdout = "";
+    let observedCwd: string | undefined;
     const command =
       "printf arcade-bash-ok > bash-output.txt && cat bash-output.txt";
     const query = vi.fn((params: Parameters<ClaudeSdkQueryFn>[0]) =>
@@ -1583,7 +1648,7 @@ describe("ClaudeSdkWorker", () => {
           });
 
           const cwd = params.options!.cwd;
-          expect(cwd).toBe(workspace);
+          observedCwd = cwd;
           const { stdout } = await execFileAsync("bash", ["-lc", command], {
             cwd,
             encoding: "utf8",
@@ -1592,7 +1657,7 @@ describe("ClaudeSdkWorker", () => {
         },
       ),
     );
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workerSlots: { roles: { researcher: "claude-sdk" } },
       claudeSdk: {
@@ -1614,21 +1679,23 @@ describe("ClaudeSdkWorker", () => {
           await expect(
             drainLifecycle(
               workerHub.submitInbound({
-                arcRunId: ARC_RUN_ID,
+                arcRunId: message.arcRunId,
                 content: "allow",
                 metadata: { askId, decision: "allow" },
               }),
             ),
-          ).resolves.toEqual([{ kind: "continued", arcRunId: ARC_RUN_ID }]);
+          ).resolves.toEqual([
+            { kind: "continued", arcRunId: message.arcRunId },
+          ]);
         }
       },
     );
 
-    await workerHub.handleTask(task, {
-      workspacePath: workspace,
-      workspaceBundle: {},
-    });
+    const { arcRunId } = await settleFirstRoutine(workerHub, routineStore);
 
+    expect(observedCwd).toBe(
+      (await arcHost.getRunWorkspaceContext(arcRunId)).workspacePath,
+    );
     expect(observedStdout).toBe("arcade-bash-ok");
     expect(
       emitted.filter((m) => m.situation.cause === "permission-ask"),
@@ -2611,11 +2678,11 @@ describe("ClaudeSdkWorker", () => {
   });
 
   it("routes instruction tasks through the default worker slot", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const query = vi.fn((params: Parameters<ClaudeSdkQueryFn>[0]) =>
       sdkMessages(params, "session-default-policy", { outcome: "completed" }),
     );
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workerSlots: { default: "claude-sdk" },
       claudeSdk: {
@@ -2624,31 +2691,28 @@ describe("ClaudeSdkWorker", () => {
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, {
-        workspacePath: process.cwd(),
-        workspaceBundle: {},
-      }),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: { outcome: "completed" },
-    });
+    const { routine } = await settleFirstRoutine(workerHub, routineStore);
+    expect(routine.status).toBe("finished");
     expect(query).toHaveBeenCalledTimes(1);
   });
 
   it("routes controlled permission asks through worker hub with fresh unidentified sessions", async () => {
-    const workspace = join(tmpdir(), "arcade-sdk-workspace-ask");
-    await mkdir(workspace, { recursive: true });
-    const { arcHost, task: roleTask } = await firstTaskWithArcHost();
-    const task: InstructionTask = {
-      ...roleTask,
-      contextIsolation: "node",
-    };
-    const pinnedNode = await arcHost.nodeInfoForRunRef(
-      task.arcRunId,
-      task.sourceRef,
+    // Two node-isolated routines on one node, then one on a sibling node.
+    const arcHost = await makeArcHostWithSource(
+      "watch",
+      `"arc";
+function Watch() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "researcher", contextIsolation: "node" };
+  $instruct(\`Watch for updates.\`);
+  $instruct(\`Watch again.\`);
+  $enter(Sibling);
+  function Sibling() {
+    this.hostParams = { workerRole: "researcher", contextIsolation: "node" };
+    $instruct(\`Sibling work.\`);
+  }
+}`,
     );
-    vi.spyOn(arcHost, "nodeInfoForRunRef").mockResolvedValue(pinnedNode);
     const emitted: OutboundMessage[] = [];
     const query = vi.fn((params: Parameters<ClaudeSdkQueryFn>[0]) =>
       sdkMessages(
@@ -2667,7 +2731,7 @@ describe("ClaudeSdkWorker", () => {
         },
       ),
     );
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workerSlots: { roles: { researcher: "claude-sdk" } },
       claudeSdk: {
@@ -2689,37 +2753,24 @@ describe("ClaudeSdkWorker", () => {
           await expect(
             drainLifecycle(
               workerHub.submitInbound({
-                arcRunId: ARC_RUN_ID,
+                arcRunId: message.arcRunId,
                 content: "allow_this_run",
                 metadata: { askId, decision: "allow_this_run" },
               }),
             ),
-          ).resolves.toEqual([{ kind: "continued", arcRunId: ARC_RUN_ID }]);
+          ).resolves.toEqual([
+            { kind: "continued", arcRunId: message.arcRunId },
+          ]);
         }
       },
     );
 
-    await workerHub.handleTask(task, {
-      workspacePath: workspace,
-      workspaceBundle: {},
-    });
-    await workerHub.handleTask(
-      { ...task, briefIds: [`${task.briefIds[0]}:2`] as const },
-      {
-        workspacePath: workspace,
-        workspaceBundle: {},
-      },
-    );
-    await workerHub.handleTask(
-      {
-        ...task,
-        briefIds: [`${task.briefIds[0]}:sibling`] as const,
-        sourceRef: "node:watch:Sibling",
-      },
-      {
-        workspacePath: workspace,
-        workspaceBundle: {},
-      },
+    const arcRunId = await submitActivation(workerHub, "start");
+    await waitFor(
+      async () =>
+        (await collectAsync(routineStore.listRoutines(arcRunId))).filter(
+          (routine) => routine.status === "finished",
+        ).length === 3,
     );
 
     expect(
@@ -2728,9 +2779,7 @@ describe("ClaudeSdkWorker", () => {
   });
 
   it("keeps Bash per-command by not persisting an SDK-level grant", async () => {
-    const workspace = join(tmpdir(), "arcade-sdk-workspace-bash-scope");
-    await mkdir(workspace, { recursive: true });
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     type CanUseTool = NonNullable<
       NonNullable<Parameters<ClaudeSdkQueryFn>[0]["options"]>["canUseTool"]
     >;
@@ -2774,7 +2823,7 @@ describe("ClaudeSdkWorker", () => {
         },
       ),
     );
-    const { workerHub } = makeWorkerHub({
+    const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workerSlots: { roles: { researcher: "claude-sdk" } },
       claudeSdk: {
@@ -2794,20 +2843,19 @@ describe("ClaudeSdkWorker", () => {
           await expect(
             drainLifecycle(
               workerHub.submitInbound({
-                arcRunId: ARC_RUN_ID,
+                arcRunId: message.arcRunId,
                 content: "allow_this_run",
                 metadata: { askId, decision: "allow_this_run" },
               }),
             ),
-          ).resolves.toEqual([{ kind: "continued", arcRunId: ARC_RUN_ID }]);
+          ).resolves.toEqual([
+            { kind: "continued", arcRunId: message.arcRunId },
+          ]);
         }
       },
     );
 
-    await workerHub.handleTask(task, {
-      workspacePath: workspace,
-      workspaceBundle: {},
-    });
+    await settleFirstRoutine(workerHub, routineStore);
 
     // Bash: Arcade granted allow_this_run, but the SDK is told only allow-once
     // so it re-asks each command and Arcade's per-command grant stays in charge.

@@ -17,10 +17,13 @@ import {
   type ClaudeSdkQueryFn,
   type InboundLifecycleEvent,
   type RoutineContext,
+  type RoutineReport,
+  type RoutineState,
   type Task,
   type WorkerHubService,
+  type WorkerHubStore,
 } from "../src/testing.js";
-import { ALICE_OWNER, ARC_RUN_ID } from "./helpers.js";
+import { ALICE_OWNER, ARC_RUN_ID, collectAsync, waitFor } from "./helpers.js";
 
 export async function callClaudeSdkTool(
   params: Parameters<ClaudeSdkQueryFn>[0],
@@ -112,6 +115,19 @@ export async function* claudeSemanticMessages(value: unknown) {
     uuid: "00000000-0000-4000-8000-000000000103",
     session_id: "00000000-0000-4000-8000-000000000102",
   } as unknown;
+}
+
+/**
+ * The completed report a rendered semantic prompt carries as its example.
+ * It answers every request in the prompt, so a provider double can return it
+ * without knowing the runtime's brief ids.
+ */
+export function exampleSemanticReport(prompt: string): RoutineReport {
+  const line = prompt
+    .split("\n")
+    .find((entry) => entry.startsWith('{"outcome":"completed","semantic":'));
+  if (!line) throw new Error("prompt carries no semantic report example");
+  return JSON.parse(line) as RoutineReport;
 }
 
 export function semanticRequestIds(prompt: string): string[] {
@@ -211,6 +227,27 @@ export async function submitActivation(
   }
   expect(event.arcRunId).toMatch(/^arc-run:/);
   return event.arcRunId;
+}
+
+/**
+ * Activate the registered arc through hub entry and wait until the first
+ * routine the hub dispatches leaves `running`. Returns the run and that
+ * routine's record.
+ */
+export async function settleFirstRoutine(
+  workerHub: WorkerHubService,
+  routineStore: WorkerHubStore,
+  content = "start",
+  principal = ALICE_OWNER,
+): Promise<{ arcRunId: ArcRunId; routine: RoutineState }> {
+  const arcRunId = await submitActivation(workerHub, content, principal);
+  let routine: RoutineState | undefined;
+  await waitFor(async () => {
+    [routine] = await collectAsync(routineStore.listRoutines(arcRunId));
+    return routine !== undefined && routine.status !== "running";
+  });
+  if (!routine) throw new Error("expected a settled routine");
+  return { arcRunId, routine };
 }
 
 /** Attach a second connector surface through its own active run-choice flow. */

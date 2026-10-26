@@ -22,7 +22,8 @@ import {
   WebAppConnector,
 } from "../src/testing.js";
 import type { Connector } from "../src/types/connector.js";
-import { WATCH_SOURCE } from "./helpers.js";
+import { waitFor, WATCH_SOURCE } from "./helpers.js";
+import { submitActivation } from "./worker-hub-helpers.js";
 
 describe("Arcade and internal App lifecycle", () => {
   it("starts Arcade without discovering configured files and registers workspaces only on explicit calls", async () => {
@@ -223,29 +224,13 @@ describe("Arcade and internal App lifecycle", () => {
       model: "x",
     });
     await arcade.arcHost.registerArc("watch", parse(WATCH_SOURCE));
-    const [step] = await arcade.arcHost.begin({
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-      inbound: { content: "start" },
-      principal: "alice",
-      projectDialog: async () => ({
-        cursor: { user: 0, self: 0 },
-        lastTurns: [],
-      }),
-    });
-    if (!step || (step.kind !== "action" && step.kind !== "trigger")) {
-      throw new Error("expected Arc work");
-    }
-    const task = step.frontier.tasks[0];
-    if (!task) throw new Error("expected a task");
-    await expect(
-      arcade.workerHub.handleTask(task, {
-        workspacePath: root,
-        workspaceBundle: {},
-      }),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: { outcome: "completed" },
-    });
+    const arcRunId = await submitActivation(arcade.workerHub, "start");
+    await waitFor(async () =>
+      (await arcade.workerHub.listWorkEvents(arcRunId)).some(
+        (event) =>
+          event.kind === "routine:finished" && event.outcome === "completed",
+      ),
+    );
     expect(run).toHaveBeenCalledOnce();
     const done = arcade.done;
     await arcade.stop();

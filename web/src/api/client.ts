@@ -115,12 +115,7 @@ export function resumeRun(
 ): Promise<ApiResult<ExecutionControlActionResponse>> {
   return requestJson<ExecutionControlActionResponse>(
     `/api/runs/${encodeURIComponent(arcRunId)}/resume`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: "Continue" }),
-      signal,
-    },
+    { method: "POST", signal },
   );
 }
 

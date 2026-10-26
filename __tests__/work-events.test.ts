@@ -16,11 +16,11 @@ import {
   InMemoryWorkEventStore,
   JsonFileWorkEventStore,
   taskId,
+  type ArcRunId,
   type CreateWorkEventInput,
-  type InstructionTask,
   type OpenAiSdkRunFn,
-  type RoutineContext,
   type WorkEvent,
+  type WorkerHubService,
 } from "../src/testing.js";
 import {
   ALICE_OWNER,
@@ -31,7 +31,7 @@ import {
   makeWorkerHub,
   waitFor,
 } from "./helpers.js";
-import { drainLifecycle } from "./worker-hub-helpers.js";
+import { drainLifecycle, submitActivation } from "./worker-hub-helpers.js";
 
 describe("WorkEvent stores", () => {
   it("keeps in-memory events in append order per Arc run", async () => {
@@ -128,7 +128,7 @@ describe("WorkEvent stores", () => {
 
 describe("WorkerHubService WorkEvents", () => {
   it("emits deterministic routine lifecycle labels", async () => {
-    const { arcHost, task } = await instructionTaskFromRun();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const { workerHub } = makeWorkerHub({
       arcHost,
       workers: {
@@ -136,11 +136,9 @@ describe("WorkerHubService WorkEvents", () => {
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext(task)),
-    ).resolves.toMatchObject({ status: "finished" });
+    const arcRunId = await activateToEnd(workerHub);
 
-    await expect(workerHub.listWorkEvents(task.arcRunId)).resolves.toEqual([
+    await expect(workerHub.listWorkEvents(arcRunId)).resolves.toEqual([
       expect.objectContaining({ kind: "run:started", route: "fresh" }),
       expect.objectContaining({
         kind: "routine:started",
@@ -151,11 +149,12 @@ describe("WorkerHubService WorkEvents", () => {
         kind: "routine:finished",
         outcome: "completed",
       }),
+      expect.objectContaining({ kind: "run:completed" }),
     ]);
   });
 
   it("emits routine usage events from observed backend usage", async () => {
-    const { arcHost, task } = await instructionTaskFromRun();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return {
@@ -178,11 +177,9 @@ describe("WorkerHubService WorkEvents", () => {
       openAiSdk: { apiKey: "sk-test", run },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext(task)),
-    ).resolves.toMatchObject({ status: "finished" });
+    const arcRunId = await activateToEnd(workerHub);
 
-    await expect(workerHub.listWorkEvents(task.arcRunId)).resolves.toEqual([
+    await expect(workerHub.listWorkEvents(arcRunId)).resolves.toEqual([
       expect.objectContaining({ kind: "run:started", route: "fresh" }),
       expect.objectContaining({ kind: "routine:started" }),
       expect.objectContaining({
@@ -200,11 +197,12 @@ describe("WorkerHubService WorkEvents", () => {
         kind: "routine:finished",
         outcome: "completed",
       }),
+      expect.objectContaining({ kind: "run:completed" }),
     ]);
   });
 
   it("emits routine usage events before failed routine events", async () => {
-    const { arcHost, task } = await instructionTaskFromRun();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const run = vi.fn<OpenAiSdkRunFn>(async (_input) => {
       if (run.mock.calls.length === 1) {
         return {
@@ -227,18 +225,9 @@ describe("WorkerHubService WorkEvents", () => {
       openAiSdk: { apiKey: "sk-test", run },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext(task)),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: {
-        error: "failed",
-        code: "backend-error",
-        message: "recovery failed",
-      },
-    });
+    const arcRunId = await activateToEnd(workerHub);
 
-    await expect(workerHub.listWorkEvents(task.arcRunId)).resolves.toEqual([
+    await expect(workerHub.listWorkEvents(arcRunId)).resolves.toEqual([
       expect.objectContaining({ kind: "run:started", route: "fresh" }),
       expect.objectContaining({ kind: "routine:started" }),
       expect.objectContaining({
@@ -254,24 +243,43 @@ describe("WorkerHubService WorkEvents", () => {
         kind: "routine:failed",
         error: { code: "backend-error", message: "recovery failed" },
       }),
+      expect.objectContaining({ kind: "run:poisoned" }),
     ]);
   });
 
   it("omits the role from default-worker routine labels", async () => {
-    const { arcHost, task } = await instructionTaskFromRun();
-    const defaultTask = { ...task, role: DEFAULT_WORKER_ROLE };
+    // A node without a worker role runs its semantic work on the default worker.
+    const arcHost = await makeArcHostWithSource(
+      "watch",
+      `"arc";
+function Watch() {
+  this.trigger = () => true;
+  let ready = Bool({ observing: "ready?" });
+  $observe(ready);
+}`,
+    );
     const { workerHub } = makeWorkerHub({
       arcHost,
       workers: {
-        [DEFAULT_WORKER_ROLE]: async () => ({ outcome: "completed" }),
+        [DEFAULT_WORKER_ROLE]: async (task) => ({
+          outcome: "completed",
+          semantic: {
+            observations: Object.fromEntries(
+              task.kind === "semantic"
+                ? task.requests.map((request) => [
+                    request.briefId,
+                    { status: "resolved", value: true },
+                  ])
+                : [],
+            ),
+          },
+        }),
       },
     });
 
-    await expect(
-      workerHub.handleTask(defaultTask, routineContext(defaultTask)),
-    ).resolves.toMatchObject({ status: "finished" });
+    const arcRunId = await activateToEnd(workerHub);
 
-    await expect(workerHub.listWorkEvents(task.arcRunId)).resolves.toEqual([
+    await expect(workerHub.listWorkEvents(arcRunId)).resolves.toEqual([
       expect.objectContaining({ kind: "run:started", route: "fresh" }),
       expect.objectContaining({
         kind: "routine:started",
@@ -282,11 +290,12 @@ describe("WorkerHubService WorkEvents", () => {
         kind: "routine:finished",
         outcome: "completed",
       }),
+      expect.objectContaining({ kind: "run:completed" }),
     ]);
   });
 
   it("notifies work event observers after durable append", async () => {
-    const { arcHost, task } = await instructionTaskFromRun();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const { workerHub, workEventStore } = makeWorkerHub({
       arcHost,
       workers: {
@@ -303,20 +312,15 @@ describe("WorkerHubService WorkEvents", () => {
       }
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext(task)),
-    ).resolves.toMatchObject({ status: "finished" });
-    const events = await workerHub.listWorkEvents(task.arcRunId);
+    const arcRunId = await activateToEnd(workerHub);
+    const events = await workerHub.listWorkEvents(arcRunId);
+    await waitFor(() => observed.length === events.length);
 
-    expect(observed).toEqual(
-      events
-        .filter((event) => event.kind !== "run:started")
-        .map((event) => event.id),
-    );
+    expect(observed).toEqual(events.map((event) => event.id));
   });
 
   it("stops notifying a work event observer after it unregisters", async () => {
-    const { arcHost, task } = await instructionTaskFromRun();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const { workerHub } = makeWorkerHub({
       arcHost,
       workers: {
@@ -333,24 +337,21 @@ describe("WorkerHubService WorkEvents", () => {
     });
     unregister();
 
-    await expect(
-      workerHub.handleTask(task, routineContext(task)),
-    ).resolves.toMatchObject({ status: "finished" });
-    const events = await workerHub.listWorkEvents(task.arcRunId);
+    const arcRunId = await activateToEnd(workerHub);
+    const events = await workerHub.listWorkEvents(arcRunId);
+    await waitFor(() => kept.length === events.length);
 
     // The still-registered observer sees every appended event; the unregistered
     // one is never called, so the returned function really detaches it.
     expect(events.length).toBeGreaterThan(0);
-    expect(kept).toEqual(
-      events
-        .filter((event) => event.kind !== "run:started")
-        .map((event) => event.id),
-    );
+    expect(kept).toEqual(events.map((event) => event.id));
     expect(dropped).toEqual([]);
   });
 
   it("stamps parsed node descriptions on routine and backend work events", async () => {
-    const { arcHost, task } = await instructionTaskFromRun(`
+    const arcHost = await makeArcHostWithSource(
+      "watch",
+      `
       "arc";
 
       function Watch() {
@@ -363,7 +364,8 @@ describe("WorkerHubService WorkEvents", () => {
         };
         $instruct(\`Watch for updates.\`);
       }
-    `);
+    `,
+    );
     const { workerHub } = makeWorkerHub({
       arcHost,
       workers: {
@@ -378,11 +380,9 @@ describe("WorkerHubService WorkEvents", () => {
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, routineContext(task)),
-    ).resolves.toMatchObject({ status: "finished" });
+    const arcRunId = await activateToEnd(workerHub);
 
-    await expect(workerHub.listWorkEvents(task.arcRunId)).resolves.toEqual(
+    await expect(workerHub.listWorkEvents(arcRunId)).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           kind: "routine:started",
@@ -401,7 +401,7 @@ describe("WorkerHubService WorkEvents", () => {
   });
 
   it("emits blocked after a question is surfaced and before the tool finishes", async () => {
-    const { arcHost, task } = await instructionTaskFromRun();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     let surfaceQuestion!: () => void;
     const questionSurfaced = new Promise<void>((resolve) => {
       surfaceQuestion = resolve;
@@ -442,14 +442,14 @@ describe("WorkerHubService WorkEvents", () => {
       },
     );
 
-    const running = workerHub.handleTask(task, routineContext(task));
+    const arcRunId = await submitActivation(workerHub, "start");
     await questionSurfaced;
     await waitFor(async () => {
-      const events = await workerHub.listWorkEvents(task.arcRunId);
+      const events = await workerHub.listWorkEvents(arcRunId);
       return events.some((event) => event.kind === "blocked:question");
     });
 
-    const waitingEvents = await workerHub.listWorkEvents(task.arcRunId);
+    const waitingEvents = await workerHub.listWorkEvents(arcRunId);
     expect(formatEventSequence(waitingEvents)).toEqual([
       "run:started",
       "routine:started",
@@ -459,14 +459,18 @@ describe("WorkerHubService WorkEvents", () => {
 
     await drainLifecycle(
       workerHub.submitInbound({
-        arcRunId: task.arcRunId,
+        arcRunId,
         content: "approved",
         metadata: { askId: internalAskId },
       }),
     );
-    await expect(running).resolves.toMatchObject({ status: "finished" });
+    await waitFor(async () =>
+      (await workerHub.listWorkEvents(arcRunId)).some(
+        (event) => event.kind === "run:completed",
+      ),
+    );
 
-    const finalEvents = await workerHub.listWorkEvents(task.arcRunId);
+    const finalEvents = await workerHub.listWorkEvents(arcRunId);
     expect(formatEventSequence(finalEvents)).toEqual([
       "run:started",
       "routine:started",
@@ -474,9 +478,22 @@ describe("WorkerHubService WorkEvents", () => {
       "blocked:question",
       "tool:finished:discuss:answered",
       "routine:finished:completed",
+      "run:completed",
     ]);
   });
 });
+
+/** Activate the registered arc through hub entry and wait for the run to end. */
+async function activateToEnd(workerHub: WorkerHubService): Promise<ArcRunId> {
+  const arcRunId = await submitActivation(workerHub, "start");
+  await waitFor(async () =>
+    (await workerHub.listWorkEvents(arcRunId)).some(
+      (event) =>
+        event.kind === "run:completed" || event.kind === "run:poisoned",
+    ),
+  );
+  return arcRunId;
+}
 
 function workEventInputs(arcRunId: string): CreateWorkEventInput[] {
   const base = {
@@ -566,38 +583,6 @@ async function callOpenAiTool(
   const fn = tools.find((tool) => tool.name === name);
   if (!fn) throw new Error(`tool not found: ${name}`);
   return await fn.invoke({} as never, JSON.stringify(input), {});
-}
-
-async function instructionTaskFromRun(source = WATCH_SOURCE): Promise<{
-  arcHost: Awaited<ReturnType<typeof makeArcHostWithSource>>;
-  task: InstructionTask;
-}> {
-  const arcHost = await makeArcHostWithSource("watch", source);
-  const begun = await arcHost.begin({
-    dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-    inbound: { content: "start" },
-    principal: ALICE_OWNER,
-    projectDialog: async () => ({
-      cursor: { user: 0, self: 0 },
-      lastTurns: [],
-    }),
-  });
-  const [step] = begun;
-  if (!step || (step.kind !== "action" && step.kind !== "trigger")) {
-    throw new Error("expected Arc work");
-  }
-  const task = step.frontier.tasks[0];
-  if (!task || task.kind !== "instruction") {
-    throw new Error("expected instruction task");
-  }
-  return { arcHost, task };
-}
-
-function routineContext(task: InstructionTask): RoutineContext {
-  return {
-    workspacePath: join(tmpdir(), "arcade-work-event-test-workspace"),
-    workspaceBundle: {},
-  };
 }
 
 describe("Run work event publication", () => {

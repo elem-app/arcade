@@ -64,7 +64,7 @@ The three interfaces:
 - **Connector interface** (connectors <-> worker hub):
   - Channel-neutral inbound submission.
   - Activation-handshake resolution.
-  - Outbound handler registration and dispatch.
+  - Outbound handler registration and dispatch, and live ask listing.
   - `askId` answer routing for questions and permission asks.
   - Execution pause/resume requests and execution-control reads.
   - Work-event handler registration and persisted work-event listing.
@@ -137,7 +137,7 @@ Existing runs can be joined through two activation paths. Selecting an active ru
 
 Interruptions and deflections redirect a run's traversal. Arc handles each one, including catch evaluation and propagation, and determines the resulting traversal. The arc host records the occurrence and returns the resulting frontier, which the hub follows: it dispatches catch work or ends the lap.
 
-An interruption comes from a host module outcome, such as a due timeout, or from a worker's interrupt disposition. The interruption occurrence records its issuance regardless of whether Arc catches it. A caught interruption may produce replacement work. An uncaught interruption ends the current lap; the run can remain active for later continuation. A deflection arises from Arc evaluation or from a worker's deflect disposition. A deflected run can later be selected for re-entry.
+An interruption comes from a host module outcome, such as a due timeout, or from a worker's interrupt disposition. The interruption occurrence records its issuance regardless of whether Arc catches it. A caught interruption may produce replacement work. An uncaught interruption ends the current lap and leaves the run parked as `uncaught-interruption` until it is resumed; see [Parking](#parking). A deflection arises from Arc evaluation or from a worker's deflect disposition. A deflected run can later be selected for re-entry.
 
 A worker disposition concludes its task's whole frontier rather than answering the task. The hub runs no further tasks of the batch, and the disposition overrides the batch's other results: they answer a frontier that no longer stands, so Arc reissues whatever work remains.
 
@@ -325,7 +325,12 @@ Connector examples:
 - **Email connector**: maps inboxes to principals, sends outbound questions, and routes replies back into the originating Arc run.
 - **Web app connector**: exposes Arcade as part of a product UI with product authentication and product-specific delivery policy.
 
-The MCP submit and handshake-resolution tools return submission decisions. A successful terminal decision carries `activated`, `joined`, and `outbound`; `outbound` contains open connector-owned items for the joined runs that belong to the client session's principals. When joining is followed by another handshake in the same submission, the handshake response carries the completed join and outbound snapshot before the next handshake instructions. Later run output is available through the MCP inbox.
+The MCP submit and handshake-resolution tools return submission decisions. A successful terminal decision carries `activated`, `joined`, `outbound`, and `control`. Before building it, the connector reconciles each joined run's inbox against the hub's live asks:
+
+- An open question or permission item whose ask the hub no longer lists, as after a restart, becomes `obsolete`. An answer to an obsolete item is rejected before it reaches the hub.
+- A live ask without an open item gets one, including an ask whose earlier item `failed` when its answer was rejected.
+
+`outbound` then contains open connector-owned items for the joined runs that belong to the client session's principals, and `control` lists each joined run's execution-control view. The connector resumes nothing; whether to continue a paused or parked run is the client's decision through `arcade_resume`, which reconciles the run again when it resumes. When joining is followed by another handshake in the same submission, the handshake response carries the completed join, outbound snapshot, and control views before the next handshake instructions. Later run output is available through the MCP inbox.
 
 Arcade can run with one connector or many. A local daemon might expose only MCP. A product deployment might use a web connector for primary interaction, Slack for approvals, and email for external reviewers. An enterprise deployment might route all channels through a central identity and policy layer.
 
@@ -474,7 +479,7 @@ Infrastructure and internal consistency exceptions surface according to the oper
 
 - **Admission work, including resumed trigger evaluation:** fail the submission channel. The caller's iteration throws after buffered events have been delivered.
 - **Direct execution calls:** reject the returned promise.
-- **Background action execution:** log the exception. Other runs and pending admission decisions remain independent.
+- **Background action execution:** log the exception and park the run as `internal-error`. Other runs and pending admission decisions remain independent.
 
 When a submission channel fails with an exception, the hub releases its pending admission state, parked trigger continuations, and retry timers. Already-running trigger work may finish and write diagnostic records, but its late results are discarded. Cleanup checks prevent those results from recreating resources for the failed submission. Independently activated runs continue.
 
@@ -490,11 +495,15 @@ Before adding an error handler, cleanup check, or retry mechanism, document:
 
 Keep the implementation proportional to those requirements. A cleanup check should protect a specific resource or pending operation. Stronger guarantees, such as automatic infrastructure recovery or coordinated cancellation, require an explicit policy change and corresponding contract tests.
 
-## Execution Control - Pause and Resume
+## Execution Control - Pause, Park, and Resume
 
-Pause and resume are run-scoped controls. A connector pauses or resumes an Arc run by `arcRunId`; it does not target a routine id. Authorization stays run-scoped, and the worker hub owns the mapping from a paused run back to any suspended routine.
+An active run is running, paused, or parked. A user pauses a run; a run parks when something stops it from progressing. Resume continues either.
+
+All are run-scoped controls. Authorization stays run-scoped, and the worker hub owns the mapping from a paused run back to any suspended routine.
 
 Execution controls apply while the run lifecycle is active. Completed, deflected, and poisoned runs are not controllable. Lifecycle takes precedence over a retained pause or park record, for example, when the last instruction completes while pause is pending.
+
+### Pause
 
 Pause is cooperative and durable. A pause request is stored immediately on the run as `pauseRequested`, and the run transitions to `paused` when execution reaches a pause boundary. Boundaries include:
 
@@ -504,25 +513,30 @@ Pause is cooperative and durable. A pause request is stored immediately on the r
 
 A paused run is not a failed run. If pause suspends an active routine, the worker hub stores `pausedRoutineId` on the execution-control state and marks that routine as `paused`. If pause lands between routines, the run is paused without a paused routine id.
 
-Resume is also run-scoped. If the paused run has `pausedRoutineId` and the same-process captured worker is available, the worker hub resumes that exact worker and rebuilds `RoutineContext.routineResume` from the optional continuation message. The shared worker contract exposes `fresh-start` and `rendered-context` delivery only. A stock sessionful adapter privately translates rendered continuation into its provider mechanism: a Claude session message or an OpenAI native run-state resume. Stateless and arbitrary backends can render the shared continuation directly. After the resumed routine finishes, the worker hub feeds the result back into the stored continuation so the run can keep advancing. A reconstructed hub without the captured worker returns `not-ready` and leaves the persisted routine parked. If the paused run has no paused routine id, resume clears the run pause state and attempts normal run draining.
+### Park
 
-Exact continuation from inside a running routine is same-process only: the backend-owned paused execution state remains in memory and is not reconstructed after a process restart.
+A parked run cannot progress until it is resumed. Its status names what stopped it:
 
-Connectors expose these controls through run-scoped APIs. The Web App connector provides `POST /api/runs/:arcRunId/pause` and `POST /api/runs/:arcRunId/resume`. The MCP connector exposes `arcade_pause` and `arcade_resume`. Web run detail includes the execution-control view so the UI can show available controls alongside activity history. See the [service API reference](./service-apis.md#execution-control-api) for request and response contracts.
+- **Worker parks.** `capacity-limited` and `transport-lost`: a backend reports a recoverable provider condition while carrying out a routine.
+- **Host park.** `uncaught-interruption`: an uncaught interruption ended the lap and left the run active. The view carries the interruption's id and reason.
+- **Hub parks.** `internal-error`: a lap of the run failed on an internal error, such as a storage failure. The view carries the error message and time. `hub-restarted`: the run was executing when Arcade restarted.
 
-### Parking
+Every park behaves the same way toward execution control. A pause request against a parked run is a no-op that returns `not-running`, and [resume](#resume) continues the run. When more than one cause applies, `internal-error` comes first, then `uncaught-interruption`, then `hub-restarted`. Arcade keeps the causes of host and hub parks in memory, so after a restart such a run reads `hub-restarted`.
 
-Some backend execution conditions are recoverable. A backend translates its provider-private exception or SDK result into `suspension: "capacity-limited"` or `suspension: "transport-lost"`, and the worker hub parks the run in durable execution-control state so it can resume once the condition clears. Both are distinct from the Arc host's structural `blocked` run status, which means a graph is waiting on dependencies.
+Worker parks come from a backend's translation of its provider-private exception or SDK result, and the worker hub parks the run in durable execution-control state so it can resume once the condition clears. The parked routine returns as if it had cooperatively deferred, so the stored continuation is preserved and the arc host is never advanced.
 
-Both parks share one worker hub lifecycle independent of the selected backend. The parked routine returns as if it had cooperatively deferred, so the stored continuation is preserved and the arc host is never advanced. The durable execution-control state records the parked routine id and serializable reason, and a matching routine work event carries the same reason for connectors and the UI. A pause request against a parked run is a no-op that returns `not-running` and leaves the parked-routine pointer intact.
-
-Retryable parks recover automatically. The hub schedules a deferred resume; after a bounded number of consecutive auto-resumes the run is left parked for a manual resume. If the user had requested a pause when the failure hit, the run is parked without auto-retry so the pause intent is honored. Resuming a parked run invokes the same assignment on the selected worker with the same routine identity. The worker owns retaining and resuming provider execution state. A suspension describes why execution stopped; it does not promise successful recovery. On another invocation, the worker attempts continuation and reports any limitation that prevents it. The OpenAI SDK worker retains execution state and completed tool results across recoverable model-request failures. The Claude SDK worker records session identity as messages arrive and resumes a suspended routine through that session with a continuation message. If the suspended Claude task has no recorded session, its retry reports continuation unavailable. Resumption is same-process only: the hub's continuation lives in memory while only the park status is durable. If a resume arrives before the continuation is stored, or after a process restart when it is gone, resume is a safe no-op that returns `not-ready` and leaves the run visibly parked rather than advancing nothing.
-
-The two parks differ only in their cause and retry policy.
+Worker parks are auto-resumed. The hub schedules a deferred resume; after a bounded number of consecutive auto-resumes the run is left parked for a manual resume. If the user had requested a pause when the failure hit, the run is parked without auto-retry so the pause intent is honored. Resuming a parked run invokes the same assignment on the selected worker with the same routine identity. The worker owns retaining and resuming provider execution state. A suspension describes why execution stopped; it does not promise successful recovery. On another invocation, the worker attempts continuation and reports any limitation that prevents it. The OpenAI SDK worker retains execution state and completed tool results across recoverable model-request failures. The Claude SDK worker records session identity as messages arrive and resumes a suspended routine through that session with a continuation message. If the suspended Claude task has no recorded session, its retry reports continuation unavailable.
 
 `capacity-limited` is a provider-capacity rejection. Built-in backends assign one of four reasons. Three are transient and recover by waiting: `api rate limit`, `token rate limit`, and `provider overloaded`. One is hard: `token usage limit` is quota or credit-balance exhaustion that needs a billing action and is never auto-retried. A backend supplies the reason, provider, message, and optional retry-after; worker hub stamps the selected backend and applies retry policy. Auto-retry backoff uses the provider retry-after when present, else exponential backoff capped per delay.
 
 `transport-lost` represents execution suspended by a provider connection failure. Built-in backends assign `connection reset`, `network timeout`, or `sdk timeout`. The hub applies exponential backoff to this suspension. The backend supplies the reason and message; worker hub stamps the selected backend. The worker determines how to continue when invoked again.
+
+### Resume
+
+Resume continues the run whenever Arcade can. It uses the exact continuation when this process still holds one, and otherwise rebuilds the run from durable state.
+
+- **Exact continuation.** If the paused run has a paused routine and the captured worker is available, the worker hub resumes that exact worker, and feeds the result back into the stored continuation so the run keeps advancing. A worker park with its captured continuation resumes the same way. Exact continuation is same-process only: the hub's continuation and the backend-owned execution state remain in memory and are not reconstructed after a process restart.
+- **Rebuild.** Without an exact continuation and without live work in this process, the arc host rebuilds the run's action session from persisted traversals and the worker hub dispatches its current work again. This covers a pause that landed between routines, a paused routine whose worker is gone, a worker park whose continuation was lost, and every host and hub park. Routine records that no live execution owns are skipped with code `execution-lost`, and a rebuilt routine starts its work again.
 
 ## Artifacts
 

@@ -105,6 +105,43 @@ describe("committed control occurrences", () => {
     },
   );
 
+  it("control-occurrences.application carries an uncaught interruption on the idle frontier", async () => {
+    for (const caught of [false, true]) {
+      const { host } = fixture();
+      await host.registerArc(
+        "control",
+        parse(
+          source(`
+        this.catchInterruption = () => ${caught};
+        $instruct(\`work\`);
+      `),
+        ),
+      );
+      const driver = await beginActivatedDriver(host, dialog);
+      const { driver: next } = await driver.advance({
+        dialog,
+        input: {
+          instructionCoverage: {},
+          reports: [
+            {
+              outcome: "disposition",
+              interrupt: { id: "external", reason: "event arrived" },
+            },
+          ],
+        },
+      });
+      if (caught) {
+        expect(next.frontier.interruption).toBeUndefined();
+      } else {
+        expect(next.frontier).toMatchObject({
+          status: "idle",
+          canProgress: false,
+          interruption: { id: "external", reason: "event arrived" },
+        });
+      }
+    }
+  });
+
   it("control-occurrences.policy orders child transitions and root deflection around one occurrence", async () => {
     const { host, events, replayStore } = fixture();
     await host.registerArc(

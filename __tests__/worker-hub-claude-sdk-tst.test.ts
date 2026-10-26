@@ -1,65 +1,42 @@
-import { mkdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  DEFAULT_WORKER_ROLE,
   type ClaudeSdkQueryFn,
   type ClaudeSdkTstQueryFn,
   type RoutineReport,
-  type Task,
 } from "../src/testing.js";
 import {
   callSdkReport,
   sdkTextMessages as sdkMessages,
-  semanticTool,
 } from "./backend-helpers.js";
+import { makeArcHostWithSource, makeWorkerHub } from "./helpers.js";
+import { executionControlFor } from "./work-event-fixtures.js";
 import {
-  ARC_RUN_ID,
-  firstTaskWithArcHost,
-  makeArcHostWithSource,
-  makeWorkerHub,
-} from "./helpers.js";
+  exampleSemanticReport,
+  semanticRequestIds,
+  settleFirstRoutine,
+  submitActivation,
+} from "./worker-hub-helpers.js";
 
 describe("WorkerHubService Claude SDK semantic routing", () => {
   it("routes fast trigger work through the Claude SDK tst backend", async () => {
     const arcHost = await makeArcHostWithSource(
       "test",
-      `"arc"; function Main() {}`,
+      `"arc"; function Main() { this.trigger = () => judge(\`Is the user asking for help?\`); }`,
     );
-    vi.spyOn(arcHost, "getRunWorkspaceContext").mockResolvedValue({
-      workspacePath: process.cwd(),
-      workspaceBundle: {},
-      reactivationCount: 0,
-    });
-    const task: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:claude-sdk",
-      role: DEFAULT_WORKER_ROLE,
-      stage: "trigger",
-      contextIsolation: "role",
-      arcRunId: ARC_RUN_ID,
-      dialog: { cursor: { user: 1, self: 0 }, lastTurns: [] },
-      requests: [
-        {
-          kind: "judgment",
-          briefId: "judge:fast",
-          role: DEFAULT_WORKER_ROLE,
-          question: "Is the user asking for help?",
-          tool: semanticTool(),
-          sourceRef: "node:test:Main",
-        },
-      ],
-    };
-    const query = vi.fn((_params: Parameters<ClaudeSdkTstQueryFn>[0]) =>
+    const query = vi.fn((params: Parameters<ClaudeSdkTstQueryFn>[0]) =>
       sdkMessages(
         JSON.stringify({
           report: {
             outcome: "completed",
-            semantic: { judgments: { "judge:fast": true } },
+            semantic: {
+              judgments: Object.fromEntries(
+                semanticRequestIds(String(params.prompt)).map((id) => [
+                  id,
+                  true,
+                ]),
+              ),
+            },
           },
         }),
       ),
@@ -73,54 +50,24 @@ describe("WorkerHubService Claude SDK semantic routing", () => {
       claudeSdkTst: { query },
     });
 
-    await expect(
-      workerHub.handleTask(task, {
-        workspacePath: process.cwd(),
-        workspaceBundle: {},
-      }),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: {
-        outcome: "completed",
-        semantic: { judgments: { "judge:fast": true } },
-      },
-    });
+    await submitActivation(workerHub, "Can you help me?");
     expect(query).toHaveBeenCalledTimes(1);
     expect(piRunner).not.toHaveBeenCalled();
   });
 
   it("routes action semantic work through the default Claude SDK backend when fast trigger is configured", async () => {
-    const workspace = join(tmpdir(), "arcade-worker-hub-action-semantic-sdk");
-    await mkdir(workspace, { recursive: true });
-    const { arcHost } = await firstTaskWithArcHost();
-    const task: Task = {
-      kind: "semantic",
-      allowedDispositions: [],
-      batchId: "semantic:action-sdk",
-      role: DEFAULT_WORKER_ROLE,
-      stage: "action",
-      contextIsolation: "role",
-      arcRunId: ARC_RUN_ID,
-      dialog: {
-        cursor: { user: 1, self: 0 },
-        lastTurns: [{ role: "user", message: "research Lumentum" }],
-      },
-      requests: [
-        {
-          kind: "observation",
-          briefId: "observe:isNew",
-          role: DEFAULT_WORKER_ROLE,
-          cell: "isNew",
-          mode: "observe",
-          question:
-            "is Lumentum new in /Users/d/Projects/everynote/04_Investments/The Longlist.md?",
-          currentValue: undefined,
-          meta: { type: "boolean" },
-          tool: observationTool(),
-          sourceRef: "node:watch:Watch",
-        },
-      ],
-    };
+    const arcHost = await makeArcHostWithSource(
+      "watch",
+      `"arc";
+function Watch() {
+  this.trigger = () => true;
+  let isNew = Bool({
+    observing: \`is Lumentum new in /Users/d/Projects/everynote/04_Investments/The Longlist.md?\`,
+  });
+  $observe(isNew);
+}`,
+    );
+    const routineStore = executionControlFor(arcHost);
     const fastQuery = vi.fn(() => {
       throw new Error("action semantic should not use fast trigger");
     }) as unknown as ClaudeSdkTstQueryFn;
@@ -129,19 +76,13 @@ describe("WorkerHubService Claude SDK semantic routing", () => {
       sdkWorkerMessages(
         params,
         "session-action-semantic",
-        {
-          outcome: "completed",
-          semantic: {
-            observations: {
-              "observe:isNew": { status: "resolved", value: true },
-            },
-          },
-        },
+        exampleSemanticReport,
         defaultPrompts,
       ),
     );
     const { workerHub } = makeWorkerHub({
       arcHost,
+      routineStore,
       workerSlots: { default: "claude-sdk" },
       fastTriggerBackend: "claude-sdk-tst",
       claudeSdkTst: { query: fastQuery },
@@ -151,27 +92,18 @@ describe("WorkerHubService Claude SDK semantic routing", () => {
       },
     });
 
-    await expect(
-      workerHub.handleTask(task, {
-        workspacePath: workspace,
-        workspaceBundle: {},
-      }),
-    ).resolves.toMatchObject({
-      status: "finished",
-      report: {
-        outcome: "completed",
-        semantic: {
-          observations: {
-            "observe:isNew": { status: "resolved", value: true },
-          },
-        },
-      },
-    });
-
+    const { arcRunId, routine } = await settleFirstRoutine(
+      workerHub,
+      routineStore,
+      "research Lumentum",
+    );
+    expect(routine.status).toBe("finished");
     expect(fastQuery).not.toHaveBeenCalled();
     expect(defaultQueryMock).toHaveBeenCalledTimes(1);
     const call = defaultQueryMock.mock.calls[0]![0];
-    expect(call.options?.cwd).toBe(workspace);
+    expect(call.options?.cwd).toBe(
+      (await arcHost.getRunWorkspaceContext(arcRunId)).workspacePath,
+    );
     expect(call.options?.tools).toEqual({
       type: "preset",
       preset: "claude_code",
@@ -186,42 +118,23 @@ describe("WorkerHubService Claude SDK semantic routing", () => {
     expect(prompt).toContain(
       'Do not call report with bare {"outcome":"completed"} for semantic work.',
     );
-    expect(prompt).toContain(
-      '"observe:isNew":{"status":"resolved","value":true}',
-    );
+    expect(prompt).toContain('{"status":"resolved","value":true}');
   });
 });
-
-function observationTool() {
-  return {
-    type: "function" as const,
-    name: "arc_observation_1",
-    description: "Resolve observation.",
-    parameters: {
-      type: "object",
-      properties: {
-        status: { type: "string", enum: ["resolved", "unknown"] },
-        value: { type: "boolean" },
-      },
-      required: ["status"],
-      additionalProperties: false,
-    },
-    strict: true as const,
-  };
-}
 
 async function* sdkWorkerMessages(
   params: Parameters<ClaudeSdkQueryFn>[0],
   sessionId: string,
-  report: RoutineReport,
+  report: (prompt: string) => RoutineReport,
   prompts: string[],
 ) {
   const input = params.prompt as AsyncIterable<{
     message?: { content?: unknown };
   }>;
   const first = await input[Symbol.asyncIterator]().next();
-  prompts.push(String(first.value?.message?.content ?? ""));
-  await callSdkReport(params, report);
+  const prompt = String(first.value?.message?.content ?? "");
+  prompts.push(prompt);
+  await callSdkReport(params, report(prompt));
   yield {
     type: "system",
     subtype: "init",

@@ -156,7 +156,7 @@ Lifecycle events:
 
 A worker asks by emitting an outbound message with cause `question` or by calling the permission effect. The outbound message carries an Arcade-generated `metadata.askId`, which is the answer-routing identity, and is ready to accept an answer when it reaches the registered handlers. A provider-local tool-call ID may appear as `metadata.toolCallId` as correlation evidence.
 
-The connector answers through `submitInbound` with the ask's `askId` and run ID. The first valid answer settles the ask.
+The connector answers through `submitInbound` with the ask's `askId` and run ID. The first valid answer settles the ask. A connector that may hold stale asks, for example after joining a run or after Arcade restarts, reads the asks still live through [`listAsks`](#listasksarcrunid-situation).
 
 - A question answer appends one role-private history entry under the ask's audience and role before the worker receives it. If that append fails, the submission fails and the connector can retry while the routine remains live.
 - A permission answer carries its verdict in `metadata.decision` as `allow`, `deny`, or `allow_this_run`, optionally with `metadata.updatedInput`, and uses `content` as an optional human-readable message. A missing or unknown decision is rejected and leaves the ask live. Permission answers write no dialog history.
@@ -171,6 +171,18 @@ registerOutboundHandler(
 ```
 
 Registers delivery for outbound messages matching one [outbound situation](./arcade.md#outbound-situations) and returns its unregister function. Any of the situation's `role`, `audience`, and `cause` may be `"*"` to match every value. Each outbound message is delivered to every handler whose situation matches.
+
+A handler's promise settles once the connector has accepted delivery and never waits for an answer. A rejection means delivery failed, and the hub rejects the ask the message carries.
+
+#### `listAsks(arcRunId, situation)`
+
+```ts
+listAsks(arcRunId: ArcRunId, situation: OutboundSituation): OutboundMessage[]
+```
+
+Returns the run's live question and permission asks whose situation matches, under the same exact-or-`"*"` rule as `registerOutboundHandler`, in registration order. Each entry is the outbound message the ask was dispatched with, including `metadata.askId`. An ask that is settled, released by supersession, or disposed with its routine is absent. Asks live only within this process, so the result is empty after a restart or a rebuild until a worker asks again.
+
+An ask is registered before its outbound dispatch completes, so a listed ask may still be on its way to the connector's handler. The shared `askId` identifies the repeat.
 
 #### `handshake(id, values, clientId?)`
 
@@ -206,7 +218,11 @@ Execution control pauses, parks, and resumes a run. A run's execution-control st
 - `running`.
 - `pauseRequested`: a cooperative pause awaits the next pause boundary.
 - `paused`.
-- `capacity-limited` or `transport-lost`: a recoverable park Arcade raised because backend execution could not continue.
+- A park, which names what stopped the run:
+  - `capacity-limited` or `transport-lost`: a worker could not continue because of a recoverable provider condition.
+  - `uncaught-interruption`: an uncaught interruption ended the lap and left the run active.
+  - `internal-error`: a lap of the run failed on an internal error.
+  - `hub-restarted`: the run was executing when Arcade restarted.
 - `inactive`: the run is completed, deflected, or poisoned.
 
 See [execution control](./arcade.md#execution-control---pause-and-resume) for pause boundaries and park retry policy.
@@ -217,7 +233,7 @@ See [execution control](./arcade.md#execution-control---pause-and-resume) for pa
 getExecutionControlView(arcRunId: ArcRunId): Promise<ExecutionControlView>
 ```
 
-Returns the run's execution-control status. A parked view may include its automatic retry state: whether a retry is pending, the attempt count and limit, and the scheduled retry time.
+Returns the run's execution-control status.
 
 #### `requestPause(arcRunId)`
 
@@ -233,17 +249,17 @@ Requests a cooperative pause. Outcomes:
 - `inactive`: the run is completed, deflected, or poisoned.
 - `missing`: no eligible run is known.
 
-#### `resume(arcRunId, message?)`
+#### `resume(arcRunId)`
 
 ```ts
-resume(arcRunId: ArcRunId, message?: string): Promise<ResumeResult>
+resume(arcRunId: ArcRunId): Promise<ResumeResult>
 ```
 
-Resumes a paused or parked run. The optional message becomes the continuation message for a resumed routine. Outcomes:
+Resumes a paused or parked run. Resume uses the exact continuation when this process still holds one, and otherwise rebuilds the run from durable state and dispatches its current work again. Outcomes:
 
 - `resumed`: the run is `running` again and continuation was attempted.
-- `not-paused`: the run was already running.
-- `not-ready`: the run is parked, but its continuation is unavailable in this process, so nothing advanced.
+- `not-paused`: the view reads `running`.
+- `not-ready`: live work in this process has not yet stored the run's continuation. Nothing advanced, and a later resume continues the run.
 - `inactive`: the run is completed, deflected, or poisoned.
 - `missing`: no eligible run is known.
 
@@ -367,7 +383,7 @@ Applies worker feedback or one host module outcome, serialized per run. Worker f
 - Worker feedback from a superseded frontier is discarded, and the call returns the current frontier.
 - A duplicate or temporarily inapplicable host module outcome leaves the frontier unchanged and records nothing.
 
-Returns one `action` step for the same run. Its `frontier.transitions` lists the position changes acknowledged during the call, which the worker hub records as node entered and exited work events under the Arc version the run executed. An uncaught interruption can end the lap with `canProgress: false` while the run lifecycle remains `active`.
+Returns one `action` step for the same run. Its `frontier.transitions` lists the position changes acknowledged during the call, which the worker hub records as node entered and exited work events under the Arc version the run executed. An uncaught interruption can end the lap with `canProgress: false` while the run lifecycle remains `active`; the frontier then carries the interruption's `id` and `reason` in `interruption`.
 
 #### `releaseAction(arcRunId, frontierId)`
 
@@ -498,7 +514,7 @@ Implement `Worker.run(input)` to handle the supplied task using its routine cont
 
 The hub serializes warmup, invocation, and continuity updates by worker instance, run, and context key. Distinct contexts may call `warm` and `run` concurrently, so keep effects, diagnostics, and retained state associated with their routine. Supplied workspaces may be shared; deployments provide filesystem isolation when required.
 
-Follow the routine context's resume instruction: `fresh-start` reruns work that paused before its worker began; `rendered-context` supplies a continuation message for the backend to render or translate into its own continuation mechanism.
+Follow the routine context's resume instruction: `fresh-start` reruns work that paused before its worker began; `continue` asks the worker to continue retained work through its own mechanism. Neither carries text; which turn, if any, continues a provider session is the backend's choice.
 
 `disposeRoutine` releases the routine's resources after its invocation settles. It must be idempotent and preserve other invocations, including a successor using the same context. Worker shutdown releases the remaining resources.
 

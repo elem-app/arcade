@@ -11,7 +11,13 @@ import type { Task } from "./task.js";
 import type { WorkEvent } from "./work-event.js";
 import type { BackendName } from "./worker-slot.js";
 
-/** Connector-owned callback registered for hub outbound dispatch. */
+/**
+ * Connector-owned callback registered for hub outbound dispatch.
+ *
+ * The returned promise settles once the connector has accepted delivery and
+ * never waits for an answer. A rejection means delivery failed, and the hub
+ * rejects the ask the message carries.
+ */
 export type OutboundMessageHandler = (
   message: OutboundMessage,
 ) => Promise<void> | void;
@@ -23,7 +29,7 @@ export type OutboundMessageHandler = (
 export type WorkEventHandler = (event: WorkEvent) => Promise<void> | void;
 
 /**
- * Hub-side outcome of one dispatched task, returned by `handleTask`.
+ * Hub-side outcome of one dispatched task.
  *
  * - `finished` — the hub ran a worker; `report` describes whatever the worker
  *   said (which may itself be a success, a deflection, or a failure).
@@ -104,7 +110,15 @@ export type RequestPauseResult =
       outcome: "not-running";
       control: Extract<
         ExecutionControlView,
-        { status: "paused" | "capacity-limited" | "transport-lost" }
+        {
+          status:
+            | "paused"
+            | "capacity-limited"
+            | "transport-lost"
+            | "internal-error"
+            | "uncaught-interruption"
+            | "hub-restarted";
+        }
       >;
     }
   | {
@@ -115,12 +129,15 @@ export type RequestPauseResult =
 /**
  * Result of resuming one paused or parked Arc run.
  *
- * `resumed` means Arcade restored permission to run and attempted continuation.
- * An already-running settlement may complete before more work is dispatched.
- * `not-paused` means the run was already running. `not-ready` means the paused
- * or parked run has no captured same-process continuation, so nothing advances.
- * `inactive` means the run is completed, deflected, or poisoned.
- * `missing` means no eligible run is known to the host.
+ * Resume continues the run whenever Arcade can: through the exact continuation
+ * when this process still holds one, otherwise by rebuilding the run from
+ * durable state. `resumed` means Arcade restored permission to run and
+ * attempted continuation; an already-running settlement may complete before
+ * more work is dispatched. `not-paused` means the control view reads
+ * `running`. `not-ready` is temporary: live work in this process has not yet
+ * stored its continuation, and a later resume continues the run. `inactive`
+ * means the run is completed, deflected, or poisoned. `missing` means no
+ * eligible run is known to the host.
  */
 export type ResumeResult =
   | {

@@ -147,9 +147,11 @@ export type ParkAutoRetry = {
  * Stable cross-boundary view of one run's execution-control state, surfaced to
  * connectors and the web UI.
  *
- * Discriminated by `status`. Active executions project durable control state
- * and parked auto-retry information. Inactive executions carry only their run
- * identity; lifecycle takes precedence over retained control state.
+ * Discriminated by `status`. An active run is running, paused, or parked, and
+ * a park names what stopped it: a worker raises `capacity-limited` and
+ * `transport-lost`, the host raises `uncaught-interruption`, and the hub
+ * raises `internal-error` and `hub-restarted`. Inactive executions carry only
+ * their run identity; lifecycle takes precedence over retained control state.
  */
 export type ExecutionControlView =
   | {
@@ -193,12 +195,22 @@ export type ExecutionControlView =
       transportReason: TransportLoss;
       autoRetry?: ParkAutoRetry;
       updatedAt: string;
+    }
+  | {
+      arcRunId: ArcRunId;
+      status: "internal-error";
+      error: { message: string };
+      failedAt: string;
+      updatedAt: string;
+    }
+  | {
+      arcRunId: ArcRunId;
+      status: "uncaught-interruption";
+      interruption: { id: string; reason: string };
+      updatedAt: string;
+    }
+  | {
+      arcRunId: ArcRunId;
+      status: "hub-restarted";
+      updatedAt: string;
     };
-
-/** Default connector message used to continue a paused routine. */
-export const DEFAULT_ROUTINE_RESUME_MESSAGE = "Continue";
-
-/** Normalize a connector-supplied continuation message, defaulting when blank. */
-export function routineResumeMessage(message?: string): string {
-  return message?.trim() || DEFAULT_ROUTINE_RESUME_MESSAGE;
-}

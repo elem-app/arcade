@@ -31,6 +31,7 @@ import type { DiscoveryService } from "../service/discovery.js";
 import type { WorkerHubService } from "../service/worker-hub.js";
 import type { Connector } from "../types/connector.js";
 import type { ArcRunId } from "../types/core.js";
+import type { ExecutionControlView } from "../types/execution-control.js";
 import type {
   ActivationRequirement,
   HandshakeResolution,
@@ -195,6 +196,10 @@ const MCP_SUBMISSION_CHANNEL_FAILED_MESSAGE =
   "Arcade could not finish handling that request. Check your runs before trying again.";
 const MCP_SUBMISSION_REJECTED_MESSAGE =
   "Arcade did not start a run for that request.";
+const MCP_OUTBOUND_NOTE =
+  "The outbound field contains open items for attached runs. Poll your inbox for later run output.";
+const MCP_JOINED_CONTROL_NOTE =
+  "The control field lists each joined run's execution control. arcade_resume continues a paused or parked run; resuming an internal-error, uncaught-interruption, or hub-restarted run restarts its current work.";
 
 type McpBranchRejectionMessage =
   | typeof MCP_HANDSHAKE_EXPIRED_MESSAGE
@@ -240,6 +245,7 @@ type SubmissionDecision = { failures: SubmissionFailure[] } & (
       activated: ArcRunId[];
       joined: ArcRunId[];
       outbound: McpOutboundInboxItem[];
+      control: ExecutionControlView[];
     }
   | {
       kind: "rejected";
@@ -252,6 +258,7 @@ type SubmissionDecision = { failures: SubmissionFailure[] } & (
       activated: ArcRunId[];
       joined: ArcRunId[];
       outbound: McpOutboundInboxItem[];
+      control: ExecutionControlView[];
     }
 );
 
@@ -268,7 +275,8 @@ type McpInboxTransitionEvent =
   | "connector.mcp.outbound.inbox_created"
   | "connector.mcp.outbound.acknowledged"
   | "connector.mcp.outbound.answered"
-  | "connector.mcp.outbound.failed";
+  | "connector.mcp.outbound.failed"
+  | "connector.mcp.outbound.obsolete";
 
 /** Internal MCP connector for standalone Arcade daemon processes. */
 export class McpConnector implements Connector {
@@ -297,6 +305,7 @@ export class McpConnector implements Connector {
     }
   >();
   readonly #inboxItemSerializer = new KeyedSerializer<string>();
+  readonly #askItemSerializer = new KeyedSerializer<string>();
   readonly #discoverySerializer = new KeyedSerializer<string>();
   readonly #discoveredArcDirs = new Set<string>();
   readonly #unregisterHandlers: Array<() => void> = [];
@@ -758,10 +767,9 @@ export class McpConnector implements Connector {
         description: "Resumes one paused or blocked Arcade run.",
         inputSchema: {
           arcRunId: z.string(),
-          message: z.string().optional(),
         },
       },
-      async ({ arcRunId, message }, extra) => {
+      async ({ arcRunId }, extra) => {
         this.#logger.info("connector.mcp.tool.resume", {
           arcRunId,
           sessionId: extra.sessionId,
@@ -771,7 +779,11 @@ export class McpConnector implements Connector {
             `MCP session is not authorized to resume run ${arcRunId}.`,
           );
         }
-        return jsonToolResult(await this.#workerHub.resume(arcRunId, message));
+        const result = await this.#workerHub.resume(arcRunId);
+        // A rebuilt run held no live asks, so the inbox drops its stale ones.
+        if (result.outcome === "resumed")
+          await this.#reconcileRunAsks(arcRunId);
+        return jsonToolResult(result);
       },
     );
 
@@ -963,10 +975,7 @@ export class McpConnector implements Connector {
           requirement: event.requirement,
           activated: accumulator.activated,
           joined: accumulator.joined,
-          outbound: await this.#openOutboundForSessionRuns(
-            session,
-            accumulator.joined,
-          ),
+          ...(await this.#joinedRunState(session, accumulator.joined)),
         };
       } else if (event.kind === "rejected") {
         this.#logger.info("connector.mcp.submission.rejected", {
@@ -1005,10 +1014,7 @@ export class McpConnector implements Connector {
         kind: "activated",
         activated: accumulator.activated,
         joined: accumulator.joined,
-        outbound: await this.#openOutboundForSessionRuns(
-          session,
-          accumulator.joined,
-        ),
+        ...(await this.#joinedRunState(session, accumulator.joined)),
       };
     }
     if (accumulator.failures.length > 0) {
@@ -1037,6 +1043,29 @@ export class McpConnector implements Connector {
       activated: accumulator.activated,
       joined: accumulator.joined,
       outbound: [],
+      control: [],
+    };
+  }
+
+  /**
+   * Reconcile each joined run's ask items, then read the open outbound and the
+   * execution-control view the decision reports for the joined runs.
+   */
+  async #joinedRunState(
+    session: McpSession,
+    joined: readonly ArcRunId[],
+  ): Promise<{
+    outbound: McpOutboundInboxItem[];
+    control: ExecutionControlView[];
+  }> {
+    for (const arcRunId of joined) await this.#reconcileRunAsks(arcRunId);
+    return {
+      outbound: await this.#openOutboundForSessionRuns(session, joined),
+      control: await Promise.all(
+        joined.map((arcRunId) =>
+          this.#workerHub.getExecutionControlView(arcRunId),
+        ),
+      ),
     };
   }
 
@@ -1078,6 +1107,10 @@ export class McpConnector implements Connector {
             activated: decision.activated,
             joined: decision.joined,
             outbound: decision.outbound,
+            control: decision.control,
+            ...(decision.joined.length
+              ? { note: MCP_JOINED_CONTROL_NOTE }
+              : {}),
           }),
           "",
           instruction,
@@ -1097,7 +1130,10 @@ export class McpConnector implements Connector {
       activated: decision.activated,
       joined: decision.joined,
       outbound: decision.outbound,
-      note: "The outbound field contains open items for attached runs. Poll your inbox for later run output.",
+      control: decision.control,
+      note: decision.joined.length
+        ? `${MCP_OUTBOUND_NOTE} ${MCP_JOINED_CONTROL_NOTE}`
+        : MCP_OUTBOUND_NOTE,
     });
   }
 
@@ -1163,23 +1199,96 @@ export class McpConnector implements Connector {
       delivery: policy.delivery,
       targetCount: principals.length,
     });
+    // Delivery settles once the item is saved and the inbox notified;
+    // elicitation waits on a user, so it runs in the background.
     await Promise.all(
       principals.map(async (principal) => {
-        const item = await this.#inboxStore.createMessage({
-          situation: message.situation,
-          arcRunId: message.arcRunId,
-          content: message.content,
-          metadata: message.metadata,
-          targetPrincipal: principal,
-        });
+        const item = await this.#createInboxItemOnce(message, principal);
+        if (!item) return;
         this.#attachRunToPrincipalSessions(item.arcRunId, item.targetPrincipal);
         this.#logInboxTransition("connector.mcp.outbound.inbox_created", item, {
           delivery: policy.delivery,
         });
         await this.#notifyInbox(principal);
-        await this.#deliverPersisted(policy, item);
+        void this.#deliverPersisted(policy, item).catch((error: unknown) => {
+          this.#logger.info("connector.mcp.elicitation.failed", {
+            outboundMessageId: item.id,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
       }),
     );
+  }
+
+  /**
+   * Create the principal's inbox item for one outbound, unless an open item
+   * already holds the same ask. Asks reach the connector both through outbound
+   * dispatch and through `listAsks`, and the askId identifies the repeat.
+   */
+  async #createInboxItemOnce(
+    message: OutboundMessage,
+    principal: McpPrincipal,
+  ): Promise<McpOutboundInboxItem | undefined> {
+    const create = () =>
+      this.#inboxStore.createMessage({
+        situation: message.situation,
+        arcRunId: message.arcRunId,
+        content: message.content,
+        metadata: message.metadata,
+        targetPrincipal: principal,
+      });
+    const askId = readAskId(message.metadata);
+    if (askId === undefined) return create();
+    return this.#askItemSerializer.run(askId, async () => {
+      const open = await collectAsync(
+        this.#inboxStore.listMessages({
+          targetPrincipal: principal,
+          statuses: ["pending", "delivered"],
+        }),
+      );
+      if (open.some((item) => readAskId(item.metadata) === askId)) return;
+      return create();
+    });
+  }
+
+  /**
+   * Bring the run's open ask items in line with the hub's live asks: deliver
+   * each listed ask the inbox lacks, and mark held items obsolete whose ask is gone.
+   * Held items are read first, so an item created for a new ask during
+   * reconciliation is never marked obsolete.
+   */
+  async #reconcileRunAsks(arcRunId: ArcRunId): Promise<void> {
+    const held = (
+      await collectAsync(
+        this.#inboxStore.listMessages({ statuses: ["pending", "delivered"] }),
+      )
+    ).filter(
+      (item) =>
+        item.arcRunId === arcRunId &&
+        isAnswerableCause(item.situation.cause) &&
+        readAskId(item.metadata) !== undefined,
+    );
+    const live = new Set<string>();
+    for (const policy of this.#policies) {
+      for (const ask of this.#workerHub.listAsks(arcRunId, policy.situation)) {
+        const askId = readAskId(ask.metadata);
+        if (askId !== undefined) live.add(askId);
+        await this.#handleOutbound(policy, ask);
+      }
+    }
+    for (const item of held) {
+      if (live.has(readAskId(item.metadata)!)) continue;
+      await this.#runForInboxItem(item.id, async () => {
+        const current = await this.#inboxStore.getMessage(item.id);
+        if (current?.status !== "pending" && current?.status !== "delivered")
+          return;
+        const obsolete = await this.#inboxStore.updateMessage(item.id, {
+          status: "obsolete",
+        });
+        await this.#notifyInbox(obsolete.targetPrincipal);
+        this.#logInboxTransition("connector.mcp.outbound.obsolete", obsolete);
+      });
+    }
   }
 
   async #deliverPersisted(

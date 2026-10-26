@@ -4,35 +4,41 @@ import { join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import type {
-  ClaudeSdkTstQueryFn,
-  OpenAiSdkTstRunFn,
-  Task,
-} from "../src/testing.js";
+import type { ClaudeSdkTstQueryFn, OpenAiSdkTstRunFn } from "../src/testing.js";
 import { sdkTextMessages } from "./backend-helpers.js";
 import {
-  ARC_RUN_ID,
+  ALICE_OWNER,
+  collectAsync,
   createCapturingLogger,
   makeArcHostWithSource,
   makeWorkerHub,
 } from "./helpers.js";
+import {
+  recordAdvanceInputs,
+  semanticRequestIds,
+  submitActivation,
+} from "./worker-hub-helpers.js";
 
 describe("Worker hub TST report validation", () => {
   it("records and removes Claude TST semantic drift at the worker hub boundary", async () => {
-    const { workerHub, task, records } = await makeClaudeHubWithReport({
-      outcome: "completed",
-      semantic: {
-        judgments: { "judge:required": true, "judge:extra": false },
-      },
-    });
-
-    await expect(workerHub.handleTask(task, context())).resolves.toMatchObject({
-      status: "finished",
-      report: {
+    const { workerHub, advanceInputs, records } = await makeClaudeHubWithReport(
+      (id) => ({
         outcome: "completed",
-        semantic: { judgments: { "judge:required": true } },
-      },
-    });
+        semantic: { judgments: { [id]: true, "judge:extra": false } },
+      }),
+    );
+
+    await submitActivation(workerHub, "Is it ready?");
+    expect(advanceInputs).toEqual([
+      expect.objectContaining({
+        reports: [
+          expect.objectContaining({
+            outcome: "completed",
+            semantic: { judgments: { [onlyJudgmentId(advanceInputs)]: true } },
+          }),
+        ],
+      }),
+    ]);
     expect(records).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -45,20 +51,24 @@ describe("Worker hub TST report validation", () => {
   });
 
   it("records and removes OpenAI TST semantic drift at the worker hub boundary", async () => {
-    const { workerHub, task, records } = await makeOpenAiHubWithReport({
-      outcome: "completed",
-      semantic: {
-        judgments: { "judge:required": true, "judge:extra": false },
-      },
-    });
-
-    await expect(workerHub.handleTask(task, context())).resolves.toMatchObject({
-      status: "finished",
-      report: {
+    const { workerHub, advanceInputs, records } = await makeOpenAiHubWithReport(
+      (id) => ({
         outcome: "completed",
-        semantic: { judgments: { "judge:required": true } },
-      },
-    });
+        semantic: { judgments: { [id]: true, "judge:extra": false } },
+      }),
+    );
+
+    await submitActivation(workerHub, "Is it ready?");
+    expect(advanceInputs).toEqual([
+      expect.objectContaining({
+        reports: [
+          expect.objectContaining({
+            outcome: "completed",
+            semantic: { judgments: { [onlyJudgmentId(advanceInputs)]: true } },
+          }),
+        ],
+      }),
+    ]);
     expect(records).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -74,15 +84,15 @@ describe("Worker hub TST report validation", () => {
     const diagnosticsDir = await mkdtemp(
       join(tmpdir(), "arcade-tst-no-drift-"),
     );
-    const { workerHub, task, records } = await makeClaudeHubWithReport(
-      {
+    const { workerHub, records } = await makeClaudeHubWithReport(
+      (id) => ({
         outcome: "completed",
-        semantic: { judgments: { "judge:required": true } },
-      },
+        semantic: { judgments: { [id]: true } },
+      }),
       diagnosticsDir,
     );
 
-    await workerHub.handleTask(task, context());
+    await submitActivation(workerHub, "Is it ready?");
 
     expect(
       records.some(
@@ -96,37 +106,51 @@ describe("Worker hub TST report validation", () => {
   });
 
   it("rejects an incomplete TST semantic report at the worker hub boundary", async () => {
-    const { workerHub, task } = await makeClaudeHubWithReport({
+    const { workerHub } = await makeClaudeHubWithReport(() => ({
       outcome: "completed",
       semantic: { judgments: {} },
-    });
+    }));
 
-    await expect(workerHub.handleTask(task, context())).resolves.toMatchObject({
-      status: "finished",
-      report: {
-        error: "failed",
-        code: "backend-error",
-        message: expect.stringContaining("judge:required is required"),
-      },
-    });
+    const events = await collectAsync(
+      workerHub.submitInbound({
+        content: "Is it ready?",
+        metadata: { principal: ALICE_OWNER },
+      }),
+    );
+    expect(events).toEqual([
+      expect.objectContaining({
+        kind: "failed",
+        reason: expect.stringContaining("is required"),
+      }),
+    ]);
   });
 });
 
+const TRIGGER_SOURCE =
+  '"arc"; function Main() { this.trigger = () => judge("Is it ready?"); }';
+
+/** The single judgment id the recorded trigger report answered. */
+function onlyJudgmentId(advanceInputs: unknown[]): string {
+  const input = advanceInputs[0] as {
+    reports: [{ semantic: { judgments: Record<string, boolean> } }];
+  };
+  const ids = Object.keys(input.reports[0].semantic.judgments);
+  expect(ids).toHaveLength(1);
+  return ids[0]!;
+}
+
 async function makeClaudeHubWithReport(
-  report: unknown,
+  report: (judgmentId: string) => unknown,
   routineDiagnosticsDir?: string,
 ) {
-  const arcHost = await makeArcHostWithSource(
-    "test",
-    '"arc"; function Main() {}',
-  );
-  vi.spyOn(arcHost, "getRunWorkspaceContext").mockResolvedValue({
-    ...context(),
-    reactivationCount: 0,
-  });
-  const task = semanticTask();
-  const query = vi.fn(() =>
-    sdkTextMessages(JSON.stringify({ report })),
+  const arcHost = await makeArcHostWithSource("test", TRIGGER_SOURCE);
+  const advanceInputs = recordAdvanceInputs(arcHost);
+  const query = vi.fn((params: Parameters<ClaudeSdkTstQueryFn>[0]) =>
+    sdkTextMessages(
+      JSON.stringify({
+        report: report(semanticRequestIds(String(params.prompt))[0]!),
+      }),
+    ),
   ) as unknown as ClaudeSdkTstQueryFn;
   const { logger, records } = createCapturingLogger();
   const { workerHub } = makeWorkerHub({
@@ -136,21 +160,18 @@ async function makeClaudeHubWithReport(
     claudeSdkTst: { query },
     routineDiagnosticsDir,
   });
-  return { workerHub, task, records };
+  return { workerHub, advanceInputs, records };
 }
 
-async function makeOpenAiHubWithReport(report: unknown) {
-  const arcHost = await makeArcHostWithSource(
-    "test",
-    '"arc"; function Main() {}',
-  );
-  vi.spyOn(arcHost, "getRunWorkspaceContext").mockResolvedValue({
-    ...context(),
-    reactivationCount: 0,
-  });
-  const task = semanticTask();
-  const run = vi.fn<OpenAiSdkTstRunFn>(async () => ({
-    finalOutput: JSON.stringify({ report }),
+async function makeOpenAiHubWithReport(
+  report: (judgmentId: string) => unknown,
+) {
+  const arcHost = await makeArcHostWithSource("test", TRIGGER_SOURCE);
+  const advanceInputs = recordAdvanceInputs(arcHost);
+  const run = vi.fn<OpenAiSdkTstRunFn>(async ({ prompt }) => ({
+    finalOutput: JSON.stringify({
+      report: report(semanticRequestIds(prompt)[0]!),
+    }),
     lastResponseId: "response:tst-validation",
   }));
   const { logger, records } = createCapturingLogger();
@@ -160,43 +181,5 @@ async function makeOpenAiHubWithReport(report: unknown) {
     fastTriggerBackend: "openai-sdk-tst",
     openAiSdkTst: { apiKey: "sk-test", run },
   });
-  return { workerHub, task, records };
-}
-
-function semanticTask(): Task {
-  return {
-    kind: "semantic",
-    allowedDispositions: [],
-    batchId: "semantic:tst-validation",
-    role: "researcher",
-    stage: "trigger",
-    contextIsolation: "role",
-    arcRunId: ARC_RUN_ID,
-    dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-    requests: [
-      {
-        kind: "judgment",
-        briefId: "judge:required",
-        role: "researcher",
-        question: "Is it ready?",
-        sourceRef: "node:test:Main",
-        tool: {
-          type: "function",
-          name: "judge_required",
-          description: "Resolve readiness.",
-          strict: true,
-          parameters: {
-            type: "object",
-            properties: { result: { type: "boolean" } },
-            required: ["result"],
-            additionalProperties: false,
-          },
-        },
-      },
-    ],
-  };
-}
-
-function context() {
-  return { workspacePath: process.cwd(), workspaceBundle: {} };
+  return { workerHub, advanceInputs, records };
 }

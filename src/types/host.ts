@@ -163,6 +163,8 @@ export type RunFrontier = {
   };
   /** All parsed tasks returned for this frontier. */
   tasks: readonly Task[];
+  /** Uncaught interruption the frontier rests on, when one ended the lap. */
+  interruption?: { id: string; reason: string };
   /** Position changes acknowledged while settling to this frontier. */
   transitions: readonly RunTransition[];
 };

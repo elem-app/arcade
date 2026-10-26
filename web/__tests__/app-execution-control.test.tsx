@@ -255,3 +255,65 @@ it.each(["paused", "capacity-limited", "transport-lost"] as const)(
       expect(container.textContent).toContain("Auto-retrying");
   },
 );
+
+it.each([
+  [
+    "internal-error",
+    {
+      status: "internal-error",
+      arcRunId: "r",
+      error: { message: "routine store unavailable" },
+      failedAt: "now",
+      updatedAt: "now",
+    },
+    "routine store unavailable",
+  ],
+  [
+    "uncaught-interruption",
+    {
+      status: "uncaught-interruption",
+      arcRunId: "r",
+      interruption: { id: "external", reason: "event arrived" },
+      updatedAt: "now",
+    },
+    "event arrived",
+  ],
+  [
+    "hub-restarted",
+    { status: "hub-restarted", arcRunId: "r", updatedAt: "now" },
+    "Arcade restarted",
+  ],
+] as const satisfies ReadonlyArray<
+  readonly [string, ExecutionControlView, string]
+>)(
+  "shows the %s park cause with a resume control",
+  async (_status, pause, cause) => {
+    const onContinueRun = vi.fn();
+    await act(async () =>
+      root.render(
+        <MessageList
+          messages={[]}
+          workEvents={[event]}
+          pause={pause}
+          expandedAnswered={new Set()}
+          answerDrafts={{}}
+          onToggleExpanded={vi.fn()}
+          onDraftChange={vi.fn()}
+          onAnswer={vi.fn()}
+          onPermission={vi.fn()}
+          onAck={vi.fn()}
+          onPauseRun={vi.fn()}
+          onContinueRun={onContinueRun}
+        />,
+      ),
+    );
+    const resume = [...container.querySelectorAll("button")].filter(
+      (button) => button.textContent === "Resume",
+    );
+    expect(resume).toHaveLength(1);
+    expect(container.textContent).toContain(cause);
+    expect(container.textContent).not.toContain("Auto-retrying");
+    await act(async () => resume[0]!.click());
+    expect(onContinueRun).toHaveBeenCalledWith("r");
+  },
+);

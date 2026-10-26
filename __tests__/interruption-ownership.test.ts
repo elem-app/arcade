@@ -551,7 +551,18 @@ describe("Host interruption ownership", () => {
         inputs.push(input);
         if (inputs.length > 1) {
           await releaseCatch.promise;
-          return { outcome: "completed" };
+          // Catch the interruption, so Arc reissues the original work.
+          const task = input.routine.task;
+          return task.kind === "semantic"
+            ? {
+                outcome: "completed",
+                semantic: {
+                  judgments: Object.fromEntries(
+                    task.requests.map((request) => [request.briefId, true]),
+                  ),
+                },
+              }
+            : { outcome: "completed" };
         }
         await input.effects
           .emit({ situation: { cause: "question" }, content: "old question" })
@@ -600,9 +611,19 @@ describe("Host interruption ownership", () => {
       expect(releases).not.toHaveBeenCalled();
       expect(env.host.getLiveSessionCounts().actioning).toBe(1);
       expect(env.workerHub!.getLiveWorkCounts().scopes).toBe(1);
-      await expect(
-        env.workerHub!.handleTask(old.routine.task, old.context),
-      ).rejects.toThrow("cannot be reused");
+      // The reissued original work selects the worker whose disposal failed.
+      releaseCatch.resolve();
+      await waitFor(
+        async () =>
+          (await env.workerHub!.getExecutionControlView(old.routine.arcRunId))
+            .status === "internal-error",
+      );
+      expect(
+        await env.workerHub!.getExecutionControlView(old.routine.arcRunId),
+      ).toMatchObject({
+        status: "internal-error",
+        error: { message: expect.stringContaining("cannot be reused") },
+      });
     } finally {
       release.resolve();
       releaseDisposal.resolve();

@@ -40,7 +40,8 @@ export type McpOutboundInboxStatus =
   | "delivered"
   | "answered"
   | "acknowledged"
-  | "failed";
+  | "failed"
+  | "obsolete";
 
 /** User answer attached to an MCP outbound inbox item. */
 export type McpOutboundInboxAnswer = {

@@ -121,11 +121,16 @@ describe("backend authoring public API", () => {
     const contexts: RoutineContext[] = [
       routineContext(),
       { ...routineContext(), routineResume: { delivery: "fresh-start" } },
-      {
-        ...routineContext(),
-        routineResume: { delivery: "rendered-context", message: "Continue" },
-      },
+      { ...routineContext(), routineResume: { delivery: "continue" } },
     ];
+    const invalidContinuationText = {
+      ...routineContext(),
+      routineResume: {
+        delivery: "continue",
+        // @ts-expect-error Continuation carries no connector text.
+        message: "Continue",
+      },
+    } satisfies RoutineContext;
     const invalidNative = {
       ...routineContext(),
       routineResume: {
@@ -145,6 +150,7 @@ describe("backend authoring public API", () => {
     expect(contexts).toHaveLength(3);
     void invalidNative;
     void invalidSessionMessage;
+    void invalidContinuationText;
   });
 
   it("keeps stock transport injection seams on the testing surface", () => {

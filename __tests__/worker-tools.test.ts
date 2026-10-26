@@ -2,8 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { EmitOutboundInputSchema } from "../src/backends/managed-worker-tools.js";
 import type { OutboundMessage } from "../src/testing.js";
-import { firstTaskWithArcHost, makeWorkerHub } from "./helpers.js";
-import { routineContext } from "./worker-hub-helpers.js";
+import {
+  makeArcHostWithSource,
+  makeWorkerHub,
+  waitFor,
+  WATCH_SOURCE,
+} from "./helpers.js";
+import { submitActivation } from "./worker-hub-helpers.js";
 
 describe("worker-facing effects", () => {
   it("requires an instruction-named audience for one-way outbound messages", () => {
@@ -19,7 +24,7 @@ describe("worker-facing effects", () => {
   });
 
   it("preserves ordinary backend metadata when askId is absent", async () => {
-    const { arcHost, task } = await firstTaskWithArcHost();
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const messages: OutboundMessage[] = [];
     const { workerHub } = makeWorkerHub({
       arcHost,
@@ -44,7 +49,8 @@ describe("worker-facing effects", () => {
       },
     );
 
-    await workerHub.handleTask(task, routineContext());
+    await submitActivation(workerHub, "start");
+    await waitFor(() => messages.length === 1);
 
     expect(messages).toEqual([
       expect.objectContaining({

@@ -1,17 +1,21 @@
+import { parse } from "@elem-app/arc/parser";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  InMemoryArcHostStore,
   InMemoryHistoryStore,
   type OutboundMessage,
   type RoleWorker,
 } from "../src/testing.js";
+import { makeControlledTime } from "./controlled-time.js";
 import {
   WATCH_SOURCE,
   makeArcHostWithSource,
   makeWorkerHub,
   waitFor,
 } from "./helpers.js";
-import { submitActivation } from "./worker-hub-helpers.js";
+import { createTestArcHost } from "./work-event-fixtures.js";
+import { drainLifecycle, submitActivation } from "./worker-hub-helpers.js";
 
 describe("Outbound situations and delivery", () => {
   it("stamps situation.role from the task and defaults audience to originator", async () => {
@@ -312,5 +316,219 @@ describe("WorkerHubService outbound handler tree", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+describe("WorkerHubService live ask listing", () => {
+  const ALL = { role: "*", audience: "*", cause: "*" } as const;
+
+  /** A researcher run whose worker holds one question and one permission ask. */
+  async function hubWithTwoAsks() {
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const dispatched: OutboundMessage[] = [];
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: {
+        researcher: async (_task, _context, effects) => {
+          await Promise.all([
+            effects.emit({
+              situation: { cause: "question" },
+              content: "Which source?",
+            }),
+            effects.requestPermission({
+              toolCallId: "tool:write",
+              toolName: "Write",
+              input: { file_path: "notes.txt" },
+            }),
+          ]);
+          return { outcome: "completed" };
+        },
+      },
+    });
+    workerHub.registerOutboundHandler(ALL, (message) => {
+      dispatched.push(message);
+    });
+    const arcRunId = await submitActivation(workerHub, "start");
+    await waitFor(() => dispatched.length === 2);
+    return { workerHub, arcRunId, dispatched };
+  }
+
+  it("out.live-asks lists live questions and permission asks in registration order", async () => {
+    const { workerHub, arcRunId, dispatched } = await hubWithTwoAsks();
+
+    expect(workerHub.listAsks(arcRunId, ALL)).toEqual(dispatched);
+    expect(
+      workerHub.listAsks(arcRunId, ALL).map((ask) => ask.situation.cause),
+    ).toEqual(["question", "permission-ask"]);
+    expect(
+      workerHub
+        .listAsks(arcRunId, ALL)
+        .every((ask) => typeof ask.metadata?.askId === "string"),
+    ).toBe(true);
+  });
+
+  it("out.live-asks matches situations with the exact-or-wildcard rule", async () => {
+    const { workerHub, arcRunId, dispatched } = await hubWithTwoAsks();
+    const [question, permission] = dispatched;
+
+    expect(
+      workerHub.listAsks(arcRunId, {
+        role: "researcher",
+        audience: "originator",
+        cause: "question",
+      }),
+    ).toEqual([question]);
+    expect(
+      workerHub.listAsks(arcRunId, {
+        role: "*",
+        audience: "permissionApprover",
+        cause: "*",
+      }),
+    ).toEqual([permission]);
+    expect(
+      workerHub.listAsks(arcRunId, {
+        role: "reviewer",
+        audience: "*",
+        cause: "*",
+      }),
+    ).toEqual([]);
+  });
+
+  it("out.live-asks omits other runs, settled asks, and asks disposed with their routine", async () => {
+    const arcHost = await makeArcHostWithSource(
+      "watch",
+      `"arc";
+function Watch() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "researcher" };
+  $instruct(\`Ask and wait.\`);
+  $instruct(\`Ask and leave.\`);
+}`,
+    );
+    const dispatched: OutboundMessage[] = [];
+    let invocation = 0;
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: {
+        researcher: async (_task, _context, effects) => {
+          invocation += 1;
+          const asked = effects.emit({
+            situation: { cause: "question" },
+            content: invocation === 1 ? "Wait for me?" : "Abandoned?",
+          });
+          if (invocation === 1) await asked;
+          else void asked.catch(() => undefined);
+          return { outcome: "completed" };
+        },
+      },
+    });
+    workerHub.registerOutboundHandler(ALL, (message) => {
+      dispatched.push(message);
+    });
+    const arcRunId = await submitActivation(workerHub, "start");
+    await waitFor(() => dispatched.length === 1);
+    expect(workerHub.listAsks(arcRunId, ALL)).toHaveLength(1);
+    expect(workerHub.listAsks("arc-run:other", ALL)).toEqual([]);
+
+    // Settling the first ask removes it; the second routine's ask is disposed
+    // when that routine ends without waiting for it.
+    await drainLifecycle(
+      workerHub.submitInbound({
+        arcRunId,
+        content: "yes",
+        metadata: { askId: dispatched[0]!.metadata?.askId },
+      }),
+    );
+    await waitFor(async () =>
+      (await workerHub.listWorkEvents(arcRunId)).some(
+        (event) => event.kind === "run:completed",
+      ),
+    );
+    expect(dispatched).toHaveLength(2);
+    expect(workerHub.listAsks(arcRunId, ALL)).toEqual([]);
+  });
+
+  it("out.live-asks omits asks released by supersession", async () => {
+    const time = makeControlledTime();
+    const arcHost = createTestArcHost({
+      store: new InMemoryArcHostStore(),
+      ...time,
+    });
+    await arcHost.registerArc(
+      "watch",
+      parse(`"arc";
+import Time from "host:time";
+function Watch() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "researcher" };
+  Time.$addTimeout(25);
+  $instruct(\`Ask and wait.\`);
+}`),
+    );
+    const dispatched: OutboundMessage[] = [];
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: {
+        researcher: async (_task, _context, effects) => {
+          await effects
+            .emit({ situation: { cause: "question" }, content: "Still there?" })
+            .catch(() => undefined);
+          return { outcome: "completed" };
+        },
+      },
+    });
+    workerHub.registerOutboundHandler(ALL, (message) => {
+      dispatched.push(message);
+    });
+    const arcRunId = await submitActivation(workerHub, "start");
+    await waitFor(() => dispatched.length === 1);
+    expect(workerHub.listAsks(arcRunId, ALL)).toHaveLength(1);
+
+    time.advanceTo(1025);
+    time.fireDue();
+    await waitFor(
+      async () =>
+        (await workerHub.getExecutionControlView(arcRunId)).status ===
+        "uncaught-interruption",
+    );
+    expect(workerHub.listAsks(arcRunId, ALL)).toEqual([]);
+  });
+
+  it("out.handler-settlement rejects an ask whose handler rejects delivery", async () => {
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    let rejection: string | undefined;
+    let askId: unknown;
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: {
+        researcher: async (_task, _context, effects) => {
+          await effects
+            .emit({ situation: { cause: "question" }, content: "Deliverable?" })
+            .catch((error: unknown) => {
+              rejection =
+                error instanceof Error ? error.message : String(error);
+            });
+          return { outcome: "completed" };
+        },
+      },
+    });
+    workerHub.registerOutboundHandler(ALL, (message) => {
+      askId = message.metadata?.askId;
+      throw new Error("delivery failed");
+    });
+
+    const arcRunId = await submitActivation(workerHub, "start");
+    await waitFor(() => rejection !== undefined);
+    expect(rejection).toBe("delivery failed");
+    expect(workerHub.listAsks(arcRunId, ALL)).toEqual([]);
+    await expect(
+      drainLifecycle(
+        workerHub.submitInbound({
+          arcRunId,
+          content: "too late",
+          metadata: { askId },
+        }),
+      ),
+    ).resolves.toEqual([expect.objectContaining({ kind: "rejected" })]);
   });
 });
