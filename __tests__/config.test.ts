@@ -28,6 +28,18 @@ describe("parseArcadeConfig", () => {
 });
 
 describe("parseAppConfig", () => {
+  it("rejects connector-owned configuration in the Arcade App", () => {
+    for (const config of [
+      { connectors: { mcp: {} } },
+      { connectors: { web: {} } },
+      { deliveryRules: [] },
+    ]) {
+      expect(() =>
+        parseAppConfig(JSON.stringify(config), "connector.jsonc"),
+      ).toThrow(/unrecognized key/i);
+    }
+  });
+
   it("leaves worker slots unbound when omitted", () => {
     const result = parseAppConfig("{}", "test.jsonc");
     expect(result.workers).toEqual({ roles: {} });
@@ -38,8 +50,6 @@ describe("parseAppConfig", () => {
       dataDir: ".arcade-data",
       arcsDir: ".arcade/arcs",
       workers: { roles: {} },
-      deliveryRules: [],
-      connectors: {},
       arcHost: { snapshotRuntimeCacheSize: 32 },
       logging: { level: "info", format: "json" },
     });
@@ -190,20 +200,9 @@ describe("parseAppConfig", () => {
     ).toThrow(/unrecognized key/i);
   });
 
-  it("validates connector, delivery, and secret sections", () => {
+  it("validates secret provider configuration", () => {
     const result = parseAppConfig(
       JSON.stringify({
-        connectors: {
-          mcp: { port: 8080 },
-          web: { host: "0.0.0.0", port: 3180 },
-        },
-        deliveryRules: [
-          {
-            situation: { role: "*", audience: "*", cause: "reply" },
-            delivery: "inbox",
-            target: { kind: "principal", id: "user-1" },
-          },
-        ],
         secrets: {
           provider: "env",
           env: { "openai.api_key": "ARCADE_OPENAI_API_KEY" },
@@ -211,16 +210,6 @@ describe("parseAppConfig", () => {
       }),
       "test.jsonc",
     );
-    expect(result.connectors.mcp).toEqual({
-      host: "127.0.0.1",
-      port: 8080,
-      path: "/mcp",
-      requirePrincipal: false,
-    });
-    expect(result.deliveryRules[0]?.target).toEqual({
-      kind: "principal",
-      id: "user-1",
-    });
     expect(result.secrets?.env).toEqual({
       "openai.api_key": "ARCADE_OPENAI_API_KEY",
     });
@@ -237,15 +226,6 @@ describe("parseAppConfig", () => {
       ),
     ).toThrow(/Environment variable names/);
   });
-
-  it("rejects non-integer connector ports", () => {
-    expect(() =>
-      parseAppConfig(
-        JSON.stringify({ connectors: { mcp: { port: 3.14 } } }),
-        "bad-port.jsonc",
-      ),
-    ).toThrow(/failed validation/);
-  });
 });
 
 describe("loadAppConfig", () => {
@@ -254,15 +234,6 @@ describe("loadAppConfig", () => {
     const result = await loadAppConfig(join(here, "..", "config.local.jsonc"));
     expect(result.workers.fastTrigger).toEqual({
       backend: "claude-sdk-tst",
-    });
-    expect(result.connectors).toEqual({
-      mcp: {
-        host: "127.0.0.1",
-        port: 3177,
-        path: "/mcp",
-        requirePrincipal: false,
-      },
-      web: { host: "127.0.0.1", port: 3180 },
     });
   });
 });

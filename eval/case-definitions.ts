@@ -134,24 +134,6 @@ export const CASES = {
     "resolves a semantic trigger with OpenAI",
     true,
   ),
-  mcpActiveRunChoice: definition(
-    "mcp-active-run-choice",
-    "selects an existing active run through MCP",
-    true,
-  ),
-  mcpWorkspaceDesignation: definition(
-    "mcp-workspace-designation",
-    "resolves a workspace handshake through MCP",
-    true,
-  ),
-  mcpDeflectedRunReentry: definition(
-    "mcp-deflected-run-reentry",
-    "re-enters a pinned deflected run through MCP",
-  ),
-  mcpMixedRunChoice: definition(
-    "mcp-mixed-run-choice",
-    "chooses deflected and fresh among mixed MCP candidates",
-  ),
 } as const;
 
 export const COMMUNICATION_CASES = [

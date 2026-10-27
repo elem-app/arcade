@@ -1,8 +1,13 @@
-import type { NodeRef, RuntimeIssue } from "@elem-app/arc/runtime";
+import type { NodeRef, PayloadValue, RuntimeIssue } from "@elem-app/arc/runtime";
 import type { InterruptionContext } from "@elem-app/arc/types";
 import type { ArcRunId } from "./core.js";
-import type { CapacityLimit, TransportLoss } from "./execution-control.js";
+import type {
+  CapacityLimit,
+  ExecutionControlView,
+  TransportLoss,
+} from "./execution-control.js";
 import type { HandshakeOutcome } from "./handshake.js";
+import type { HostModuleEffect } from "./host-module.js";
 import type { ToolEventInput } from "./routine.js";
 import type { InstructionIssue, TaskDisposition } from "./task.js";
 import type { RoutineTokenUsage } from "./token-usage.js";
@@ -77,10 +82,38 @@ export type PermissionBlockedEvent = RoutineEventEnvelope &
 export type BlockedEvent = QuestionBlockedEvent | PermissionBlockedEvent;
 
 /** Run-level execution-control activity. */
-export type ControlEvent = EventEnvelope & {
-  kind: `control:${"pause-requested" | "paused" | "resume-requested" | "resumed"}`;
-  routineId?: string;
-};
+export type ControlEvent = EventEnvelope &
+  (
+    | {
+        kind: `control:${"pause-requested" | "paused" | "resumed"}`;
+        routineId?: string;
+      }
+    | ({
+        /** Published after this park is readable through execution control. */
+        kind: "control:parked";
+      } & (
+        | Pick<
+            Extract<ExecutionControlView, { status: "capacity-limited" }>,
+            "status" | "capacityReason"
+          >
+        | Pick<
+            Extract<ExecutionControlView, { status: "transport-lost" }>,
+            "status" | "transportReason"
+          >
+        | Pick<
+            Extract<ExecutionControlView, { status: "internal-error" }>,
+            "status" | "error" | "failedAt"
+          >
+        | Pick<
+            Extract<ExecutionControlView, { status: "uncaught-interruption" }>,
+            "status" | "interruption"
+          >
+        | Pick<
+            Extract<ExecutionControlView, { status: "hub-restarted" }>,
+            "status"
+          >
+      ))
+  );
 
 /**
  * Run position activity: the walk entered or exited one Arc node, derived from
@@ -119,10 +152,28 @@ export type RunEvent = EventEnvelope &
       }
     | { kind: "run:completed" }
     | { kind: "run:deflected" }
+    /** Committed host handback; the hub's park follows separately. */
+    | { kind: "run:interrupted" }
     | {
         kind: "run:poisoned";
         issues: readonly RuntimeIssue[];
         instructionIssues: readonly InstructionIssue[];
+      }
+  );
+
+/** Host module activity for calls the module chose to publish. */
+export type HostModuleEvent = EventEnvelope & { hostCallId: string } & (
+    | {
+        kind: "host-module:call";
+        module: string;
+        target: string[];
+        operation: string;
+        /** Data published by the module; null publishes the call without data. */
+        publishedData: PayloadValue | null;
+      }
+    | {
+        kind: "host-module:effect";
+        outcome: HostModuleEffect["hostCallOutcome"]["kind"];
       }
   );
 
@@ -132,7 +183,10 @@ export type AskEvent = EventEnvelope & {
   askIds: readonly string[];
 };
 
-/** Originator-visible work activity emitted while an Arc run executes. */
+/**
+ * Originator-visible facts established before publication in their owning state
+ * domain. Consequences in other domains have separate completion events.
+ */
 export type WorkEvent =
   | AskEvent
   | RunEvent
@@ -140,4 +194,5 @@ export type WorkEvent =
   | ToolEvent
   | BlockedEvent
   | ControlEvent
+  | HostModuleEvent
   | NodeTransitionEvent;

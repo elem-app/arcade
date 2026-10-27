@@ -7,7 +7,7 @@ Arcade runs Arc scripts as durable, agent-oriented workflows. Use it when work n
 - Running Arc workflows as a local or hosted service.
 - Coordinating work across requesters, reviewers, operators, and agent roles.
 - Keeping long-running work inspectable through persisted run state, structured operator logs, and Work events.
-- Delivering inbound and outbound activity through connectors such as MCP and the web app connector.
+- Providing service APIs for application-owned inbound and outbound connectors.
 - Asking humans for decisions when a workflow reaches a question, permission request, or handoff point.
 - Discovering Arc bundles from workspaces before registering them with the running service.
 
@@ -19,7 +19,7 @@ Arcade runs Arc scripts as durable, agent-oriented workflows. Use it when work n
 - **Human interaction:** route asks, answers, permission decisions, and outbound messages through connector inboxes.
 - **Replay tools:** inspect, rewind, jump, and verify replay behavior for recorded runs.
 - **Workspace discovery:** scan configured working roots for Arcade workspaces and register discovered Arc bundles.
-- **Configurable operation:** configure storage, connectors, worker-slot bindings, and Arc directories through the Arcade config file; programmatic builders can register additional backend implementations.
+- **Configurable operation:** configure storage, worker-slot bindings, and Arc directories through the Arcade config file; programmatic builders can register additional backend implementations.
 
 ## Get Started
 
@@ -36,15 +36,15 @@ pnpm build
 ./dist/app.js
 ```
 
-Local development loads `.env` with Node's native `--env-file-if-exists` behavior before Arcade starts. Runtime configuration, including storage, connector, Arc directory, and agent backend settings, is documented in [docs/configuration.md](./docs/configuration.md).
+Local development loads `.env` with Node's native `--env-file-if-exists` behavior before Arcade starts. Runtime configuration, including storage, Arc directory, and agent backend settings, is documented in [docs/configuration.md](./docs/configuration.md).
 
-The `arcade` CLI is Arcade's opinionated local deployment. It creates file-backed stores, starts the Web and MCP connectors in the committed local configuration, and makes the `pi-agent`, `claude-sdk`, `claude-sdk-tst`, `openai-sdk`, and `openai-sdk-tst` implementations available to its configuration.
+The `arcade` CLI is Arcade's opinionated local deployment. It creates file-backed stores, registers the configured Arc directory, and makes the `pi-agent`, `claude-sdk`, `claude-sdk-tst`, `openai-sdk`, and `openai-sdk-tst` implementations available to its configuration.
 
 ## Programmatic Use
 
-Applications import the connector-free lifecycle and storage APIs from `arcade`. `startArcade(...)` installs only the implementations supplied through `backends`; it has no implicit provider or connector dependencies. The `arcade` executable owns the opinionated Web and MCP connector composition.
+Applications import the connector-free lifecycle and storage APIs from `arcade`. `startArcade(...)` installs only the implementations supplied through `backends`; it has no implicit provider or connector dependencies. Applications own their connector implementations, transports, authorization, and delivery policy. Arcade ships no built-in MCP server or browser UI.
 
-`startArcade(...)` initializes services without discovering or registering filesystem Arcs. The owning application calls `arcade.discovery.registerArcsFromWorkspace(...)` or `registerArcsFromDirectory(...)` when its deployment context is known. The `arcade` executable explicitly registers its configured directory before constructing connectors.
+`startArcade(...)` initializes services without discovering or registering filesystem Arcs. The owning application calls `arcade.discovery.registerArcsFromWorkspace(...)` or `registerArcsFromDirectory(...)` when its deployment context is known. The `arcade` executable explicitly registers its configured directory. Use the programmatic API to compose a user-facing application around the services.
 
 ```ts
 import {
@@ -78,7 +78,7 @@ Custom backend implementations import their contracts from `arcade`. Application
 - [Configuration](./docs/configuration.md)
 - [Service API reference](./docs/service-apis.md)
 - [Observability](./docs/observability.md)
-- [E2E and eval harnesses](./docs/e2e-eval.md)
+- [Testing and eval harnesses](./docs/e2e-eval.md)
 - [Host module implementation](./docs/host-modules/README.md)
 - [Audience host module](./docs/host-modules/audience.md)
 - [Time host module](./docs/host-modules/time.md)

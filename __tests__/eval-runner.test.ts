@@ -140,7 +140,7 @@ console.log(JSON.stringify(summary));
       debug: false,
     });
     expect(defaults).not.toHaveProperty("profile");
-    expect(defaults.targets).toHaveLength(5);
+    expect(defaults.targets).toHaveLength(4);
 
     expect(
       parseEvalInvocation(
@@ -175,10 +175,10 @@ console.log(JSON.stringify(summary));
     expect(() => parseEvalInvocation(["positional"])).toThrow();
   });
 
-  it("registers 33 unique case ids and disjoint smoke/extended plans", () => {
+  it("registers unique case ids and disjoint smoke/extended plans", () => {
     const cases = listEvalCases();
-    expect(cases).toHaveLength(33);
-    expect(new Set(cases.map((item) => item.id)).size).toBe(33);
+    expect(cases).toHaveLength(29);
+    expect(new Set(cases.map((item) => item.id)).size).toBe(29);
 
     const smoke = planEvalExecutions(invocation({ profile: "smoke" }), cases);
     const extended = planEvalExecutions(
@@ -186,9 +186,9 @@ console.log(JSON.stringify(summary));
       cases,
     );
     const all = planEvalExecutions(invocation(), cases);
-    expect(smoke.executions).toHaveLength(21);
-    expect(extended.executions).toHaveLength(36);
-    expect(all.executions).toHaveLength(57);
+    expect(smoke.executions).toHaveLength(19);
+    expect(extended.executions).toHaveLength(34);
+    expect(all.executions).toHaveLength(53);
     const smokeIds = new Set(
       smoke.executions.map((execution) => execution.caseId),
     );
@@ -480,13 +480,7 @@ console.log(JSON.stringify(summary));
 
 function invocation(overrides: Partial<EvalInvocation> = {}): EvalInvocation {
   return {
-    targets: [
-      "claude-sdk",
-      "openai-sdk",
-      "claude-sdk-tst",
-      "openai-sdk-tst",
-      "claude-mcp-client",
-    ],
+    targets: ["claude-sdk", "openai-sdk", "claude-sdk-tst", "openai-sdk-tst"],
     repetitions: 1,
     output: "/tmp/unused-eval-output",
     keep: false,

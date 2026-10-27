@@ -39,6 +39,7 @@ import {
   DEFLECTABLE_SOURCE,
   GREET_SOURCE,
   createCapturingLogger,
+  deferred,
   makeArcHost,
   makeArcHostWithSource,
   makeWorkerHub,
@@ -50,16 +51,235 @@ import {
   submitActivation,
 } from "./worker-hub-helpers.js";
 
+import { renderAgentSemanticText } from "../src/service/semantic-text-renderer.js";
 import { KeyedSerializer } from "../src/utils/keyed-serializer.js";
 import { makeControlledTime } from "./controlled-time.js";
 
 describe("Arc runs", () => {
+  it.each(["memory", "json"] as const)(
+    "follows captured activation receipts through reentry and restart without WorkEvents in %s storage",
+    async (storage) => {
+      const store =
+        storage === "memory"
+          ? new InMemoryArcHostStore()
+          : new JsonFileArcHostStore({
+              dir: await mkdtemp(join(tmpdir(), "activation-identity-")),
+            });
+      const host = await createTestArcHost({ store });
+      workEventsFor(host).close();
+      vi.spyOn(workEventsFor(host), "list").mockRejectedValue(
+        new Error("WorkEvent reads unavailable"),
+      );
+      await host.registerArc(
+        "identity",
+        parse(
+          '"arc"; function Main() { this.trigger = () => true; this.forgetfulEntry = true; $enter(Wait); function Wait() { this.guard = () => State.DEFLECTED; } }',
+        ),
+      );
+      const { workerHub } = makeWorkerHub({ arcHost: host });
+      try {
+        const first = workerHub.submitInbound({
+          content: "start",
+          metadata: { principal: ALICE_OWNER },
+        });
+        let runId = "";
+        await waitFor(async () => {
+          const [view] = await host.listRunViews();
+          if (view?.stage !== "actioning" || view.lifecycle !== "deflected")
+            return false;
+          runId = view.arcRunId;
+          return true;
+        });
+        for (const count of [1, 2, 3]) {
+          const channel = workerHub
+            .submitInbound({
+              content: "again",
+              metadata: { principal: ALICE_OWNER },
+            })
+            [Symbol.asyncIterator]();
+          const gate = (await channel.next()).value;
+          if (gate?.kind !== "handshake-required")
+            throw new Error("Expected reentry choice");
+          await expect(
+            workerHub.handshake(gate.handshakeId, {
+              runChoice: { action: "join", arcRunId: runId },
+            }),
+          ).resolves.toEqual({ status: "ok" });
+          expect((await channel.next()).value).toEqual({
+            kind: "activated",
+            arcRunId: runId,
+            reactivationCount: count,
+          });
+          expect((await channel.next()).done).toBe(true);
+          expect(await host.getRunView(runId)).toMatchObject({
+            stage: "actioning",
+            lifecycle: "deflected",
+            reactivationCount: count,
+          });
+        }
+        // The initial channel was buffered while three later activations settled.
+        expect(await drainLifecycle(first)).toEqual([
+          { kind: "activated", arcRunId: runId, reactivationCount: 0 },
+        ]);
+        await workerHub.stop();
+        await host.stop();
+        const restored = await createTestArcHost({ store });
+        workEventsFor(restored).close();
+        try {
+          expect(await restored.getRunView(runId)).toMatchObject({
+            lifecycle: "deflected",
+            reactivationCount: 3,
+          });
+          expect(await restored.listRunViews()).toEqual([
+            await restored.getRunView(runId),
+          ]);
+          expect(await restored.getRunView("missing")).toBeUndefined();
+          expect(
+            await restored.begin({
+              arcRunId: runId,
+              projectDialog: async () => ({
+                cursor: { user: 0, self: 0 },
+                lastTurns: [],
+              }),
+            }),
+          ).toEqual([]);
+        } finally {
+          await restored.stop();
+        }
+      } finally {
+        await workerHub.stop();
+        await host.stop();
+      }
+    },
+  );
+
+  it.each(["completed", "poisoned"] as const)(
+    "keeps buffered activation and join identities when a later activation becomes %s",
+    async (terminal) => {
+      const host = await createTestArcHost({
+        store: new InMemoryArcHostStore(),
+      });
+      workEventsFor(host).close();
+      await host.registerArc(
+        "association",
+        parse(
+          '"arc"; function Main() { this.trigger = () => true; this.forgetfulEntry = true; $enter(Wait); function Wait() { this.guard = () => { if (!judge("proceed")) return State.DEFLECTED; }; $instruct("finish"); } }',
+        ),
+      );
+      const release = deferred();
+      let guards = 0;
+      let working = false;
+      const { workerHub } = makeWorkerHub({
+        arcHost: host,
+        workers: {
+          [DEFAULT_WORKER_ROLE]: async (task) => {
+            if (task.kind === "semantic") {
+              const proceed = ++guards >= 3;
+              return {
+                outcome: "completed",
+                semantic: {
+                  judgments: Object.fromEntries(
+                    task.requests
+                      .filter((request) => request.kind === "judgment")
+                      .map((request) => [request.briefId, proceed]),
+                  ),
+                },
+              };
+            }
+            working = true;
+            await release.promise;
+            return terminal === "completed"
+              ? { outcome: "completed" }
+              : { error: "failed", code: "test", message: "failed" };
+          },
+        },
+      });
+      try {
+        const original = workerHub.submitInbound({
+          content: "start",
+          metadata: { principal: ALICE_OWNER },
+        });
+        let runId = "";
+        await waitFor(async () => {
+          const [view] = await host.listRunViews();
+          if (view?.stage !== "actioning" || view.lifecycle !== "deflected")
+            return false;
+          runId = view.arcRunId;
+          return true;
+        });
+        for (const count of [1, 2]) {
+          const channel = workerHub
+            .submitInbound({
+              content: "retry",
+              metadata: { principal: ALICE_OWNER },
+            })
+            [Symbol.asyncIterator]();
+          const gate = (await channel.next()).value;
+          if (gate?.kind !== "handshake-required")
+            throw new Error("Expected choice");
+          await workerHub.handshake(gate.handshakeId, {
+            runChoice: { action: "join", arcRunId: runId },
+          });
+          expect((await channel.next()).value).toEqual({
+            kind: "activated",
+            arcRunId: runId,
+            reactivationCount: count,
+          });
+          await waitFor(async () =>
+            count === 2
+              ? working
+              : (await host.getRunView(runId))?.stage === "actioning" &&
+                (await host.listRunViews()).some(
+                  (view) =>
+                    view.stage === "actioning" &&
+                    view.lifecycle === "deflected",
+                ),
+          );
+        }
+        const joinChannel = workerHub
+          .submitInbound({
+            content: "attach",
+            metadata: { principal: ALICE_OWNER },
+          })
+          [Symbol.asyncIterator]();
+        const gate = (await joinChannel.next()).value;
+        if (gate?.kind !== "handshake-required")
+          throw new Error("Expected active join choice");
+        await workerHub.handshake(gate.handshakeId, {
+          runChoice: { action: "join", arcRunId: runId },
+        });
+        release.resolve();
+        await waitFor(async () =>
+          (await host.listRunViews()).some(
+            (view) => view.stage === "actioning" && view.lifecycle === terminal,
+          ),
+        );
+        expect(await drainLifecycle(original)).toEqual([
+          { kind: "activated", arcRunId: runId, reactivationCount: 0 },
+        ]);
+        expect((await joinChannel.next()).value).toMatchObject({
+          kind: "joined",
+          arcRunId: runId,
+          reactivationCount: 2,
+        });
+        expect(await host.getRunView(runId)).toMatchObject({
+          lifecycle: terminal,
+          reactivationCount: 2,
+        });
+      } finally {
+        release.resolve();
+        await workerHub.stop();
+        await host.stop();
+      }
+    },
+  );
+
   it.each(["completed", "deflected", "poisoned"] as const)(
     "run.control-inactive preserves %s execution on targeted entry and reconstruction",
     async (lifecycle) => {
       const store = new InMemoryArcHostStore();
       const replayStore = new InMemoryReplayStore();
-      const host = createTestArcHost({ store, replayStore });
+      const host = await createTestArcHost({ store, replayStore });
       await host.registerArc(
         "inactive-entry",
         parse(
@@ -103,7 +323,7 @@ describe("Arc runs", () => {
       const write = vi.spyOn(store, "putState");
       const append = vi.spyOn(replayStore, "appendStep");
       const checkpoint = vi.spyOn(replayStore, "putCheckpoint");
-      const restarted = createTestArcHost({
+      const restarted = await createTestArcHost({
         store,
         replayStore,
         workEvents: workEventsFor(host),
@@ -151,7 +371,7 @@ describe("Arc runs", () => {
     const store = new InMemoryArcHostStore();
     const replayStore = new InMemoryReplayStore();
     const time = makeControlledTime();
-    const host = createTestArcHost({ store, replayStore, ...time });
+    const host = await createTestArcHost({ store, replayStore, ...time });
     await host.registerArc(
       "queued-entry",
       parse(
@@ -256,7 +476,7 @@ describe("Arc runs", () => {
 
   it("run.control-inactive retires failed execution while preserving terminal commit", async () => {
     const store = new InMemoryArcHostStore();
-    const host = createTestArcHost({ store });
+    const host = await createTestArcHost({ store });
     await host.registerArc(
       "failed-commit",
       parse(
@@ -313,7 +533,7 @@ describe("Arc runs", () => {
 
   it("lists live stages once with owner filtering and drops ephemeral views on restart without writes", async () => {
     const store = new InMemoryArcHostStore();
-    const host = createTestArcHost({ store });
+    const host = await createTestArcHost({ store });
     await host.registerArc(
       "live-views",
       parse(
@@ -335,14 +555,14 @@ describe("Arc runs", () => {
     expect(await host.listRunViews(ALICE_OWNER)).toHaveLength(1);
     expect(await host.listRunViews("other")).toEqual([]);
     expect(await store.getState(arcRunKey(step.arcRunId))).toBeUndefined();
-    const restarted = createTestArcHost({ store });
+    const restarted = await createTestArcHost({ store });
     expect(await restarted.listRunViews()).toEqual([]);
     expect(await restarted.getRunView(step.arcRunId)).toBeUndefined();
   });
 
   it("starts a scope:'arc' activation with a registered workspace path", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     const registeredWorkspacePath = "registered-stock-workspace";
     const expectedWorkspacePath = resolve(registeredWorkspacePath);
     await arcHost.registerArc(
@@ -374,7 +594,7 @@ describe("Arc runs", () => {
   it("persists a resolved workspace path for run-scoped activations", async () => {
     const artifactRoot = await mkdtemp(join(tmpdir(), "arcade-run-root-"));
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store, artifactRoot });
+    const arcHost = await createTestArcHost({ store, artifactRoot });
     await arcHost.registerArc(
       "stock-research",
       parse(GREET_SOURCE),
@@ -406,7 +626,7 @@ describe("Arc runs", () => {
 
   it("lists run views newest first, and across every owner when unfiltered", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("stock-research", parse(GREET_SOURCE));
     const dialog: Dialog = {
       cursor: { user: 1, self: 0 },
@@ -461,7 +681,7 @@ describe("Arc runs", () => {
 
   it("returns the workspace path and bundle for a run, live and from persisted state", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     const policy = {
       workspaceScope: "arc",
       bundle: { docs: "/srv/docs" },
@@ -491,7 +711,7 @@ describe("Arc runs", () => {
 
     // A fresh service over the same store holds no live session, so the same
     // question is answered from persisted run state instead.
-    const restarted = createTestArcHost({ store });
+    const restarted = await createTestArcHost({ store });
     await restarted.registerArc("stock-research", parse(GREET_SOURCE), policy, {
       workspacePath: "/tmp/alice-stock-workspace",
     });
@@ -505,7 +725,7 @@ describe("Arc runs", () => {
   it("reads workspace context from the live trigger session before run state exists", async () => {
     const artifactRoot = await mkdtemp(join(tmpdir(), "arcade-probe-root-"));
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store, artifactRoot });
+    const arcHost = await createTestArcHost({ store, artifactRoot });
     await arcHost.registerArc(
       "stock-research",
       parse(`
@@ -552,7 +772,7 @@ function Stock() {
     });
 
     // Without that live session the persisted branch has nothing to read.
-    const restarted = createTestArcHost({ store });
+    const restarted = await createTestArcHost({ store });
     await expect(
       restarted.getRunWorkspaceContext(trig.arcRunId),
     ).rejects.toThrow(/no workspace context/);
@@ -561,7 +781,7 @@ function Stock() {
   it("prunes an abandoned run workspace and keeps the live one", async () => {
     const artifactRoot = await mkdtemp(join(tmpdir(), "arcade-prune-live-"));
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store, artifactRoot });
+    const arcHost = await createTestArcHost({ store, artifactRoot });
     await arcHost.registerArc("stock-research", parse(GREET_SOURCE));
     const dialog: Dialog = {
       cursor: { user: 1, self: 0 },
@@ -592,7 +812,7 @@ function Stock() {
 
   it("keeps a workspace directory that fails any pruning guard", async () => {
     const artifactRoot = await mkdtemp(join(tmpdir(), "arcade-prune-guards-"));
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       artifactRoot,
     });
@@ -624,7 +844,7 @@ function Stock() {
 
   it("reports nothing pruned when the artifact root does not exist", async () => {
     const root = await mkdtemp(join(tmpdir(), "arcade-prune-absent-"));
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       artifactRoot: join(root, "never-created"),
     });
@@ -633,7 +853,7 @@ function Stock() {
   });
 
   it("returns idle when no registered Arc triggers for the dialog", async () => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     const dialog: Dialog = {
       cursor: { user: 0, self: 0 },
       lastTurns: [{ role: "user", message: "hello" }],
@@ -714,7 +934,7 @@ function Stock() {
   it("poisons a run when worker feedback reports failure", async () => {
     const store = new InMemoryArcHostStore();
     const { logger, records } = createCapturingLogger("info");
-    const arcHost = createTestArcHost({ store, logger });
+    const arcHost = await createTestArcHost({ store, logger });
     await arcHost.registerArc("greet", parse(GREET_SOURCE));
     const dialog: Dialog = {
       cursor: { user: 0, self: 0 },
@@ -778,7 +998,7 @@ function Stock() {
 
   it("keeps ready trigger work out of durable run state", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "ready",
       parse(`
@@ -813,7 +1033,7 @@ function CheckReady() {
 
   it("persists trigger deps with activated run state and run views", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArcs([
       {
         source: "main",
@@ -897,7 +1117,7 @@ function Helper() {
 }
 `;
     const nodeFloorStore = new InMemoryArcHostStore();
-    const nodeFloorHost = createTestArcHost({ store: nodeFloorStore });
+    const nodeFloorHost = await createTestArcHost({ store: nodeFloorStore });
     await nodeFloorHost.registerArcs([
       {
         source: "main",
@@ -933,7 +1153,7 @@ function Helper() {
     ).resolves.toEqual(expect.objectContaining({ contextIsolation: "node" }));
 
     const roleFloorStore = new InMemoryArcHostStore();
-    const roleFloorHost = createTestArcHost({ store: roleFloorStore });
+    const roleFloorHost = await createTestArcHost({ store: roleFloorStore });
     await roleFloorHost.registerArcs([
       {
         source: "main",
@@ -970,7 +1190,7 @@ function Helper() {
   });
 
   it("promotes a node host parameter and keeps its action semantic task node-local", async () => {
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
     });
     await arcHost.registerArc(
@@ -1031,7 +1251,7 @@ function Main() {
 }
 `;
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("policy-replacement", parse(source), {
       workspaceScope: "run",
       bundle: {},
@@ -1076,7 +1296,7 @@ function Main() {
   });
 
   it("surfaces artifact instruction text as structured SemanticText", async () => {
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
     });
     await arcHost.registerArc(
@@ -1116,7 +1336,7 @@ function Main() {
   });
 
   it("counts unique artifact paths as action briefs emit them", async () => {
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
     });
     await arcHost.registerArc(
@@ -1177,7 +1397,7 @@ function Main() {
 
   it("keeps one artifact path reachable across writer and reader nodes", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "arcade-artifacts-"));
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
     });
     await arcHost.registerArc(
@@ -1271,7 +1491,7 @@ function Main() {
   });
 
   it("returns idle when beginning a run without state or trigger match", async () => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
 
     const begun = await arcHost.begin({
@@ -1285,7 +1505,7 @@ function Main() {
   it("re-yields unacknowledged instruction work from durable JSON state after restart", async () => {
     const dir = await mkdtemp(join(tmpdir(), "arcade-host-"));
     const store = new JsonFileArcHostStore({ dir });
-    const first = createTestArcHost({ store });
+    const first = await createTestArcHost({ store });
     await first.registerArc("greet", parse(GREET_SOURCE));
     const dialog: Dialog = {
       cursor: { user: 0, self: 0 },
@@ -1293,7 +1513,7 @@ function Main() {
     };
     const activated = await beginActivatedView(first, dialog);
 
-    const second = createTestArcHost({ store });
+    const second = await createTestArcHost({ store });
     const restored = await beginView(second, activated.arcRunId, dialog);
 
     expect(restored.status).toBe("ready");
@@ -1330,7 +1550,7 @@ function Main() {
 
   it("restores a postcheck frontier without redispatching its instruction", async () => {
     const store = new InMemoryArcHostStore();
-    const first = createTestArcHost({ store });
+    const first = await createTestArcHost({ store });
     await first.registerArc(
       "persistent-restart",
       parse(`
@@ -1369,7 +1589,7 @@ function Main() {
     ]);
     expect(postcheck.briefs.judgments).toHaveLength(1);
 
-    const second = createTestArcHost({ store });
+    const second = await createTestArcHost({ store });
     const restored = await beginView(second, activated.arcRunId, dialog);
     expect(restored.briefs.instructions).toEqual(postcheck.briefs.instructions);
     expect(restored.briefs.judgments).toEqual(postcheck.briefs.judgments);
@@ -1402,7 +1622,7 @@ function Main() {
   it("logs begun and committed lifecycle events for a run", async () => {
     const store = new InMemoryArcHostStore();
     const { logger, records } = createCapturingLogger("info");
-    const arcHost = createTestArcHost({ store, logger });
+    const arcHost = await createTestArcHost({ store, logger });
     await arcHost.registerArc("greet", parse(GREET_SOURCE));
     const driver = await beginActivatedDriver(arcHost, {
       cursor: { user: 0, self: 0 },
@@ -1432,7 +1652,7 @@ function Main() {
 
   it("does not choose a workspace handshake from ambiguous trigger deps", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "scratchpad",
       parse(`
@@ -1486,7 +1706,7 @@ function Stock() {
     // caller's policy, not silently regress to "first". Two always-matching arcs
     // with registered workspaces activate directly under policy "all".
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "alpha",
       parse(`
@@ -1559,7 +1779,7 @@ function Beta() {
 
   it("carries distinct execution and preparation identities across a mixed fan-out", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "ready",
       parse(`
@@ -1614,7 +1834,7 @@ function Gated() {
 
   it("uses registered workspace for a trigger-stage fresh activation", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "scratchpad",
       parse(`
@@ -1713,7 +1933,7 @@ function Stock() {
 
   it("closes unresolved trigger activation when semantic trigger work fails", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "scratchpad",
       parse(`
@@ -1774,7 +1994,7 @@ function Stock() {
   it("trigger-plans and re-enters a deflected run under the same id", async () => {
     const store = new InMemoryArcHostStore();
     const replay = new InMemoryReplayStore();
-    const arcHost = createTestArcHost({ store, replayStore: replay });
+    const arcHost = await createTestArcHost({ store, replayStore: replay });
     await arcHost.registerArc(
       "wait",
       parse(`"arc";
@@ -1868,7 +2088,7 @@ function Main() {
   it("ignores and replaces an uncommitted reactivation after re-entry fails", async () => {
     const store = new InMemoryArcHostStore();
     const replay = new InMemoryReplayStore();
-    const arcHost = createTestArcHost({ store, replayStore: replay });
+    const arcHost = await createTestArcHost({ store, replayStore: replay });
     await arcHost.registerArc(
       "failed-reentry",
       parse(`"arc";
@@ -1954,7 +2174,7 @@ function Main() {
   it("serializes concurrent re-entry of the same deflected run", async () => {
     const store = new InMemoryArcHostStore();
     const replay = new InMemoryReplayStore();
-    const arcHost = createTestArcHost({ store, replayStore: replay });
+    const arcHost = await createTestArcHost({ store, replayStore: replay });
     await arcHost.registerArc(
       "concurrent-reentry",
       parse(`"arc";
@@ -2013,7 +2233,7 @@ function Main() {
   function Wait() { this.guard = () => State.DEFLECTED; }
 }`;
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("watch", parse(source("old")));
     const oldDialog: Dialog = {
       cursor: { user: 1, self: 0 },
@@ -2070,7 +2290,7 @@ function Main() {
   function Wait() { this.guard = () => State.DEFLECTED; }
 }`;
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("both-match", parse(source("revision one")));
     const dialog: Dialog = {
       cursor: { user: 1, self: 0 },
@@ -2115,7 +2335,7 @@ function Main() {
   function Wait() { this.guard = () => State.DEFLECTED; }
 }`;
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("replacement-only", parse(source("old")));
     const oldDialog: Dialog = {
       cursor: { user: 1, self: 0 },
@@ -2154,7 +2374,7 @@ function Pinned() {
   function Wait() { this.guard = () => State.DEFLECTED; }
 }`;
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("pinned-order", parse(deflectedSource(true)));
     const dialog: Dialog = {
       cursor: { user: 1, self: 0 },
@@ -2206,7 +2426,7 @@ function Fresh() {
 
   it("finalizes a concurrently settled activation batch only once", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "semantic-race",
       parse(`"arc";
@@ -2286,7 +2506,7 @@ function Main() {
     for (const retiringReport of retiringReports)
       for (const retiringFirst of [true, false]) {
         const store = new InMemoryArcHostStore();
-        const arcHost = createTestArcHost({ store });
+        const arcHost = await createTestArcHost({ store });
         await arcHost.registerArc(
           "failed-batch",
           parse(`"arc";
@@ -2365,7 +2585,7 @@ function Main() {
   $instruct("${label}");
 }`;
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     const v1 = parse(source("revision one"));
     await arcHost.registerArc("snapshot-race", v1);
     const dialog: Dialog = {
@@ -2410,8 +2630,49 @@ function Main() {
     });
   });
 
+  it("keeps a deleted fresh probe unavailable after source re-registration", async () => {
+    const host = await createTestArcHost({ store: new InMemoryArcHostStore() });
+    const document = parse(
+      '"arc"; function Main() { this.trigger = () => judge("Start?"); $instruct("Work"); }',
+    );
+    await host.registerArc("deleted-probe", document);
+    const dialog: Dialog = {
+      cursor: { user: 1, self: 0 },
+      lastTurns: [{ role: "user", message: "start" }],
+    };
+    const probe = expectSoleTrigger(
+      await beginActivation(host, dialog, {
+        inbound: inboundFromDialog(dialog),
+        principal: ALICE_OWNER,
+      }),
+    );
+    await host.registerArcs([{ source: "deleted-probe", delete: true }]);
+    await host.registerArc("deleted-probe", document);
+    const steps = await host.advanceTrigger(probe.arcRunId, dialog, {
+      instructionCoverage: {},
+      projectDialog: projectorFor(dialog),
+      reports: [
+        {
+          outcome: "completed",
+          semantic: {
+            judgments: { [probe.frontier.briefs.judgments[0]!.id]: true },
+          },
+        },
+      ],
+    });
+    expect(steps).toEqual([
+      {
+        kind: "rejected",
+        arcRef: "arc:deleted-probe:Main",
+        reason: expect.stringContaining("unavailable"),
+      },
+    ]);
+    expect(await host.listRunViews()).toEqual([]);
+    await host.stop();
+  });
+
   it("expires unresolved activation probes without later activating them", async () => {
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       activationBatchTtlMs: 5,
     });
@@ -2500,7 +2761,7 @@ describe("worker dispositions", () => {
   async function activate(source: string) {
     const store = new InMemoryArcHostStore();
     const { logger, records } = createCapturingLogger("info");
-    const arcHost = createTestArcHost({ store, logger });
+    const arcHost = await createTestArcHost({ store, logger });
     await arcHost.registerArc("dispositions", parse(source));
     const driver = await beginActivatedDriver(arcHost, dialog);
     return { arcHost, store, records, driver };
@@ -2544,7 +2805,7 @@ function Main() {
       }),
     ]);
 
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc(
       "trigger",
       parse(`"arc";
@@ -2840,4 +3101,191 @@ function Main() {
       expect.objectContaining({ reports: [interrupt("external")] }),
     ]);
   });
+});
+
+describe("pinned source manifests", () => {
+  const dialog: Dialog = {
+    cursor: { user: 1, self: 0 },
+    lastTurns: [{ role: "user", message: "start" }],
+  };
+  const policy = (path: string) => ({
+    workspaceScope: "run" as const,
+    contextIsolation: "role" as const,
+    bundle: { "guide/": path },
+  });
+
+  it("retains root bundle rendering through replacement deletion and reconstruction", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "arcade-pinned-manifest-"));
+    const store = new JsonFileArcHostStore({ dir });
+    const host = await createTestArcHost({ store });
+    const root = parse(
+      '"arc"; import { Work } from "imported"; function Main() { this.trigger = () => true; $enter(Work); }',
+    );
+    const imported = parse(
+      '"arc"; function Work() { let guide = Artifact("guide/readme.md"); $instruct("First"); $enter(Next); function Next() { $instruct(`Read ${guide}.`); } }',
+    );
+    await host.registerArcs([
+      {
+        source: "root",
+        document: root,
+        manifest: policy("/tmp/original-bundle"),
+      },
+      {
+        source: "imported",
+        document: imported,
+        manifest: policy("/tmp/imported-bundle"),
+      },
+    ]);
+    const driver = await beginActivatedDriver(host, dialog);
+    const original = await host.getRunWorkspaceContext(driver.arcRunId);
+    await host.registerArc("root", root, policy("/tmp/replacement-bundle"), {
+      replace: true,
+    });
+    expect(await host.getRunWorkspaceContext(driver.arcRunId)).toEqual(
+      original,
+    );
+    await host.registerArcs([
+      { source: "root", delete: true },
+      { source: "imported", delete: true },
+    ]);
+    expect(await host.getRunWorkspaceContext(driver.arcRunId)).toEqual(
+      original,
+    );
+    const next = (
+      await driver.advance({
+        dialog,
+        input: {
+          instructionCoverage: Object.fromEntries(
+            driver.frontier.briefs.instructions.map((item) => [
+              item.id,
+              "applied" as const,
+            ]),
+          ),
+          reports: [],
+        },
+      })
+    ).driver;
+    const task = next.frontier.tasks[0]!;
+    if (task.kind !== "instruction")
+      throw new Error("Expected imported instruction");
+    expect(
+      renderAgentSemanticText(
+        task.texts[0]!,
+        await host.getRunWorkspaceContext(driver.arcRunId),
+        { kind: "host" },
+      ).text,
+    ).toContain("/tmp/original-bundle/readme.md");
+    await host.registerArcs([
+      { source: "root", document: root, manifest: policy("/tmp/new-bundle") },
+      {
+        source: "imported",
+        document: imported,
+        manifest: policy("/tmp/imported-new"),
+      },
+    ]);
+    const fresh = expectSoleDriver(
+      await host.begin({
+        dialog,
+        inbound: { content: "start" },
+        principal: "another-owner",
+        projectDialog: projectorFor(dialog),
+      }),
+    );
+    expect(
+      (await host.getRunWorkspaceContext(fresh.arcRunId)).workspaceBundle,
+    ).toEqual(policy("/tmp/new-bundle").bundle);
+    expect(await host.getRunWorkspaceContext(driver.arcRunId)).toEqual(
+      original,
+    );
+    await host.stop();
+    const restarted = await createTestArcHost({
+      store: new JsonFileArcHostStore({ dir }),
+    });
+    const resumed = await beginView(restarted, driver.arcRunId, dialog);
+    const resumedTask = resumed.tasks[0]!;
+    if (resumedTask.kind !== "instruction")
+      throw new Error("Expected resumed instruction");
+    expect(
+      renderAgentSemanticText(
+        resumedTask.texts[0]!,
+        await restarted.getRunWorkspaceContext(driver.arcRunId),
+        { kind: "host" },
+      ).text,
+    ).toContain("/tmp/original-bundle/readme.md");
+    await restarted.stop();
+  });
+
+  it.each(["trigger", "workspace"] as const)(
+    "pins document and manifest together across a pending %s replacement",
+    async (pending) => {
+      const store = new InMemoryArcHostStore();
+      const host = await createTestArcHost({ store });
+      const document = parse(
+        `"arc"; function Main() { this.trigger = () => ${pending === "trigger" ? 'judge("Start?")' : "true"}; $instruct("Original document"); }`,
+      );
+      await host.registerArc("source", document, {
+        workspaceScope: pending === "workspace" ? "arc" : "run",
+        contextIsolation: "node",
+        bundle: { "guide/": "/tmp/original-manifest" },
+      });
+      const [gate] = await host.begin({
+        dialog,
+        inbound: { content: "start" },
+        principal: ALICE_OWNER,
+        projectDialog: projectorFor(dialog),
+      });
+      await host.registerArc(
+        "source",
+        parse(
+          '"arc"; function Main() { this.trigger = () => true; $instruct("Replacement document"); }',
+        ),
+        {
+          workspaceScope: "run",
+          contextIsolation: "role",
+          bundle: { "guide/": "/tmp/replacement-manifest" },
+        },
+        { replace: true },
+      );
+      let activated;
+      if (gate?.kind === "trigger") {
+        expect(
+          (await host.getRunWorkspaceContext(gate.arcRunId)).workspaceBundle,
+        ).toEqual({ "guide/": "/tmp/original-manifest" });
+        activated = expectSoleDriver(
+          await host.advanceTrigger(gate.arcRunId, dialog, {
+            projectDialog: projectorFor(dialog),
+            instructionCoverage: {},
+            reports: [
+              {
+                outcome: "completed",
+                semantic: {
+                  judgments: { [gate.frontier.briefs.judgments[0]!.id]: true },
+                },
+              },
+            ],
+          }),
+        );
+      } else if (gate?.kind === "handshake") {
+        const result = await host.resolveHandshake(
+          gate.handshakeId,
+          { workspace: "/tmp/original-workspace" },
+          { projectDialog: projectorFor(dialog) },
+        );
+        if (result.status !== "ok" || result.step.kind !== "action")
+          throw new Error("Expected activated handshake");
+        activated = result.step;
+      } else throw new Error("Expected pending activation");
+      expect(activated.frontier.tasks[0]).toMatchObject({
+        texts: ["Original document"],
+        contextIsolation: "node",
+      });
+      const workspace = await host.getRunWorkspaceContext(activated.arcRunId);
+      expect(workspace.workspaceBundle).toEqual({
+        "guide/": "/tmp/original-manifest",
+      });
+      if (pending === "workspace")
+        expect(workspace.workspacePath).toBe("/tmp/original-workspace");
+      await host.stop();
+    },
+  );
 });

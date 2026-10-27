@@ -45,25 +45,9 @@
     },
   },
 
-  // -- Connectors --
-  // Adding a connector section enables its listener.
-  "connectors": {
-    "web": {
-      "host": "127.0.0.1", // Use "0.0.0.0" only to accept non-loopback traffic.
-      "port": 3180, // Bind port.
-    },
-
-    "mcp": {
-      "host": "127.0.0.1", // Use "0.0.0.0" only to accept non-loopback traffic.
-      "port": 3177, // Bind port.
-      "path": "/mcp", // HTTP path for the MCP endpoint.
-      "requirePrincipal": false, // Require arcade.principal metadata on submissions.
-    },
-  },
-
   // -- Arc host --
   // "arcHost": {
-  //   "snapshotRuntimeCacheSize": 32    // Max Arc runtime snapshots cached in memory (0 disables).
+  //   "snapshotRuntimeCacheSize": 32    // Max entries per snapshot-data/runtime cache (0 disables retention).
   // },
 
   // -- Logging --
@@ -71,34 +55,4 @@
   //   "level": "info",                  // "silent" | "info" | "debug"
   //   "format": "json"                  // "json" | "pretty"
   // },
-
-  // -- Delivery rules --
-  // Route outbound messages by matching role, audience, and cause.
-  // "elicitation" asks a connected client synchronously; "inbox" stores the message
-  // for asynchronous delivery. Target "activator" selects the connection that started
-  // the run; target "principal" selects a fixed principal id.
-  "deliveryRules": [
-    // Ask the activating client to approve worker permission requests.
-    {
-      "situation": {
-        "role": "*",
-        "audience": "permissionApprover",
-        "cause": "permission-ask",
-      },
-      "delivery": "elicitation",
-      "target": { "kind": "activator" },
-    },
-    // Ask the activating client to answer agent questions.
-    {
-      "situation": { "role": "*", "audience": "*", "cause": "question" },
-      "delivery": "elicitation",
-      "target": { "kind": "activator" },
-    },
-    // Store agent replies in the activating client's inbox.
-    {
-      "situation": { "role": "*", "audience": "*", "cause": "reply" },
-      "delivery": "inbox",
-      "target": { "kind": "activator" },
-    },
-  ],
 }

@@ -163,8 +163,18 @@ export type OutboundMessage = {
  *   pushes its follow-on events back onto the same channel.
  */
 export type InboundLifecycleEvent =
-  | { kind: "activated"; arcRunId: ArcRunId; arcRef?: ArcRef }
-  | { kind: "joined"; arcRunId: ArcRunId; arcRef?: ArcRef }
+  | {
+      kind: "activated";
+      arcRunId: ArcRunId;
+      reactivationCount: number;
+      arcRef?: ArcRef;
+    }
+  | {
+      kind: "joined";
+      arcRunId: ArcRunId;
+      reactivationCount: number;
+      arcRef?: ArcRef;
+    }
   | { kind: "continued"; arcRunId: ArcRunId }
   | { kind: "rejected"; reason: string; arcRef?: ArcRef }
   | { kind: "failed"; arcRunId: ArcRunId; routineId: string; reason: string }

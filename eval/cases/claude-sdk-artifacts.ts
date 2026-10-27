@@ -25,7 +25,6 @@ import type { WorkerHubService } from "../../src/service/worker-hub.js";
 import {
   InMemoryArcHostStore,
   InMemoryHistoryStore,
-  InMemoryMcpOutboundInboxStore,
   InMemoryWorkerHubStore,
   InMemoryWorkEventStore,
 } from "../../src/storage/in-memory.js";
@@ -91,7 +90,6 @@ defineManagedEvalGroup(
         routineDiagnosticsStore: new FileRoutineDiagnosticsStore(
           join(root, "routine-diagnostics"),
         ),
-        mcpInboxStore: new InMemoryMcpOutboundInboxStore(),
         connectorFactory: ({ workerHub }) => {
           connector = new EvalConnector(workerHub);
           return [connector];
@@ -176,7 +174,6 @@ defineManagedEvalGroup(
         routineDiagnosticsStore: new FileRoutineDiagnosticsStore(
           join(root, "routine-diagnostics"),
         ),
-        mcpInboxStore: new InMemoryMcpOutboundInboxStore(),
         connectorFactory: ({ workerHub }) => {
           connector = new PermissionEvalConnector(workerHub);
           return [connector];

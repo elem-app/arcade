@@ -259,15 +259,15 @@ function CheckReady() {
 
 export const EMPTY_SOURCE = `"arc";`;
 
-export function makeArcHost(): ArcHostService {
-  return createTestArcHost({ store: new InMemoryArcHostStore() });
+export async function makeArcHost(): Promise<ArcHostService> {
+  return await createTestArcHost({ store: new InMemoryArcHostStore() });
 }
 
 export async function makeArcHostWithSource(
   sourceName: string,
   source: string,
 ): Promise<ArcHostService> {
-  const arcHost = makeArcHost();
+  const arcHost = await makeArcHost();
   await arcHost.registerArc(sourceName, parse(source));
   return arcHost;
 }
@@ -392,7 +392,7 @@ export async function firstTaskWithArcHost(): Promise<{
   task: InstructionTask;
 }> {
   const store = new InMemoryArcHostStore();
-  const arcHost = createTestArcHost({ store });
+  const arcHost = await createTestArcHost({ store });
   await arcHost.registerArc("watch", parse(WATCH_SOURCE));
   const dialog = {
     cursor: { user: 0, self: 0 },
@@ -452,7 +452,13 @@ function stubLifecycleEvents(
   switch (receipt.status) {
     case "activated":
       return receipt.arcRunId
-        ? [{ kind: "activated", arcRunId: receipt.arcRunId }]
+        ? [
+            {
+              kind: "activated",
+              reactivationCount: 0,
+              arcRunId: receipt.arcRunId,
+            },
+          ]
         : [];
     case "handshake-required": {
       const requirement = receipt.handshakeRunCandidates

@@ -82,9 +82,9 @@ import {
 import type {
   ActivationPolicy,
   AdvanceInput,
+  ArcDocumentRecord,
   ArcDocumentSnapshot,
   ArcHostStep,
-  ArcManifest,
   ArcRunState,
   ArcRunView,
   BeginInput,
@@ -94,6 +94,7 @@ import type {
   RunFrontier,
   RunTransition,
 } from "../types/host.js";
+import { parseArcManifest, type ArcManifest } from "../types/manifest.js";
 import {
   handoffCheckpoint,
   type ActionReplayPosition,
@@ -141,13 +142,23 @@ const DEFAULT_ARC_MANIFEST: ArcManifest = {
 };
 
 /** One document update committed as part of an Arc registration transaction. */
-export type ArcRegistrationInput = {
-  source: string;
-  document: Document;
-  manifest?: ArcManifest;
-  workspacePath?: string;
-  replace?: boolean;
-};
+export type ArcRegistrationInput =
+  | {
+      source: string;
+      document: Document;
+      manifest?: ArcManifest;
+      workspacePath?: string;
+      replace?: boolean;
+      delete?: never;
+    }
+  | {
+      source: string;
+      delete: true;
+      document?: never;
+      manifest?: never;
+      workspacePath?: never;
+      replace?: never;
+    };
 
 /**
  * Arc node metadata.
@@ -155,12 +166,19 @@ export type ArcRegistrationInput = {
 export type NodeInfo = { name: string; description?: string };
 
 type RegisteredArc = {
+  availability: { available: boolean };
   source: string;
   identifier: string;
   document: Document;
   documentRecordId: string;
   manifest: ArcManifest;
   workspacePath?: string;
+};
+
+/** Detached immutable storage material shared by runtime and manifest reads. */
+type SnapshotData = {
+  snapshot: ArcDocumentSnapshot;
+  recordsBySource: ReadonlyMap<string, ArcDocumentRecord>;
 };
 
 type ArcRunRuntimeState = {
@@ -200,7 +218,11 @@ type TriggerPlanResult =
     };
 
 type TriggerProbeOrigin =
-  | { kind: "fresh"; recordIds: ReadonlyMap<string, string> }
+  | {
+      kind: "fresh";
+      recordIds: ReadonlyMap<string, string>;
+      arcs: ReadonlyMap<ArcRef, RegisteredArc>;
+    }
   | {
       kind: "deflected";
       state: ArcRunState;
@@ -249,21 +271,28 @@ type LiveArcSession =
 
 type PlannedRunStartResult =
   | { kind: "idle" }
-  | { kind: "invalid"; reason: string }
+  | { kind: "invalid"; reason: string; unavailable?: boolean }
   | { kind: "trigger"; arcRunId: ArcRunId; frontier: RunFrontier }
-  | { kind: "matched"; arcRunId: ArcRunId; frontier: RunFrontier };
+  | {
+      kind: "matched";
+      arcRunId: ArcRunId;
+      frontier: RunFrontier;
+      reactivationCount: number;
+    };
 
 type PreparationOperation = {
   entry?: Extract<LiveArcSession, { kind: "preparing" }>;
   arcRunId?: ArcRunId;
 };
 
+/** A captured fresh selection whose root registration has been removed. */
+class FreshActivationUnavailable extends Error {}
+
 type RunEventCollection = {
   start?: Extract<CreateWorkEventInput, { kind: "run:started" }>;
   staged: CreateWorkEventInput[];
   committed: CreateWorkEventInput[];
   onCommit: (() => void)[];
-  publications?: Promise<unknown>[];
 };
 
 type LiveAction = {
@@ -274,6 +303,7 @@ type LiveAction = {
 
 type ActionSession = {
   kind: "actioning";
+  reactivationCount: number;
   generation: string;
   preparation?: Extract<LiveArcSession, { kind: "preparing" }>;
   admissionId?: string;
@@ -317,9 +347,10 @@ export type ArcHostServiceOptions = {
   /** Optional pending-handshake store for `workspaceScope: "arc"` activations. */
   handshakes?: HandshakeStore;
   /**
-   * Maximum number of immutable snapshot runtimes to keep in memory.
+   * Maximum completed entries in each of the snapshot-data and runtime caches.
    *
-   * Defaults to 32. Set to 0 to disable runtime caching.
+   * Defaults to 32 per cache. Set to 0 to retain neither; concurrent reads of
+   * one snapshot can still share their in-flight data load.
    */
   snapshotRuntimeCacheSize?: number;
   /** Maximum lifetime of an unresolved multi-probe activation batch. */
@@ -361,19 +392,30 @@ export class ArcHostService {
   readonly #frontierIds = new WeakMap<object, string>();
   readonly #moduleExecutions = new Map<ArcRunId, ModuleExecution>();
   #stopped = false;
-  readonly #committedControlBriefs = new WeakSet<ActionBrief>();
+  readonly #committedControlBriefs = new WeakSet<ActionBrief | TerminalBrief>();
   readonly #store: ArcHostStore;
   readonly #executionControl: Pick<WorkerHubStore, "getExecutionControl">;
   readonly #workEvents: WorkEventService;
   readonly #logger: ArcadeLogger;
   #latestRuntime = new Runtime().init();
   readonly #snapshotRuntimes = new Map<ArcDocumentSnapshotId, Runtime>();
+  readonly #snapshotData = new Map<ArcDocumentSnapshotId, SnapshotData>();
+  readonly #snapshotLoads = new Map<
+    ArcDocumentSnapshotId,
+    Promise<SnapshotData>
+  >();
   readonly #arcs = new Map<ArcRef, RegisteredArc>();
   readonly #hostModules = new Map<string, HostModule>();
   readonly #latestDocumentRecordIds = new Map<string, string>();
+  readonly #registryMutations = new KeyedSerializer<"registry">();
+  readonly #freshRegistrations = new WeakMap<
+    PendingTriggerSelection,
+    RegisteredArc
+  >();
   readonly #liveSessions = new Map<string, LiveArcSession>();
   readonly #activationBatches = new Map<string, ActivationBatch>();
   readonly #reentrySerializer = new KeyedSerializer<ArcRunId>();
+  readonly #handshakeResolutions = new KeyedSerializer<string>();
   readonly #artifactRoot: string;
   readonly #handshakes: HandshakeStore;
   readonly #replayStore: ReplayStore | undefined;
@@ -400,9 +442,10 @@ export class ArcHostService {
       1,
       Math.trunc(opts.activationBatchTtlMs ?? DEFAULT_ACTIVATION_BATCH_TTL_MS),
     );
-    this.registerHostModule("audience", {
-      declaration: audienceDeclaration,
+    this.#hostModules.set("audience", {
+      declaration: structuredClone(audienceDeclaration),
     });
+    this.#latestRuntime = this.#buildRuntime(new Map());
   }
 
   /** Abort host module resources before waiting for in-flight host operations. */
@@ -434,7 +477,7 @@ export class ArcHostService {
     if (this.#stopped) throw new Error("The arc host has stopped.");
     this.#moduleExecutions.set(
       arcRunId,
-      new ModuleExecution(arcRunId, action, this.#hostModules),
+      new ModuleExecution(arcRunId, action, this.#hostModules, this.#logger),
     );
   }
 
@@ -489,12 +532,16 @@ export class ArcHostService {
     return session?.kind === "actioning" ? session : undefined;
   }
 
-  async #newActionSession(arcRunId: ArcRunId): Promise<ActionSession> {
+  async #newActionSession(
+    arcRunId: ArcRunId,
+    reactivationCount: number,
+  ): Promise<ActionSession> {
     const previous = this.#liveSessions.get(arcRunKey(arcRunId));
     await this.#openModuleExecution(arcRunId, true);
     const session: ActionSession = {
       kind: "actioning",
       generation: randomUUID(),
+      reactivationCount,
       phase: { kind: "starting" },
       preparation: previous?.kind === "preparing" ? previous : undefined,
     };
@@ -552,8 +599,8 @@ export class ArcHostService {
     arcRunId: ArcRunId,
     frontierId: string,
     operation: () => Promise<RunFrontier>,
-  ): Promise<RunFrontier> {
-    return this.#actionMutations.run(arcRunId, () => {
+  ): Promise<Extract<ArcHostStep, { kind: "action" }>> {
+    return this.#actionMutations.run(arcRunId, async () => {
       const session = this.#actionSession(arcRunId);
       if (!frontierId)
         throw new TypeError(
@@ -566,7 +613,13 @@ export class ArcHostService {
         throw new Error(
           "Begin action execution before advancing its frontier.",
         );
-      return this.#mutateActionLocked(arcRunId, operation);
+      const frontier = await this.#mutateActionLocked(arcRunId, operation);
+      return {
+        kind: "action",
+        arcRunId,
+        frontier,
+        reactivationCount: session.reactivationCount,
+      };
     });
   }
 
@@ -602,10 +655,19 @@ export class ArcHostService {
    * Register the declaration and implementer of one `host:*` module. The host
    * owns the host-module registry; embedders and connectors register a module
    * here rather than intercepting frontiers. At most one registration per
-   * module — registering a second for the same module throws. Returns an
-   * unregister function.
+   * module. Duplicate registration rejects. Registration and the returned
+   * unregister callback share the source registry's asynchronous mutation queue.
    */
-  registerHostModule(module: string, impl: HostModule): () => void {
+  registerHostModule(
+    module: string,
+    impl: HostModule,
+  ): Promise<() => Promise<void>> {
+    return this.#registryMutations.run("registry", async () =>
+      this.#registerHostModule(module, impl),
+    );
+  }
+
+  #registerHostModule(module: string, impl: HostModule): () => Promise<void> {
     if (this.#hostModules.has(module)) {
       throw new Error(`Host module "${module}" already has an implementer.`);
     }
@@ -626,22 +688,23 @@ export class ArcHostService {
     this.#hostModules.set(module, ownedImplementation);
     this.#latestRuntime = nextRuntime;
     this.#snapshotRuntimes.clear();
-    return () => {
-      if (this.#hostModules.get(module) !== ownedImplementation) return;
+    return () =>
+      this.#registryMutations.run("registry", async () => {
+        if (this.#hostModules.get(module) !== ownedImplementation) return;
 
-      const remainingModules = new Map(this.#hostModules);
-      remainingModules.delete(module);
-      const remainingDocuments = this.#latestDocuments();
-      const remainingRuntime = this.#buildRuntime(
-        remainingDocuments,
-        this.#hostModuleSpecs(remainingModules),
-      );
-      assertHostDispatcherContracts(remainingDocuments, remainingModules);
+        const remainingModules = new Map(this.#hostModules);
+        remainingModules.delete(module);
+        const remainingDocuments = this.#latestDocuments();
+        const remainingRuntime = this.#buildRuntime(
+          remainingDocuments,
+          this.#hostModuleSpecs(remainingModules),
+        );
+        assertHostDispatcherContracts(remainingDocuments, remainingModules);
 
-      this.#hostModules.delete(module);
-      this.#latestRuntime = remainingRuntime;
-      this.#snapshotRuntimes.clear();
-    };
+        this.#hostModules.delete(module);
+        this.#latestRuntime = remainingRuntime;
+        this.#snapshotRuntimes.clear();
+      });
   }
 
   #hostModuleSpecs(
@@ -697,21 +760,45 @@ export class ArcHostService {
   async registerArcs(
     registrations: readonly ArcRegistrationInput[],
   ): Promise<void> {
+    return this.#registryMutations.run("registry", () =>
+      this.#registerArcs(registrations),
+    );
+  }
+
+  async #registerArcs(
+    registrations: readonly ArcRegistrationInput[],
+  ): Promise<void> {
     if (registrations.length === 0) return;
     const batchSources = new Set<string>();
-    const prepared = registrations.map((registration) => {
-      const { source, document } = registration;
+    const prepared = registrations.flatMap((registration) => {
+      const { source } = registration;
       if (batchSources.has(source)) {
         throw new Error(
           `Duplicate Arc source in registration batch: ${source}`,
         );
       }
       batchSources.add(source);
+      if ("delete" in registration) {
+        if (
+          registration.delete !== true ||
+          Object.keys(registration).some(
+            (key) => key !== "source" && key !== "delete",
+          )
+        ) {
+          throw new TypeError(
+            "Arc deletion accepts only source and delete: true.",
+          );
+        }
+        return [];
+      }
+      const document = structuredClone(registration.document);
       if (document.roots.length === 0) {
         throw new Error(`Document for source "${source}" has no arc roots.`);
       }
       assertWorkerRoleContracts(source, document);
-      const manifest = registration.manifest ?? DEFAULT_ARC_MANIFEST;
+      const manifest = parseArcManifest(
+        registration.manifest ?? DEFAULT_ARC_MANIFEST,
+      );
       const workspacePath =
         manifest.workspaceScope === "arc" &&
         registration.workspacePath !== undefined
@@ -730,7 +817,7 @@ export class ArcHostService {
           throw new Error(`Arc source already registered: ${source}`);
         }
       }
-      return { source, document, manifest, workspacePath };
+      return [{ source, document, manifest, workspacePath }];
     });
 
     // Build the prospective latest runtime before committing any registration
@@ -754,19 +841,38 @@ export class ArcHostService {
         id: commit.documentRecordId,
         source: commit.source,
         document: commit.document,
+        manifest: commit.manifest,
         createdAt: at,
       });
       await this.#store.putArcSource(commit.source, commit.document);
     }
+    const retainedAvailability = new Map<
+      ArcRef,
+      RegisteredArc["availability"]
+    >();
+    const nextRoots = new Set(
+      commits.flatMap((commit) =>
+        commit.document.roots.map((root) =>
+          toArcRef(commit.source, root.identifier),
+        ),
+      ),
+    );
     for (const [arcRef, registered] of this.#arcs) {
-      if (batchSources.has(registered.source)) this.#arcs.delete(arcRef);
+      if (!batchSources.has(registered.source)) continue;
+      if (nextRoots.has(arcRef))
+        retainedAvailability.set(arcRef, registered.availability);
+      else registered.availability.available = false;
+      this.#arcs.delete(arcRef);
     }
+    for (const source of batchSources)
+      this.#latestDocumentRecordIds.delete(source);
     this.#latestRuntime = nextRuntime;
     for (const commit of commits) {
       this.#latestDocumentRecordIds.set(commit.source, commit.documentRecordId);
       for (const root of commit.document.roots) {
         const arc = toArcRef(commit.source, root.identifier);
         this.#arcs.set(arc, {
+          availability: retainedAvailability.get(arc) ?? { available: true },
           source: commit.source,
           identifier: root.identifier,
           document: commit.document,
@@ -784,27 +890,26 @@ export class ArcHostService {
     }
   }
 
-  /** Return stable parsed-node metadata for a runtime source node ref. */
-  nodeInfoForRef(ref: NodeRef): NodeInfo {
-    const node = this.#latestRuntime.nodeForRef(ref);
-    if (!node) {
-      throw new Error(`No registered Arc node for source ref ${ref}.`);
+  /** Read latest node metadata, or pinned metadata for a supplied run/probe ID. */
+  async nodeInfoForRef(ref: NodeRef, arcRunId?: ArcRunId): Promise<NodeInfo> {
+    let runtime = this.#latestRuntime;
+    if (arcRunId !== undefined) {
+      const live = this.#liveSessions.get(arcRunKey(arcRunId));
+      const liveSnapshotId =
+        live?.kind === "triggering"
+          ? live.snapshotId
+          : this.#liveAction(arcRunId)?.state.snapshotId;
+      const snapshotId =
+        liveSnapshotId ?? (await this.#stateFor(arcRunId))?.snapshotId;
+      if (!snapshotId) throw new Error(`Unknown Arc run ${arcRunId}.`);
+      runtime = await this.#runtimeForSnapshot(snapshotId);
     }
-    return {
-      name: node.identifier,
-      description: node.description,
-    };
-  }
-
-  /** Return node metadata from the immutable document snapshot of one run. */
-  async nodeInfoForRunRef(arcRunId: ArcRunId, ref: NodeRef): Promise<NodeInfo> {
-    const state = await this.#stateFor(arcRunId);
-    if (!state) throw new Error(`Unknown Arc run ${arcRunId}.`);
-    const runtime = await this.#runtimeForSnapshot(state.snapshotId);
     const node = runtime.nodeForRef(ref);
     if (!node) {
       throw new Error(
-        `Arc run ${arcRunId} snapshot has no node for source ref ${ref}.`,
+        arcRunId === undefined
+          ? `No registered Arc node for source ref ${ref}.`
+          : `Arc run ${arcRunId} snapshot has no node for source ref ${ref}.`,
       );
     }
     return {
@@ -849,8 +954,10 @@ export class ArcHostService {
     const action = this.#liveAction(arcRunId);
     const live = this.#liveSessions.get(arcRunKey(arcRunId));
     if (action) {
-      const arc = this.#arcs.get(action.state.arcRef);
-      const manifest = cloneArcManifest(arc?.manifest);
+      const { manifest } = await this.#sourceRecordForSnapshot(
+        action.state.snapshotId,
+        action.state.arcRef,
+      );
       return {
         workspacePath: action.state.workspacePath,
         workspaceBundle: { ...manifest.bundle },
@@ -858,16 +965,17 @@ export class ArcHostService {
       };
     }
     if (live?.kind === "triggering") {
-      const registered = this.#registeredArcForReadyPlan({
-        status: "ready",
-        deps: live.deps,
-        snapshotId: live.snapshotId,
-        brief: live.brief,
-      });
-      const manifest = cloneArcManifest(registered?.arc.manifest);
+      const root =
+        live.origin?.kind === "deflected"
+          ? live.origin.state.arcRef
+          : this.#rootForTriggerBrief(live.brief);
+      const bundle = root
+        ? (await this.#sourceRecordForSnapshot(live.snapshotId, root)).manifest
+            .bundle
+        : {};
       return {
         workspacePath: live.workspacePath,
-        workspaceBundle: { ...manifest.bundle },
+        workspaceBundle: { ...bundle },
         reactivationCount: 0,
       };
     }
@@ -876,8 +984,10 @@ export class ArcHostService {
     if (!state) {
       throw new Error(`Arc run ${arcRunId} has no workspace context.`);
     }
-    const arc = this.#arcs.get(state.arcRef);
-    const manifest = cloneArcManifest(arc?.manifest);
+    const { manifest } = await this.#sourceRecordForSnapshot(
+      state.snapshotId,
+      state.arcRef,
+    );
     return {
       workspacePath: state.workspacePath,
       workspaceBundle: { ...manifest.bundle },
@@ -1044,11 +1154,16 @@ export class ArcHostService {
         if (state && state.lifecycle !== "active") return [];
         if (this.#liveSessions.get(arcRunKey(arcRunId))?.kind === "triggering")
           return [
-            this.#frontierToStep(
+            {
+              kind: "trigger",
               arcRunId,
-              await this.#beginActioning(arcRunId, input.projectDialog),
-            ),
+              frontier: await this.#beginActioning(
+                arcRunId,
+                input.projectDialog,
+              ),
+            },
           ];
+        if (!state) return [];
         const retained = this.#actionSession(arcRunId);
         if (
           retained?.frontier &&
@@ -1058,9 +1173,19 @@ export class ArcHostService {
           const frontier = await this.#mutateActionLocked(arcRunId, () =>
             this.#resumeRetainedAction(arcRunId, retained, input.projectDialog),
           );
-          return [this.#frontierToStep(arcRunId, frontier)];
+          return [
+            {
+              kind: "action",
+              arcRunId,
+              frontier,
+              reactivationCount: retained.reactivationCount,
+            },
+          ];
         }
-        const session = await this.#newActionSession(arcRunId);
+        const session = await this.#newActionSession(
+          arcRunId,
+          state.reactivationCount,
+        );
         try {
           const frontier = await this.#mutateActionLocked(arcRunId, () =>
             this.#beginActioning(arcRunId, input.projectDialog),
@@ -1069,7 +1194,14 @@ export class ArcHostService {
             await this.#retireAction(arcRunId, session);
             return [];
           }
-          return [this.#frontierToStep(arcRunId, frontier)];
+          return [
+            {
+              kind: "action",
+              arcRunId,
+              frontier,
+              reactivationCount: session.reactivationCount,
+            },
+          ];
         } catch (error) {
           await this.#retireAction(arcRunId, session);
           throw error;
@@ -1115,20 +1247,15 @@ export class ArcHostService {
     frontierId: string,
     input: AdvanceInput,
   ): Promise<ArcHostStep> {
-    const frontier = await this.#mutateAction(
-      arcRunId,
-      frontierId,
-      async () => {
-        const execution = this.#actionSession(arcRunId)!;
-        if (
-          !execution.frontier!.canProgress ||
-          execution.admissionId !== frontierId
-        )
-          return execution.frontier!;
-        return this.#advanceActioning(arcRunId, input);
-      },
-    );
-    return { kind: "action", arcRunId, frontier };
+    return this.#mutateAction(arcRunId, frontierId, async () => {
+      const execution = this.#actionSession(arcRunId)!;
+      if (
+        !execution.frontier!.canProgress ||
+        execution.admissionId !== frontierId
+      )
+        return execution.frontier!;
+      return this.#advanceActioning(arcRunId, input);
+    });
   }
 
   async #resumeRetainedAction(
@@ -1147,6 +1274,7 @@ export class ArcHostService {
     });
     if (!(await this.#canAdvance(arcRunId))) return execution.frontier!;
     return this.#settleActioningAdvance(
+      runtime,
       arcRunKey(arcRunId),
       live.recorder,
       arcRunId,
@@ -1184,6 +1312,7 @@ export class ArcHostService {
           {
             kind: "fresh",
             recordIds: new Map(this.#latestDocumentRecordIds),
+            arcs: new Map(this.#arcs),
           },
           this.#latestRuntime,
           [],
@@ -1296,7 +1425,13 @@ export class ArcHostService {
           });
         }
         handedOff = true;
-        return [this.#frontierToStep(started.arcRunId, started.frontier)];
+        return [
+          {
+            kind: "trigger",
+            arcRunId: started.arcRunId,
+            frontier: started.frontier,
+          },
+        ];
       } catch (error) {
         failed = true;
         throw error;
@@ -1333,7 +1468,7 @@ export class ArcHostService {
       };
       group.order = Math.min(group.order, originOrder);
       if (origin.kind === "fresh") {
-        group.fresh = {
+        const selection: PendingTriggerSelection = {
           ...pendingTriggerSelection(
             `arc-run:${randomUUID()}`,
             match,
@@ -1341,6 +1476,11 @@ export class ArcHostService {
           ),
           triggerSteps: [...triggerSteps],
         };
+        const registration = origin.arcs.get(match.arcRef);
+        if (!registration)
+          throw new Error(`Missing captured registration for ${match.arcRef}.`);
+        this.#freshRegistrations.set(selection, registration);
+        group.fresh = selection;
       } else if (match.arcRef === origin.state.arcRef) {
         group.reentries.push({
           arcRunId: origin.state.arcRunId,
@@ -1379,7 +1519,7 @@ export class ArcHostService {
         if (choose) {
           steps.push(
             this.#handshakeStep(
-              await this.#stageArcChoiceHandshake(
+              this.#stageArcChoiceHandshake(
                 group.arcRef,
                 batch.request,
                 placeholder,
@@ -1407,7 +1547,7 @@ export class ArcHostService {
         if (candidates.length > 0) {
           steps.push(
             this.#handshakeStep(
-              await this.#stageRunChoiceHandshake(
+              this.#stageRunChoiceHandshake(
                 group.arcRef,
                 candidates,
                 batch.request,
@@ -1449,6 +1589,7 @@ export class ArcHostService {
                   kind: "action",
                   arcRunId: started.arcRunId,
                   frontier: started.frontier,
+                  reactivationCount: started.reactivationCount,
                 },
           );
         }
@@ -1509,7 +1650,6 @@ export class ArcHostService {
       committed: [],
       onCommit: [],
     };
-    let failed = false;
     try {
       const key = arcRunKey(arcRunId);
       const live = this.#liveSessions.get(key);
@@ -1546,6 +1686,7 @@ export class ArcHostService {
       recorder.setHostModuleState(state.hostModules);
       const brief = await recorder.start(state.traversals, dialog);
       const settled = await this.#settle(
+        runtime,
         recorder,
         arcRunId,
         state,
@@ -1563,18 +1704,8 @@ export class ArcHostService {
         work: workSummary(settled.frontier),
       });
       return settled.frontier;
-    } catch (error) {
-      failed = true;
-      throw error;
     } finally {
-      try {
-        await this.#publishRunEvents(events);
-      } catch (error) {
-        if (!failed) throw error;
-        this.#logger.info("arc_host.work_event.publication_failed", {
-          message: String(error),
-        });
-      }
+      this.#enqueueRunEvents(events);
     }
   }
 
@@ -1597,13 +1728,18 @@ export class ArcHostService {
       projectDialog: DialogProjector;
     },
   ): Promise<ResolveHandshakeResult> {
-    const operation: PreparationOperation = {};
-    try {
-      return await this.#resolveHandshaking(id, values, opts, operation);
-    } finally {
-      if (operation.arcRunId && operation.entry)
-        this.#releasePreparation(operation.arcRunId, operation.entry);
-    }
+    return this.#handshakeResolutions.run(id, async () => {
+      const operation: PreparationOperation = {};
+      try {
+        return await this.#resolveHandshaking(id, values, opts, operation);
+      } catch (error) {
+        if (!(error instanceof FreshActivationUnavailable)) throw error;
+        return this.#missingFreshHandshake(id, error.message);
+      } finally {
+        if (operation.arcRunId && operation.entry)
+          this.#releasePreparation(operation.arcRunId, operation.entry);
+      }
+    });
   }
 
   async #resolveHandshaking(
@@ -1651,6 +1787,17 @@ export class ArcHostService {
       return { status: "invalid", reason: "Handshake has no requirements." };
     }
 
+    if (
+      requirement.kind === "workspace" ||
+      (requirement.kind === "run-choice" &&
+        values.runChoice?.action === "fresh" &&
+        (handshake.freshAvailable ?? requirement.freshAvailable)) ||
+      (requirement.kind === "arc-choice" &&
+        !handshake.reentrySelections?.length)
+    ) {
+      this.#assertFreshAvailable(handshake.triggerSelection);
+    }
+
     if (requirement.kind === "arc-choice") {
       const choice = values.arcChoice;
       if (!choice) {
@@ -1662,7 +1809,8 @@ export class ArcHostService {
       if (!choice.activate) {
         return this.#declineHandshake(handshake, operation);
       }
-      await this.#consumeHandshake(handshake, { kind: "proceed" }, operation);
+      if (!this.#consumeHandshake(handshake, { kind: "proceed" }, operation))
+        return { status: "missing" };
       // Activating: the arc may still need run-choice/workspace — stage that as
       // the next-round handshake — otherwise activate now.
       const request: ActivationRequest = {
@@ -1689,7 +1837,7 @@ export class ArcHostService {
           ).values(),
         ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
         if (candidates.length > 0) {
-          const next = await this.#stageRunChoiceHandshake(
+          const next = this.#stageRunChoiceHandshake(
             handshake.arcRef,
             candidates,
             request,
@@ -1697,7 +1845,11 @@ export class ArcHostService {
             handshake.dialog,
             {
               reentrySelections: handshake.reentrySelections,
-              freshAvailable: handshake.freshAvailable ?? false,
+              freshAvailable:
+                (handshake.freshAvailable ?? false) &&
+                (this.#freshRegistrations.get(handshake.triggerSelection)
+                  ?.availability.available ??
+                  false),
             },
           );
           return { status: "ok", step: this.#handshakeStep(next) };
@@ -1779,11 +1931,14 @@ export class ArcHostService {
                 reason: `Run ${choice.arcRunId} changed after trigger planning.`,
               };
             }
-            await this.#consumeHandshake(
-              handshake,
-              { kind: "reentry", arcRunId: choice.arcRunId },
-              operation,
-            );
+            if (
+              !this.#consumeHandshake(
+                handshake,
+                { kind: "reentry", arcRunId: choice.arcRunId },
+                operation,
+              )
+            )
+              return { status: "missing" };
             const frontier = await this.#activateDeflectedReentry(
               state,
               reentrySelection,
@@ -1791,7 +1946,12 @@ export class ArcHostService {
             );
             return {
               status: "ok",
-              step: { kind: "action", arcRunId: state.arcRunId, frontier },
+              step: {
+                kind: "action",
+                arcRunId: state.arcRunId,
+                frontier,
+                reactivationCount: reentrySelection.reactivationCount,
+              },
             };
           });
         }
@@ -1809,14 +1969,21 @@ export class ArcHostService {
             reason: `Run ${choice.arcRunId} cannot be advanced.`,
           };
         }
-        await this.#consumeHandshake(
-          handshake,
-          { kind: "join", arcRunId: choice.arcRunId },
-          operation,
-        );
+        if (
+          !this.#consumeHandshake(
+            handshake,
+            { kind: "join", arcRunId: choice.arcRunId },
+            operation,
+          )
+        )
+          return { status: "missing" };
         // Validated active run: worker hub publishes additive attachment without
         // scheduling or mutating the selected run.
-        return { status: "joined", arcRunId: choice.arcRunId };
+        return {
+          status: "joined",
+          arcRunId: choice.arcRunId,
+          reactivationCount: state.reactivationCount,
+        };
       }
 
       if (!(handshake.freshAvailable ?? requirement.freshAvailable)) {
@@ -1826,17 +1993,25 @@ export class ArcHostService {
         };
       }
 
-      const arc = this.#arcs.get(handshake.arcRef);
+      const registration = this.#freshRegistrations.get(
+        handshake.triggerSelection,
+      )!;
+      const { manifest } = await this.#sourceRecordForSnapshot(
+        handshake.triggerSelection.snapshotId,
+        handshake.arcRef,
+      );
+      this.#assertFreshAvailable(handshake.triggerSelection);
       let workspace: string | undefined;
-      if (arc?.manifest.workspaceScope === "arc") {
-        workspace = arc.workspacePath;
+      if (manifest.workspaceScope === "arc") {
+        workspace = registration.workspacePath;
         if (workspace === undefined) {
           const resolvedWorkspace = this.#validatedWorkspace(values.workspace);
           if (resolvedWorkspace.status === "invalid") return resolvedWorkspace;
           workspace = resolvedWorkspace.value;
         }
       }
-      await this.#consumeHandshake(handshake, { kind: "proceed" }, operation);
+      if (!this.#consumeHandshake(handshake, { kind: "proceed" }, operation))
+        return { status: "missing" };
       return this.#activateFreshFromHandshake(
         handshake,
         workspace,
@@ -1848,7 +2023,8 @@ export class ArcHostService {
     if (workspace.status === "invalid") {
       return workspace;
     }
-    await this.#consumeHandshake(handshake, { kind: "proceed" }, operation);
+    if (!this.#consumeHandshake(handshake, { kind: "proceed" }, operation))
+      return { status: "missing" };
     return this.#activateFreshFromHandshake(
       handshake,
       workspace.value,
@@ -1856,11 +2032,12 @@ export class ArcHostService {
     );
   }
 
-  async #declineHandshake(
+  #declineHandshake(
     handshake: PendingHandshake,
     operation: PreparationOperation,
-  ): Promise<ResolveHandshakeResult> {
-    await this.#consumeHandshake(handshake, { kind: "declined" }, operation);
+  ): ResolveHandshakeResult {
+    if (!this.#consumeHandshake(handshake, { kind: "declined" }, operation))
+      return { status: "missing" };
     return {
       status: "ok",
       step: {
@@ -1885,6 +2062,8 @@ export class ArcHostService {
       },
     );
     if (started.kind === "invalid") {
+      if (started.unavailable)
+        return this.#missingFreshHandshake(handshake.id, started.reason);
       return { status: "invalid", reason: started.reason };
     }
     this.#logger.info("arc_host.handshake.resolved", {
@@ -1894,14 +2073,15 @@ export class ArcHostService {
       workspacePath: workspace,
       continuedTriggerArcRunId: handshake.triggerSelection.arcRunId,
     });
-    const step = this.#frontierToStep(started.arcRunId, started.frontier);
-    if (step.kind !== "action") {
-      return {
-        status: "invalid",
-        reason: "Resolved handshake did not produce runnable Arc work.",
-      };
-    }
-    return { status: "ok", step };
+    return {
+      status: "ok",
+      step: {
+        kind: "action",
+        arcRunId: started.arcRunId,
+        frontier: started.frontier,
+        reactivationCount: started.reactivationCount,
+      },
+    };
   }
 
   async #stageHandshakeForTriggerSelection(
@@ -1911,34 +2091,37 @@ export class ArcHostService {
     dialog: Dialog,
     opts: { excludeArcRunId?: ArcRunId } = {},
   ): Promise<PendingHandshake | undefined> {
-    const arc = this.#arcs.get(selection.arcRef);
-    if (!arc) return undefined;
+    const registration = this.#freshRegistrations.get(selection);
+    if (!registration?.availability.available) return undefined;
+    const { manifest } = await this.#sourceRecordForSnapshot(
+      selection.snapshotId,
+      selection.arcRef,
+    );
     const candidates = await this.#findRunChoiceCandidates(
       ownerPrincipal,
       selection.arcRef,
       opts,
     );
+    if (!registration.availability.available) return undefined;
     if (candidates.length > 0) {
-      return await this.#stageRunChoiceHandshake(
+      return this.#stageRunChoiceHandshake(
         selection.arcRef,
         candidates,
         request,
         selection,
         dialog,
       );
-    }
-    if (
-      arc.manifest.workspaceScope === "arc" &&
-      arc.workspacePath === undefined
+    } else if (
+      manifest.workspaceScope === "arc" &&
+      registration.workspacePath === undefined
     ) {
-      return await this.#stageWorkspaceHandshake(
+      return this.#stageWorkspaceHandshake(
         selection.arcRef,
         request,
         selection,
         dialog,
       );
     }
-    return undefined;
   }
 
   async #startTriggeringFromReadyPlan(
@@ -1989,16 +2172,16 @@ export class ArcHostService {
       selection.arcRef,
     );
     try {
-      const arc = this.#arcs.get(selection.arcRef);
-      if (!arc) {
-        return {
-          kind: "invalid",
-          reason: `Cannot start unregistered arc ${selection.arcRef}.`,
-        };
-      }
+      this.#assertFreshAvailable(selection);
+      const registration = this.#freshRegistrations.get(selection)!;
+      const { manifest } = await this.#sourceRecordForSnapshot(
+        selection.snapshotId,
+        selection.arcRef,
+      );
+      this.#assertFreshAvailable(selection);
       const workspacePath =
-        arc.manifest.workspaceScope === "arc"
-          ? (opts.workspacePath ?? arc.workspacePath)
+        manifest.workspaceScope === "arc"
+          ? (opts.workspacePath ?? registration.workspacePath)
           : defaultRunWorkspaceRoot(this.#artifactRoot, selection.arcRunId);
       if (workspacePath === undefined) {
         return {
@@ -2020,7 +2203,7 @@ export class ArcHostService {
           traversals: selection.traversals,
           reactivationCount: 0,
           workspacePath,
-          contextIsolation: arc.manifest.contextIsolation,
+          contextIsolation: manifest.contextIsolation,
           ownerPrincipal: opts.ownerPrincipal,
           artifactPaths: existing?.artifactPaths ?? [],
           hostModules: { calls: [] },
@@ -2030,127 +2213,40 @@ export class ArcHostService {
           route: "fresh",
           appendBegun: !existing,
           triggerSteps: selection.triggerSteps,
+          assertAvailable: () => this.#assertFreshAvailable(selection),
         },
       );
-      return { kind: "matched", arcRunId: selection.arcRunId, frontier };
+      return {
+        kind: "matched",
+        arcRunId: selection.arcRunId,
+        frontier,
+        reactivationCount: 0,
+      };
+    } catch (error) {
+      if (!(error instanceof FreshActivationUnavailable)) throw error;
+      return { kind: "invalid", reason: error.message, unavailable: true };
     } finally {
       this.#releasePreparation(selection.arcRunId, preparing);
     }
   }
 
-  /**
-   * Activate matched arcs from one inbound per the activation policy. `first`
-   * activates one; `all` activates every match; `choose` (with >1 match) stages a
-   * host-level arc-choice handshake per match so the client selects the subset.
-   * Each activation gets its own fresh run id; gated matches are returned as
-   * handshakes (no run yet — they activate later via the resolve path);
-   * unregistered/invalid matches are rejected. The captured trigger replay is
-   * replicated into each activated run.
-   */
-  async #fanOutActivation(
-    matches: readonly TriggerMatch[],
-    snapshotId: ArcDocumentSnapshotId,
-    sharedTriggerSteps: readonly TriggerReplayStep[],
-    dialog: Dialog,
-    ownerPrincipal: string,
-    request: ActivationRequest | undefined,
-    policy: ActivationPolicy,
-    projectDialog: DialogProjector,
-    opts: { excludeArcRunId?: ArcRunId } = {},
-  ): Promise<ArcHostStep[]> {
-    const steps: ArcHostStep[] = [];
-    const freshSelection = (match: TriggerMatch): PendingTriggerSelection => ({
-      ...pendingTriggerSelection(`arc-run:${randomUUID()}`, match, snapshotId),
-      triggerSteps: [...sharedTriggerSteps],
-    });
-
-    // `choose` with >1 match: ask the client which arcs to activate, one
-    // arc-choice handshake per match. Resolution activates (or declines) each.
-    if (policy === "choose" && matches.length > 1 && request) {
-      for (const match of matches) {
-        steps.push(
-          this.#handshakeStep(
-            await this.#stageArcChoiceHandshake(
-              match.arcRef,
-              request,
-              freshSelection(match),
-              dialog,
-            ),
-          ),
-        );
-      }
-      return steps;
-    }
-
-    const selected = policy === "first" ? matches.slice(0, 1) : matches;
-    try {
-      for (const match of selected) {
-        const selection = freshSelection(match);
-        if (request) {
-          const handshake = await this.#stageHandshakeForTriggerSelection(
-            selection,
-            ownerPrincipal,
-            request,
-            dialog,
-            opts,
-          );
-          if (handshake) {
-            steps.push(this.#handshakeStep(handshake));
-            continue;
-          }
-        }
-        const started = await this.#activateFromTriggerSelection(selection, {
-          ownerPrincipal,
-          projectDialog,
-        });
-        if (started.kind === "invalid") {
-          steps.push({
-            kind: "rejected",
-            arcRef: match.arcRef,
-            reason: started.reason,
-          });
-          continue;
-        }
-        steps.push({
-          kind: "action",
-          arcRunId: started.arcRunId,
-          frontier: started.frontier,
-        });
-      }
-    } catch (error) {
-      await Promise.all(
-        steps.map((step) =>
-          step.kind === "action"
-            ? this.releaseAction(step.arcRunId, step.frontier.frontierId)
-            : undefined,
-        ),
-      );
-      throw error;
-    }
-    return steps;
-  }
-
-  #registeredArcForReadyPlan(
-    planned: Extract<TriggerPlanResult, { status: "ready" }>,
-  ): { arcRef: ArcRef; arc: RegisteredArc } | undefined {
-    const roots = new Set<ArcRef>(planned.brief.matchableArcs);
+  #rootForTriggerBrief(brief: TriggerBrief): ArcRef | undefined {
+    const roots = new Set<ArcRef>(brief.matchableArcs);
     const addNodeRoot = (ref: NodeRef) => {
       const parts = toNodeRefParts(ref);
       roots.add(toArcRef(parts.source, parts.path[0] ?? ""));
     };
-    for (const item of planned.brief.judgments) {
+    for (const item of brief.judgments) {
       addNodeRoot(item.sourceRef);
     }
-    for (const item of planned.brief.observations) {
+    for (const item of brief.observations) {
       addNodeRoot(item.sourceRef);
     }
-    for (const item of planned.brief.hostCalls) {
+    for (const item of brief.hostCalls) {
       addNodeRoot(item.sourceRef);
     }
     if (roots.size !== 1) return undefined;
-    const arcRef = [...roots][0]!;
-    const arc = this.#arcs.get(arcRef);
-    return arc ? { arcRef, arc } : undefined;
+    return [...roots][0]!;
   }
 
   async #activateMatchedRun(
@@ -2161,10 +2257,14 @@ export class ArcHostService {
       route: "fresh" | "reentry";
       appendBegun?: boolean;
       triggerSteps?: readonly TriggerReplayStep[];
+      assertAvailable?: () => void;
     },
   ): Promise<RunFrontier> {
     return this.#actionMutations.run(arcRunId, async () => {
-      const session = await this.#newActionSession(arcRunId);
+      const session = await this.#newActionSession(
+        arcRunId,
+        activated.reactivationCount,
+      );
       try {
         return await this.#mutateActionLocked(arcRunId, () =>
           this.#activateMatchedRunUnderMutation(
@@ -2191,6 +2291,7 @@ export class ArcHostService {
       route: "fresh" | "reentry";
       appendBegun?: boolean;
       triggerSteps?: readonly TriggerReplayStep[];
+      assertAvailable?: () => void;
     },
   ): Promise<RunFrontier> {
     const events: RunEventCollection = {
@@ -2199,10 +2300,10 @@ export class ArcHostService {
       onCommit: [],
     };
     events.start = { kind: "run:started", arcRunId, route: opts.route };
-    let failed = false;
     try {
       const key = arcRunKey(arcRunId);
       const runtime = await this.#runtimeForSnapshot(activated.snapshotId);
+      opts.assertAvailable?.();
       const recorder = this.#newRecorder(runtime, arcRunId, {
         reactivationCount: activated.reactivationCount,
       });
@@ -2214,9 +2315,11 @@ export class ArcHostService {
       const actionDialog = await projectDialog({
         roleId: this.#workerRoleForTraversals(runtime, activated.traversals),
       });
+      opts.assertAvailable?.();
       recorder.setHostModuleState(activated.hostModules);
       const brief = await recorder.start(activated.traversals, actionDialog);
       const settled = await this.#settle(
+        runtime,
         recorder,
         arcRunId,
         activated,
@@ -2232,21 +2335,24 @@ export class ArcHostService {
           phase: "actioning",
         });
       }
-      await this.#putState(arcRunId, settled.state, events, settled.frontier);
+      if (opts.assertAvailable) {
+        // The first durable commit and root removal share one admission order.
+        await this.#registryMutations.run("registry", async () => {
+          opts.assertAvailable!();
+          await this.#putState(
+            arcRunId,
+            settled.state,
+            events,
+            settled.frontier,
+          );
+        });
+      } else {
+        await this.#putState(arcRunId, settled.state, events, settled.frontier);
+      }
       this.#trackActioningSession(key, settled, recorder);
       return settled.frontier;
-    } catch (error) {
-      failed = true;
-      throw error;
     } finally {
-      try {
-        await this.#publishRunEvents(events);
-      } catch (error) {
-        if (!failed) throw error;
-        this.#logger.info("arc_host.work_event.publication_failed", {
-          message: String(error),
-        });
-      }
+      this.#enqueueRunEvents(events);
     }
   }
 
@@ -2333,16 +2439,17 @@ export class ArcHostService {
         )
       )
         return [
-          this.#frontierToStep(
+          {
+            kind: "trigger",
             arcRunId,
-            await this.#frontierFromTriggerBrief(
+            frontier: await this.#frontierFromTriggerBrief(
               arcRunId,
               live.deps,
               live.snapshotId,
               live.brief,
               dialog,
             ),
-          ),
+          },
         ];
       if (input.hostCallOutcome.kind === "interruption")
         throw new TypeError("Interruption requires an action execution.");
@@ -2427,7 +2534,7 @@ export class ArcHostService {
         phase: "triggering",
         outcome: "ready",
       });
-      return [this.#frontierToStep(arcRunId, frontier)];
+      return [{ kind: "trigger", arcRunId, frontier }];
     }
 
     await this.#retireExecution(arcRunId);
@@ -2450,35 +2557,7 @@ export class ArcHostService {
       if (batch.pendingProbeIds.size > 0) return [];
       return this.#finalizeActivationBatch(batch, input.projectDialog);
     }
-    if (planned.status === "idle") {
-      this.#logger.info("arc_host.run.committed", {
-        arcRunId,
-        phase: "triggering",
-        outcome: "idle",
-      });
-      return [];
-    }
-
-    // Fan out per the activation policy, under fresh run ids, replicating the
-    // captured trigger replay into each. The trigger stage (arcRunId) is closed
-    // with a committed event and is never itself a run.
-    const activated = await this.#fanOutActivation(
-      planned.matches,
-      planned.snapshotId,
-      live.recorder.drainTriggerBuffer(),
-      dialog,
-      live.request.principal,
-      live.request,
-      live.request.activationPolicy,
-      input.projectDialog,
-      { excludeArcRunId: arcRunId },
-    );
-    this.#logger.info("arc_host.run.committed", {
-      arcRunId,
-      phase: "triggering",
-      outcome: "activated",
-    });
-    return activated;
+    return [];
   }
 
   async #advanceActioning(
@@ -2574,6 +2653,7 @@ export class ArcHostService {
       return execution.frontier!;
     recorder.setHostModuleState(state.hostModules);
     return this.#settleActioningAdvance(
+      runtime,
       arcRunKey(arcRunId),
       recorder,
       arcRunId,
@@ -2587,6 +2667,7 @@ export class ArcHostService {
   }
 
   async #settleActioningAdvance(
+    runtime: Runtime,
     key: string,
     recorder: RecordingRuntime,
     arcRunId: ArcRunId,
@@ -2602,7 +2683,6 @@ export class ArcHostService {
       committed: [],
       onCommit: [],
     };
-    let failed = false;
     try {
       if (report && initial.canProgress)
         initial = await this.#progressAction(
@@ -2617,6 +2697,7 @@ export class ArcHostService {
           effect,
         );
       const settled = await this.#settle(
+        runtime,
         recorder,
         arcRunId,
         state,
@@ -2634,18 +2715,8 @@ export class ArcHostService {
         work: workSummary(settled.frontier),
       });
       return settled.frontier;
-    } catch (error) {
-      failed = true;
-      throw error;
     } finally {
-      try {
-        await this.#publishRunEvents(events);
-      } catch (error) {
-        if (!failed) throw error;
-        this.#logger.info("arc_host.work_event.publication_failed", {
-          message: String(error),
-        });
-      }
+      this.#enqueueRunEvents(events);
     }
   }
 
@@ -2855,6 +2926,76 @@ export class ArcHostService {
     );
   }
 
+  async #sourceRecordForSnapshot(
+    snapshotId: ArcDocumentSnapshotId,
+    arcRef: ArcRef,
+  ): Promise<ArcDocumentRecord> {
+    const data = await this.#dataForSnapshot(snapshotId);
+    const source = toArcRefParts(arcRef).source;
+    const record = data.recordsBySource.get(source);
+    if (record) return record;
+    throw new Error(
+      `Arc snapshot ${snapshotId} has no document for source ${source}.`,
+    );
+  }
+
+  #touchSnapshotData(
+    snapshotId: ArcDocumentSnapshotId,
+  ): SnapshotData | undefined {
+    const data = this.#snapshotData.get(snapshotId);
+    if (data) {
+      this.#snapshotData.delete(snapshotId);
+      this.#snapshotData.set(snapshotId, data);
+    }
+    return data;
+  }
+
+  async #dataForSnapshot(
+    snapshotId: ArcDocumentSnapshotId,
+  ): Promise<SnapshotData> {
+    const cached = this.#touchSnapshotData(snapshotId);
+    if (cached) return cached;
+    const pending = this.#snapshotLoads.get(snapshotId);
+    if (pending) return pending;
+
+    const loading = this.#loadSnapshotData(snapshotId);
+    this.#snapshotLoads.set(snapshotId, loading);
+    try {
+      const data = await loading;
+      if (this.#snapshotRuntimeCacheSize > 0) {
+        this.#snapshotData.set(snapshotId, data);
+        while (this.#snapshotData.size > this.#snapshotRuntimeCacheSize) {
+          const oldest = this.#snapshotData.keys().next().value;
+          if (oldest === undefined) break;
+          this.#snapshotData.delete(oldest);
+        }
+      }
+      return data;
+    } finally {
+      if (this.#snapshotLoads.get(snapshotId) === loading)
+        this.#snapshotLoads.delete(snapshotId);
+    }
+  }
+
+  async #loadSnapshotData(
+    snapshotId: ArcDocumentSnapshotId,
+  ): Promise<SnapshotData> {
+    const stored = await this.#store.getArcDocumentSnapshot(snapshotId);
+    if (!stored)
+      throw new Error(`Arc document snapshot not found: ${snapshotId}`);
+    const snapshot = structuredClone(stored);
+    const recordsBySource = new Map<string, ArcDocumentRecord>();
+    for (const id of snapshot.documents) {
+      const storedRecord = await this.#store.getArcDocumentRecord(id);
+      if (!storedRecord)
+        throw new Error(`Arc document record not found: ${id}`);
+      const record = structuredClone(storedRecord);
+      record.manifest = parseArcManifest(record.manifest);
+      recordsBySource.set(record.source, record);
+    }
+    return { snapshot, recordsBySource };
+  }
+
   async #runtimeForSnapshot(
     snapshotId: ArcDocumentSnapshotId,
   ): Promise<Runtime> {
@@ -2862,18 +3003,21 @@ export class ArcHostService {
     if (cached) {
       this.#snapshotRuntimes.delete(snapshotId);
       this.#snapshotRuntimes.set(snapshotId, cached);
+      this.#touchSnapshotData(snapshotId);
       return cached;
     }
-    const snapshot = await this.#store.getArcDocumentSnapshot(snapshotId);
-    if (!snapshot)
-      throw new Error(`Arc document snapshot not found: ${snapshotId}`);
-    const documents = new Map<string, Document>();
-    for (const recordId of snapshot.documents) {
-      const record = await this.#store.getArcDocumentRecord(recordId);
-      if (!record)
-        throw new Error(`Arc document record not found: ${recordId}`);
-      documents.set(record.source, record.document);
+    const { snapshot, recordsBySource } =
+      await this.#dataForSnapshot(snapshotId);
+    const completed = this.#snapshotRuntimes.get(snapshotId);
+    if (completed) {
+      this.#snapshotRuntimes.delete(snapshotId);
+      this.#snapshotRuntimes.set(snapshotId, completed);
+      this.#touchSnapshotData(snapshotId);
+      return completed;
     }
+    const documents = new Map(
+      [...recordsBySource].map(([source, record]) => [source, record.document]),
+    );
     const hostModules = this.#hostModulesForSnapshot(snapshot, documents);
     const runtime = this.#buildRuntime(documents, hostModules);
     this.#cacheSnapshotRuntime(snapshotId, runtime);
@@ -3222,10 +3366,10 @@ export class ArcHostService {
       artifactPaths: [...sourceRun.artifactPaths],
       hostModules: structuredClone(hostModules),
     });
-    await this.#workEvents.append({ kind: "run:started", arcRunId, route });
+    this.#workEvents.publish(() => ({ kind: "run:started", arcRunId, route }));
     const lifecycle = lifecycleFromTraversals(binding.arcRef, seedTraversals);
     if (lifecycle !== "active") {
-      await this.#workEvents.append(
+      this.#workEvents.publish(() =>
         lifecycle === "poisoned"
           ? {
               kind: "run:poisoned",
@@ -3277,7 +3421,7 @@ export class ArcHostService {
   ): Promise<ActionBrief | TerminalBrief> {
     const validation = validateActionReport(brief, report);
     if (!validation.rejected && validation.accepted.move === "interrupt") {
-      events.committed.push({
+      this.#captureRunEvent(events.committed, () => ({
         kind: "run:interruption-occurred",
         arcRunId,
         origin: brief.active,
@@ -3285,25 +3429,39 @@ export class ArcHostService {
           id: validation.accepted.interruption!.id,
           reason: validation.accepted.interruption!.reason ?? "",
         },
-      });
+      }));
       this.#enqueueRunEvents(events);
     }
     return recorder.progress(brief, report, dialog, origin, {
       moduleEffect: effect,
       beforeProgress: () => this.#moduleExecutions.get(arcRunId)?.assertOpen(),
-      progressed: () => {
+      progressed: (_output, moduleEffectAdmitted) => {
+        if (
+          moduleEffectAdmitted &&
+          effect &&
+          this.#moduleExecutions
+            .get(arcRunId)
+            ?.hasPublishedCall(effect.hostCallId)
+        ) {
+          this.#captureRunEvent(events.staged, () => ({
+            kind: "host-module:effect",
+            arcRunId,
+            hostCallId: effect.hostCallId,
+            outcome: effect.hostCallOutcome.kind,
+          }));
+        }
         if (
           validation.rejected ||
           this.#committedControlBriefs.has(brief) ||
           validation.accepted.move !== "deflect"
         )
           return;
-        events.staged.push({
+        this.#captureRunEvent(events.staged, () => ({
           kind: "run:deflection-occurred",
           arcRunId,
           reactivationCount: state.reactivationCount,
           origin: brief.deflection?.origin ?? brief.active,
-        });
+        }));
         events.onCommit.push(() => {
           this.#committedControlBriefs.add(brief);
         });
@@ -3312,6 +3470,7 @@ export class ArcHostService {
   }
 
   async #settle(
+    runtime: Runtime,
     recorder: RecordingRuntime,
     arcRunId: ArcRunId,
     initialState: ArcRunRuntimeState,
@@ -3328,6 +3487,19 @@ export class ArcHostService {
     const publishState = async (next: ArcRunRuntimeState): Promise<void> => {
       if (!brief.canProgress) {
         await recorder.captureHostModuleState(brief);
+        if (
+          brief.outcome === "interrupted" &&
+          !this.#committedControlBriefs.has(brief)
+        ) {
+          const interrupted = brief;
+          this.#captureRunEvent(opts.events.staged, () => ({
+            kind: "run:interrupted",
+            arcRunId,
+          }));
+          opts.events.onCommit.push(() => {
+            this.#committedControlBriefs.add(interrupted);
+          });
+        }
       }
       if (opts.events.onCommit.length > 0) opts.deferStatePublish = false;
       if (!opts.deferStatePublish) {
@@ -3336,7 +3508,7 @@ export class ArcHostService {
           instructionIssues,
         });
         this.#trackActionState(arcRunId, next, brief, recorder);
-        await this.#publishRunEvents(opts.events);
+        this.#enqueueRunEvents(opts.events);
       }
     };
     let brief = initial;
@@ -3454,13 +3626,13 @@ export class ArcHostService {
           ["node:exited", transition.exited],
         ] as const)
           for (const ref of refs)
-            opts.events.staged.push(
-              await this.#nodeTransitionEvent(
+            this.#captureRunEvent(opts.events.staged, () =>
+              this.#nodeTransitionEvent(
                 arcRunId,
                 kind,
                 ref,
                 transition.role,
-                state.snapshotId,
+                runtime,
               ),
             );
         continue;
@@ -3472,9 +3644,16 @@ export class ArcHostService {
           brief.hostCalls,
           { arcRunId, arcRef: state.arcRef },
           brief.traversals,
-          async () => {
+          async (publications = []) => {
             opts.deferStatePublish = false;
             await recorder.captureHostModuleState(brief);
+            for (const publication of publications) {
+              this.#captureRunEvent(opts.events.staged, () => ({
+                kind: "host-module:call",
+                arcRunId,
+                ...publication,
+              }));
+            }
             await publishState(state);
           },
         );
@@ -4050,35 +4229,35 @@ export class ArcHostService {
   }
 
   #enqueueRunEvents(events: RunEventCollection): void {
-    const publications = (events.publications ??= []);
-    for (const event of events.committed.splice(0)) {
-      let publication: Promise<unknown>;
+    for (const event of events.committed.splice(0))
+      this.#workEvents.publish(event);
+  }
+
+  /** Isolate optional construction and capture before later runtime mutations. */
+  #captureRunEvent(
+    target: CreateWorkEventInput[],
+    build: () => CreateWorkEventInput,
+  ): void {
+    try {
+      target.push(structuredClone(build()));
+    } catch (error) {
       try {
-        publication = this.#workEvents.append(event);
-      } catch (error) {
-        publication = Promise.reject(error);
+        this.#logger.info("arc_host.work_event.capture_failed", {
+          message: String(error),
+        });
+      } catch {
+        /* Observability diagnostics are optional too. */
       }
-      void publication.catch(() => undefined);
-      publications.push(publication);
     }
   }
 
-  async #publishRunEvents(events: RunEventCollection): Promise<void> {
-    this.#enqueueRunEvents(events);
-    await Promise.all(events.publications ?? []);
-    events.publications = [];
-  }
-
-  async #nodeTransitionEvent(
+  #nodeTransitionEvent(
     arcRunId: ArcRunId,
     kind: "node:entered" | "node:exited",
     ref: NodeRef,
     role: string,
-    snapshotId: ArcDocumentSnapshotId,
-  ): Promise<CreateWorkEventInput> {
-    // Activation can stage transitions before the first run-state commit.
-    // Resolve from its immutable snapshot, which already exists at this point.
-    const runtime = await this.#runtimeForSnapshot(snapshotId);
+    runtime: Runtime,
+  ): CreateWorkEventInput {
     const node = runtime.nodeForRef(ref);
     return {
       arcRunId,
@@ -4128,7 +4307,7 @@ export class ArcHostService {
       (existing?.lifecycle !== lifecycle ||
         existing.reactivationCount !== state.reactivationCount)
     ) {
-      events.committed.push(
+      this.#captureRunEvent(events.committed, () =>
         lifecycle === "poisoned"
           ? {
               kind: "run:poisoned",
@@ -4233,15 +4412,6 @@ export class ArcHostService {
     return true;
   }
 
-  /** Map a live frontier to its step, keyed by whether the run is triggering. */
-  #frontierToStep(arcRunId: ArcRunId, frontier: RunFrontier): ArcHostStep {
-    const kind =
-      this.#liveSessions.get(arcRunKey(arcRunId))?.kind === "triggering"
-        ? "trigger"
-        : "action";
-    return { kind, arcRunId, frontier };
-  }
-
   /** Hub-facing projection of a staged handshake (its `PendingHandshake` stays internal). */
   #handshakeStep(
     handshake: PendingHandshake,
@@ -4259,7 +4429,7 @@ export class ArcHostService {
     };
   }
 
-  async #stageRunChoiceHandshake(
+  #stageRunChoiceHandshake(
     arcRef: ArcRef,
     candidates: readonly RunChoiceCandidate[],
     request: ActivationRequest,
@@ -4269,7 +4439,7 @@ export class ArcHostService {
       reentrySelections?: readonly PendingReentrySelection[];
       freshAvailable?: boolean;
     } = {},
-  ): Promise<PendingHandshake> {
+  ): PendingHandshake {
     const freshAvailable = opts.freshAvailable ?? true;
     return this.#stageHandshake({
       id: this.#handshakes.newId(),
@@ -4291,7 +4461,7 @@ export class ArcHostService {
     });
   }
 
-  async #stageArcChoiceHandshake(
+  #stageArcChoiceHandshake(
     arcRef: ArcRef,
     request: ActivationRequest,
     triggerSelection: PendingTriggerSelection,
@@ -4300,7 +4470,7 @@ export class ArcHostService {
       reentrySelections?: readonly PendingReentrySelection[];
       freshAvailable?: boolean;
     } = {},
-  ): Promise<PendingHandshake> {
+  ): PendingHandshake {
     return this.#stageHandshake({
       id: this.#handshakes.newId(),
       clientId: request.clientId ?? "",
@@ -4319,12 +4489,12 @@ export class ArcHostService {
     });
   }
 
-  async #stageWorkspaceHandshake(
+  #stageWorkspaceHandshake(
     arcRef: ArcRef,
     request: ActivationRequest,
     triggerSelection: PendingTriggerSelection,
     dialog: Dialog,
-  ): Promise<PendingHandshake> {
+  ): PendingHandshake {
     return this.#stageHandshake({
       id: this.#handshakes.newId(),
       clientId: request.clientId ?? "",
@@ -4341,28 +4511,29 @@ export class ArcHostService {
     });
   }
 
-  async #stageHandshake(
-    handshake: PendingHandshake,
-  ): Promise<PendingHandshake> {
+  #stageHandshake(handshake: PendingHandshake): PendingHandshake {
     this.#handshakes.stage(handshake);
     const key = arcRunKey(handshake.triggerSelection.arcRunId);
     if (this.#liveSessions.get(key)?.kind === "preparing")
       this.#liveSessions.delete(key);
-    await this.#workEvents.append({
+    this.#workEvents.publish(() => ({
       kind: "run:handshake-pending",
       arcRunId: handshake.triggerSelection.arcRunId,
       handshakeId: handshake.id,
-    });
+    }));
     return handshake;
   }
 
-  async #consumeHandshake(
+  #consumeHandshake(
     handshake: PendingHandshake,
     outcome: HandshakeOutcome,
     operation: PreparationOperation,
-  ): Promise<void> {
-    if (this.#handshakes.get(handshake.id) !== handshake)
-      throw new Error(`Handshake ${handshake.id} is no longer pending.`);
+  ): boolean {
+    if (outcome.kind === "proceed" && !handshake.reentrySelections?.length) {
+      this.#assertFreshAvailable(handshake.triggerSelection);
+    }
+    if (this.#handshakes.get(handshake.id) !== handshake) return false;
+    if (!this.#handshakes.take(handshake.id)) return false;
     const preparing =
       outcome.kind === "proceed" || outcome.kind === "reentry"
         ? this.#prepare(
@@ -4371,22 +4542,32 @@ export class ArcHostService {
             handshake.arcRef,
           )
         : undefined;
-    if (!this.#handshakes.take(handshake.id)) {
-      if (preparing)
-        this.#releasePreparation(
-          handshake.triggerSelection.arcRunId,
-          preparing,
-        );
-      throw new Error(`Handshake ${handshake.id} is no longer pending.`);
-    }
     operation.entry = preparing;
     operation.arcRunId = handshake.triggerSelection.arcRunId;
-    await this.#workEvents.append({
+    this.#workEvents.publish(() => ({
       kind: "run:handshake-resolved",
       arcRunId: handshake.triggerSelection.arcRunId,
       handshakeId: handshake.id,
       outcome,
+    }));
+    return true;
+  }
+
+  #assertFreshAvailable(selection: PendingTriggerSelection): void {
+    if (!this.#freshRegistrations.get(selection)?.availability.available) {
+      throw new FreshActivationUnavailable(
+        `Fresh activation of ${selection.arcRef} is unavailable because its root registration was removed.`,
+      );
+    }
+  }
+
+  #missingFreshHandshake(id: string, reason: string): ResolveHandshakeResult {
+    this.#handshakes.take(id);
+    this.#logger.info("arc_host.handshake.unavailable", {
+      handshakeId: id,
+      reason,
     });
+    return { status: "missing" };
   }
 
   #validatedWorkspace(
@@ -4426,19 +4607,6 @@ function pendingTriggerSelection(
   };
 }
 
-function arcDescriptionFor(arc: RegisteredArc): string {
-  return `The ${arc.source}/${arc.identifier} arc needs a persistent workspace path for user-owned files shared across runs.`;
-}
-
-function cloneArcManifest(manifest: ArcManifest | undefined): ArcManifest {
-  return {
-    workspaceScope: manifest?.workspaceScope ?? "run",
-    bundle: { ...(manifest?.bundle ?? {}) },
-    contextIsolation: manifest?.contextIsolation ?? "role",
-  };
-}
-
-/** Normalize JSON-persisted values by dropping explicitly undefined fields. */
 function jsonComparable<T>(value: T): unknown {
   return JSON.parse(JSON.stringify(value)) as unknown;
 }
@@ -4913,6 +5081,7 @@ function arcRunView(state: ArcRunState): ArcRunView {
     arcRef: state.arcRef,
     ownerPrincipal: state.ownerPrincipal,
     lifecycle: state.lifecycle,
+    reactivationCount: state.reactivationCount,
     createdAt: state.createdAt,
     updatedAt: state.updatedAt,
     workspacePath: state.workspacePath,

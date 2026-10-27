@@ -10,7 +10,7 @@ Construct the host and hub, construct each module with its hub dependency, then 
 const host = new ArcHostService(hostOptions);
 const hub = new WorkerHubService({ ...hubOptions, arcHost: host });
 const time = new TimeModule(hub, nowMillis, scheduleTimeout);
-host.registerHostModule("time", time.module);
+await host.registerHostModule("time", time.module);
 ```
 
 The module calls the hub's internal `enqueueModuleEffect(arcRunId, effect, signal)` capability. This capability belongs to the module's dependency on the hub. The host owns submission and advancement and has no delivery callback. Delivery enqueues work synchronously; it does not await host advancement. The hub waits for the returned frontier and committed activation history before applying queued effects.
@@ -53,6 +53,15 @@ type HostCall = {
   moduleData?: PayloadValue;
 };
 
+/** Setup acknowledgment with private reconstruction data and optional public activity. */
+type HostCallAck = {
+  hostCallId: string;
+  /** Retained privately for reconstruction. */
+  moduleData?: PayloadValue;
+  /** Omitted publishes nothing; null publishes the call without data. */
+  publishedData?: PayloadValue | null;
+};
+
 /** Registered module implementation. Setup acknowledges before operation completion. */
 type HostModule = {
   declaration: HostModuleSpec;
@@ -67,7 +76,7 @@ type HostModule = {
       arcRunId: ArcRunId;
       signal: AbortSignal;
     },
-  ) => Promise<readonly { hostCallId: string; moduleData?: PayloadValue }[]>;
+  ) => Promise<readonly HostCallAck[]>;
   releaseRun?: (arcRunId: ArcRunId) => Promise<void>;
 };
 ```
@@ -77,6 +86,14 @@ The host validates concrete arguments before submission. Operation names are uns
 `options.arcRunId` identifies the current execution for effect delivery: an action run or a volatile trigger probe. `options.signal` identifies its process-local lifetime. Each effect uses that identity and signal together with its call's `hostCallId`. `context` describes the authored interaction: trigger calls have neither an action-run ID nor a selected Arc, while action calls carry both. A trigger probe's delivery identity does not imply that an action run exists.
 
 The host validates occurrence identity when admitting an outcome. Duplicate or temporarily inapplicable resolutions preserve the frontier and add no input. The hub retains deferred effects while allowing other work to advance; an abandoned occurrence cannot resolve a subsequent call.
+
+## Publishing activity
+
+A module opts into public activity separately on each acknowledgment by supplying `publishedData`. Omission publishes nothing; `null` publishes the call without additional data. The host validates this field as finite, acyclic payload data. Invalid optional data is diagnosed and omitted for that call while its valid acknowledgment and effects proceed. Required `moduleData`, acknowledgment identity/order, and persistence failures retain their operational effect. Private `moduleData` remains part of the run's reconstruction state; `publishedData` appears only in work events and is not retained in the call record.
+
+For action calls, the host publishes `host-module:call` with the occurrence ID, module, target path, operation, and published data after committing the acknowledgment. It publishes `host-module:effect` with the occurrence ID and outcome kind after committing an admitted outcome for a call whose publication opt-in committed in the current execution. The marker records opt-in rather than successful event storage; bounded optional publication may leave incomplete call/effect pairs. Calls can have multiple outcomes, such as a timeout's registration resolution followed by its interruption. Trigger calls publish neither event.
+
+Modules make the publication choice again on resubmission and republish outstanding work with its current public data. The host treats that data opaquely; each module documents its meaning. See [work-event semantics](../observability.md#host-module-activity) for ordering and interpretation.
 
 ## Declaration and registration
 

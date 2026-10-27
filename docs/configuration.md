@@ -8,27 +8,22 @@ ARCADE_CONFIG_FILE=./config.local.jsonc pnpm start
 
 The config file is parsed by `src/config.ts`, validated, and filled with schema defaults before services start. Values in `config.local.jsonc` are explicit recommended local deployment values, not the source of runtime defaults.
 
-Arcade config describes the deployment: which connectors start, where file-backed service state lives, which registered backend each worker slot selects, and which connector delivery rules are installed. The committed local deployment enables both the Web and MCP connectors. Connector runtime state carries the concrete principal, session, and user-selected workspace values that arrive with a connection or browser interaction.
+Arcade config describes service storage, worker-slot bindings, Arc discovery, and logging. Applications configure their own connectors and supply concrete principal, session, and workspace context through the service APIs.
 
 ## App Config
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `dataDir` | `.arcade-data` | Root directory for file-backed Arcade state and diagnostics. The app creates directories for Arc-host state, history, hub state, work events, routine diagnostics, replay data, artifacts, and connector inboxes. |
+| `dataDir` | `.arcade-data` | Root directory for file-backed Arcade state and diagnostics. The app creates directories for Arc-host state, history, hub state, work events, routine diagnostics, replay data, and artifacts. |
 | `arcsDir` | `.arcade/arcs` | Arc bundle directory path. The Arcade executable explicitly registers this directory; relative paths resolve from its cwd and from each discovered workspace under user connection working roots. |
 | `workers.default` | omitted | Complete slot used for roles without an explicit role slot or in-process worker. The backend name is an open-ended canonical string. |
 | `workers.fastTrigger` | omitted | Complete slot used only for trigger-stage semantic work. Set it to `null` explicitly when overriding a composed configuration that supplies one. |
 | `workers.roles` | `{}` | Complete slots keyed by Arc worker role. A slot embeds its backend-specific JSON configuration beside `backend`. |
 | `secrets.provider` | unset | Secret provider. Currently supports `env`. |
 | `secrets.env` | `{}` | Mapping from Arcade logical secret refs to process environment variable names. |
-| `connectors.mcp.host` | `127.0.0.1` | Host address for the MCP Streamable HTTP server. Use `0.0.0.0` only when the host network should expose Arcade outside loopback. |
-| `connectors.mcp.port` | `3177` | Port for the MCP Streamable HTTP server. |
-| `connectors.mcp.path` | `/mcp` | HTTP path for the MCP endpoint. |
-| `connectors.mcp.requirePrincipal` | `false` | When `true`, MCP submit calls must include `_meta["arcade.principal"]`. |
-| `arcHost.snapshotRuntimeCacheSize` | `32` | Maximum number of immutable Arc snapshot runtimes kept in memory. Set to `0` to disable runtime caching. |
+| `arcHost.snapshotRuntimeCacheSize` | `32` | Maximum completed entries in each of the immutable snapshot-data and compiled-runtime caches. Each cache retains up to this count and may contain different snapshot IDs. Set to `0` to retain neither; concurrent requests can still share an in-flight data load. |
 | `logging.level` | `info` | Arcade log verbosity: `silent`, `info`, or `debug`. |
 | `logging.format` | `json` | Arcade log output format: `json` or `pretty`. |
-| `deliveryRules` | `[]` | Connector delivery routing rules matched by `(role, audience, cause)`. |
 
 `dataDir` contains the file-backed state for the Arcade app process. For disposable manual checks, point it at a temporary path. For local development, the default `.arcade-data` keeps state beside the app checkout. For containerized runs, bind mount this directory if state should survive container replacement.
 
@@ -84,9 +79,9 @@ All `claude-sdk` and `openai-sdk` worker slots reject `provider`. When an OpenAI
 Arcade loads Arc bundles from two places:
 
 - The Arcade executable explicitly registers `arcsDir`, resolved relative to its process cwd. The `startArcade()` library factory performs no filesystem Arc registration.
-- For user connections that expose working roots, Arcade checks each supplied root for `arcsDir` before submit trigger evaluation. Matching roots become workspaces for the discovered Arcs. Descendant traversal is temporarily disabled; nested workspaces must be supplied explicitly.
+- Applications can use the discovery service to check supplied working roots for `arcsDir` before submit trigger evaluation. Matching roots become workspaces for the discovered Arcs. Descendant traversal is temporarily disabled; nested workspaces must be supplied explicitly.
 
-The MCP connector maps MCP roots into connection working roots. The Web App Connector receives its working root from browser-side principal/session state, currently through the entry-message API. The `arcsDir` setting remains the connector-agnostic relative discovery base path under each workspace.
+The owning application obtains working roots from its client or deployment context. The `arcsDir` setting is the relative discovery base path under each workspace.
 
 Each immediate subdirectory is one Arc bundle. The subdirectory name becomes the source name. A bundle must contain exactly one `*.arc.js` file. An optional `arcade.json` configures the workspace policy and bundle map. Missing arc directories load zero bundles.
 
@@ -110,41 +105,6 @@ Each immediate subdirectory is one Arc bundle. The subdirectory name becomes the
 
 The activating root bundle's `contextIsolation` value is captured when a fresh run starts and is the isolation floor for all nodes reached by that run, including imported nodes. An imported bundle's manifest does not replace that floor. Replacing a manifest affects later fresh runs; existing runs retain the policy stored with their pinned snapshot.
 
-## Delivery Rules
-
-Delivery rules route outbound Arc messages back to connector-facing targets. Each rule matches a situation and chooses a delivery mode.
-
-```json
-{
-  "situation": { "role": "*", "audience": "*", "cause": "reply" },
-  "delivery": "inbox",
-  "target": { "kind": "activator" }
-}
-```
-
-- `situation.role`, `situation.audience`, and `situation.cause` match outbound message fields. `*` is a wildcard.
-- `delivery` is `elicitation` for a synchronous prompt or `inbox` for async store-and-forward delivery.
-- `target.kind` is `activator` for the user connection that activated the run, or `principal` with an explicit `id`.
-
-MCP elicitations are intentionally compact. Arcade always persists the full outbound content in the connector inbox first, then sends an elicitation prompt with the inbox id, inbox URI, and a bounded preview. If a client clips the prompt, call `arcade_list_outbound_messages` and inspect the referenced inbox item before answering with the form or `arcade_answer_outbound_message`.
-
-## Web App Connector
-
-The Web App Connector is a local browser-facing connector. When the `connectors.web` section is present, Arcade starts an HTTP server that serves the built SPA assets and exposes `/api/*` endpoints for entry routing, run inspection, handshakes, outbound answers, artifacts, and run event streams.
-
-```json
-{
-  "connectors": {
-    "web": {
-      "host": "127.0.0.1",
-      "port": 3180
-    }
-  }
-}
-```
-
-Entry messages, handshake resolution, run listing, web-owned outbound listing, and outbound answers are wired to Arcade. Entry requests may include a principal/session working root; the connector checks that root for `arcsDir` and loads its Arc bundles before submit trigger evaluation. Built web assets are served from `dist/web`.
-
 ## Logging
 
 Arcade logs are emitted to the calling terminal.
@@ -162,6 +122,6 @@ Example:
   "at": "2026-05-11T10:00:00.000Z",
   "level": "info",
   "event": "arcade.app.started",
-  "connectorCount": 1
+  "connectorCount": 0
 }
 ```

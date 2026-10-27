@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { parse } from "@elem-app/arc/parser";
 import { toNodeRef } from "@elem-app/arc/runtime";
 import { describe, expect, it } from "vitest";
@@ -10,6 +14,8 @@ import {
 
 import {
   InMemoryArcHostStore,
+  JsonFileArcHostStore,
+  arcRunKey,
   taskId,
   type ArcRunId,
   type Dialog,
@@ -20,6 +26,8 @@ import {
   beginActivatedDriver,
   beginActivatedView,
   expectSoleDriver,
+  expectSoleTrigger,
+  observeSnapshotReads,
   projectorFor,
 } from "./arc-host-helpers.js";
 import {
@@ -29,14 +37,542 @@ import {
   INVALID_INSTRUCTION_SOURCE,
   OBSERVE_SOURCE,
   WATCH_SOURCE,
+  deferred,
   hostModule,
   makeArcHost,
   makeArcHostWithSource,
+  waitFor,
 } from "./helpers.js";
+
+const snapshotDialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+const snapshotManifest = {
+  workspaceScope: "run" as const,
+  contextIsolation: "role" as const,
+  bundle: { "guide/": "/tmp/snapshot-root" },
+};
+
+async function snapshotReadFixture(
+  store:
+    | InMemoryArcHostStore
+    | JsonFileArcHostStore = new InMemoryArcHostStore(),
+) {
+  const host = await createTestArcHost({ store });
+  await host.registerArcs([
+    {
+      source: "root",
+      document: parse(
+        '"arc"; import { Work } from "imported"; function Main() { this.trigger = () => true; $enter(Work); }',
+      ),
+      manifest: snapshotManifest,
+    },
+    {
+      source: "imported",
+      document: parse(
+        '"arc"; function Work() { this.description = "Pinned work"; $instruct("Work"); }',
+      ),
+      manifest: {
+        ...snapshotManifest,
+        bundle: { "guide/": "/tmp/snapshot-imported" },
+      },
+    },
+  ]);
+  const driver = await beginActivatedDriver(host, snapshotDialog);
+  const reads = observeSnapshotReads(store);
+  const ref = toNodeRef("imported", ["Work"]);
+  return { store, host, driver, reads, ref };
+}
+
+describe("Snapshot read caching", () => {
+  it.each(["single root", "ambiguous roots"] as const)(
+    "reuses warm live trigger snapshot reads with %s",
+    async (roots) => {
+      const store = new InMemoryArcHostStore();
+      const host = await createTestArcHost({ store });
+      await host.registerArc(
+        "trigger-cache",
+        parse(`"arc";
+function Main() { this.description = "Captured trigger"; this.trigger = () => judge("Start?"); }
+${roots === "ambiguous roots" ? 'function Other() { this.trigger = () => judge("Other?"); }' : ""}`),
+        snapshotManifest,
+      );
+      try {
+        const probe = expectSoleTrigger(
+          await host.begin({
+            dialog: snapshotDialog,
+            principal: ALICE_OWNER,
+            inbound: { content: "start" },
+            projectDialog: projectorFor(snapshotDialog),
+          }),
+        );
+        const ref = toNodeRef("trigger-cache", ["Main"]);
+        await host.getRunWorkspaceContext(probe.arcRunId);
+        await host.nodeInfoForRef(ref, probe.arcRunId);
+        await host.registerArc(
+          "trigger-cache",
+          parse(
+            '"arc"; function Main() { this.description = "Latest trigger"; }',
+          ),
+          snapshotManifest,
+          { replace: true },
+        );
+        const reads = observeSnapshotReads(store);
+        for (let i = 0; i < 2; i++) {
+          expect(
+            (await host.getRunWorkspaceContext(probe.arcRunId)).workspaceBundle,
+          ).toEqual(roots === "single root" ? snapshotManifest.bundle : {});
+          expect(
+            (await host.nodeInfoForRef(ref, probe.arcRunId)).description,
+          ).toBe("Captured trigger");
+        }
+        expect(reads.counts()).toEqual({ state: 0, snapshot: 0, record: 0 });
+        expect((await host.nodeInfoForRef(ref)).description).toBe(
+          "Latest trigger",
+        );
+        await expect(host.nodeInfoForRef(ref, "unknown-probe")).rejects.toThrow(
+          "Unknown Arc run",
+        );
+        await expect(
+          host.nodeInfoForRef(
+            toNodeRef("trigger-cache", ["Absent"]),
+            probe.arcRunId,
+          ),
+        ).rejects.toThrow("snapshot has no node");
+      } finally {
+        await host.stop();
+      }
+    },
+  );
+
+  it.each(["snapshot", "record"] as const)(
+    "shares concurrent snapshot data while the %s read is pending",
+    async (boundary) => {
+      const { host, store, driver, reads, ref } = await snapshotReadFixture();
+      await host.stop();
+      const restarted = await createTestArcHost({ store });
+      const entered = deferred();
+      const release = deferred();
+      if (boundary === "snapshot") {
+        reads.snapshot.mockImplementationOnce(async (id) => {
+          entered.resolve();
+          await release.promise;
+          return InMemoryArcHostStore.prototype.getArcDocumentSnapshot.call(
+            store,
+            id,
+          );
+        });
+      } else {
+        reads.record.mockImplementationOnce(async (id) => {
+          entered.resolve();
+          await release.promise;
+          return InMemoryArcHostStore.prototype.getArcDocumentRecord.call(
+            store,
+            id,
+          );
+        });
+      }
+      reads.reset();
+      const loading = Promise.all([
+        restarted.getRunWorkspaceContext(driver.arcRunId),
+        restarted.nodeInfoForRef(ref, driver.arcRunId),
+        restarted.nodeInfoForRef(ref, driver.arcRunId),
+      ]);
+      try {
+        await entered.promise;
+        expect(reads.snapshot).toHaveBeenCalledTimes(1);
+        release.resolve();
+        const [workspace, node, otherNode] = await loading;
+        expect(workspace.workspaceBundle).toEqual(snapshotManifest.bundle);
+        expect(node).toEqual({ name: "Work", description: "Pinned work" });
+        expect(otherNode).toEqual(node);
+        expect(reads.counts()).toEqual({ state: 3, snapshot: 1, record: 2 });
+      } finally {
+        release.resolve();
+        await loading;
+        await restarted.stop();
+      }
+    },
+  );
+
+  it("loads independent snapshot identities while another load is held", async () => {
+    const { host, store, driver, reads } = await snapshotReadFixture();
+    const second = await beginActivatedDriver(host, snapshotDialog, {
+      principal: "second",
+    });
+    const firstState = await store.getState(arcRunKey(driver.arcRunId));
+    await host.stop();
+    const restarted = await createTestArcHost({ store });
+    const entered = deferred();
+    const release = deferred();
+    reads.snapshot.mockImplementation(async (id) => {
+      if (id === firstState!.snapshotId) {
+        entered.resolve();
+        await release.promise;
+      }
+      return InMemoryArcHostStore.prototype.getArcDocumentSnapshot.call(
+        store,
+        id,
+      );
+    });
+    reads.reset();
+    const first = restarted.getRunWorkspaceContext(driver.arcRunId);
+    try {
+      await entered.promise;
+      expect(
+        (await restarted.getRunWorkspaceContext(second.arcRunId))
+          .workspaceBundle,
+      ).toEqual(snapshotManifest.bundle);
+      expect(reads.snapshot).toHaveBeenCalledTimes(2);
+      release.resolve();
+      expect((await first).workspaceBundle).toEqual(snapshotManifest.bundle);
+    } finally {
+      release.resolve();
+      await first;
+      await restarted.stop();
+    }
+  });
+
+  it.each(["read failure", "missing record", "invalid manifest"] as const)(
+    "rejects all snapshot waiters after %s and retries the whole load",
+    async (failure) => {
+      const { host, store, driver, reads, ref } = await snapshotReadFixture();
+      await host.stop();
+      const restarted = await createTestArcHost({ store });
+      const entered = deferred();
+      const release = deferred();
+      reads.record.mockImplementation(async (id) => {
+        const record =
+          await InMemoryArcHostStore.prototype.getArcDocumentRecord.call(
+            store,
+            id,
+          );
+        if (record?.source === "imported") {
+          entered.resolve();
+          await release.promise;
+          if (failure === "read failure") throw new Error("Read failed");
+          if (failure === "missing record") return undefined;
+          return {
+            ...record,
+            manifest: { ...record.manifest, bundle: { guide: "relative" } },
+          };
+        }
+        return record;
+      });
+      reads.reset();
+      const loading = Promise.allSettled([
+        restarted.getRunWorkspaceContext(driver.arcRunId),
+        restarted.nodeInfoForRef(ref, driver.arcRunId),
+      ]);
+      try {
+        await entered.promise;
+        expect(reads.record).toHaveBeenCalledTimes(2);
+        release.resolve();
+        const results = await loading;
+        const message =
+          failure === "read failure"
+            ? /Read failed/
+            : failure === "missing record"
+              ? /record not found/
+              : /Invalid Arc manifest/;
+        for (const result of results) {
+          expect(result.status).toBe("rejected");
+          if (result.status === "rejected")
+            expect(result.reason.message).toMatch(message);
+        }
+        reads.record.mockImplementation((id) =>
+          InMemoryArcHostStore.prototype.getArcDocumentRecord.call(store, id),
+        );
+        reads.reset();
+        await restarted.getRunWorkspaceContext(driver.arcRunId);
+        expect(
+          (await restarted.nodeInfoForRef(ref, driver.arcRunId)).description,
+        ).toBe("Pinned work");
+        expect(reads.counts()).toEqual({ state: 2, snapshot: 1, record: 2 });
+      } finally {
+        release.resolve();
+        await loading;
+        await restarted.stop();
+      }
+    },
+  );
+
+  it("retries missing snapshots and rejects a source absent from a complete snapshot", async () => {
+    const { host, store, driver, reads, ref } = await snapshotReadFixture();
+    await host.stop();
+    const restarted = await createTestArcHost({ store });
+    try {
+      reads.snapshot.mockResolvedValueOnce(undefined);
+      await expect(
+        restarted.nodeInfoForRef(ref, driver.arcRunId),
+      ).rejects.toThrow("snapshot not found");
+      await expect(
+        restarted.nodeInfoForRef(ref, driver.arcRunId),
+      ).resolves.toHaveProperty("name", "Work");
+      const state = (await store.getState(arcRunKey(driver.arcRunId)))!;
+      await store.putState(arcRunKey(driver.arcRunId), {
+        ...state,
+        arcRef: "arc:absent:Main",
+      });
+      await expect(
+        restarted.getRunWorkspaceContext(driver.arcRunId),
+      ).rejects.toThrow("has no document for source absent");
+    } finally {
+      await restarted.stop();
+    }
+  });
+
+  it.each(["data", "runtime"] as const)(
+    "promotes snapshot data on a %s hit before LRU eviction",
+    async (hit) => {
+      const { host, store, driver, reads, ref } = await snapshotReadFixture();
+      const second = await beginActivatedDriver(host, snapshotDialog, {
+        principal: "second",
+      });
+      const third = await beginActivatedDriver(host, snapshotDialog, {
+        principal: "third",
+      });
+      await host.stop();
+      const restarted = await createTestArcHost({
+        store,
+        snapshotRuntimeCacheSize: 2,
+      });
+      try {
+        await restarted.nodeInfoForRef(ref, driver.arcRunId);
+        await restarted.nodeInfoForRef(ref, second.arcRunId);
+        if (hit === "data")
+          await restarted.getRunWorkspaceContext(driver.arcRunId);
+        else await restarted.nodeInfoForRef(ref, driver.arcRunId);
+        await restarted.getRunWorkspaceContext(third.arcRunId);
+        reads.reset();
+        await restarted.getRunWorkspaceContext(driver.arcRunId);
+        // B's runtime remains resident after its data is evicted. It must not hydrate data.
+        await restarted.nodeInfoForRef(ref, second.arcRunId);
+        expect(reads.counts()).toEqual({ state: 2, snapshot: 0, record: 0 });
+        reads.reset();
+        await restarted.getRunWorkspaceContext(second.arcRunId);
+        expect(reads.counts()).toEqual({ state: 1, snapshot: 1, record: 2 });
+      } finally {
+        await restarted.stop();
+      }
+    },
+  );
+
+  it("bounds both snapshot caches at one completed entry", async () => {
+    const { host, store, driver, reads, ref } = await snapshotReadFixture();
+    const second = await beginActivatedDriver(host, snapshotDialog, {
+      principal: "second",
+    });
+    await host.stop();
+    const restarted = await createTestArcHost({
+      store,
+      snapshotRuntimeCacheSize: 1,
+    });
+    try {
+      for (const id of [driver.arcRunId, second.arcRunId, driver.arcRunId]) {
+        reads.reset();
+        expect((await restarted.nodeInfoForRef(ref, id)).description).toBe(
+          "Pinned work",
+        );
+        expect(reads.counts()).toEqual({ state: 1, snapshot: 1, record: 2 });
+        await restarted.getRunWorkspaceContext(id);
+        expect(reads.counts()).toEqual({ state: 2, snapshot: 1, record: 2 });
+      }
+    } finally {
+      await restarted.stop();
+    }
+  });
+
+  it("shares only outstanding snapshot loads when caching is disabled", async () => {
+    const { host, store, driver, reads, ref } = await snapshotReadFixture();
+    await host.stop();
+    const restarted = await createTestArcHost({
+      store,
+      snapshotRuntimeCacheSize: 0,
+    });
+    const entered = deferred();
+    const release = deferred();
+    reads.snapshot.mockImplementationOnce(async (id) => {
+      entered.resolve();
+      await release.promise;
+      return InMemoryArcHostStore.prototype.getArcDocumentSnapshot.call(
+        store,
+        id,
+      );
+    });
+    reads.reset();
+    const loading = Promise.all([
+      restarted.getRunWorkspaceContext(driver.arcRunId),
+      restarted.nodeInfoForRef(ref, driver.arcRunId),
+    ]);
+    try {
+      await entered.promise;
+      release.resolve();
+      await loading;
+      expect(reads.counts()).toEqual({ state: 2, snapshot: 1, record: 2 });
+      reads.reset();
+      await restarted.getRunWorkspaceContext(driver.arcRunId);
+      await restarted.nodeInfoForRef(ref, driver.arcRunId);
+      await restarted.nodeInfoForRef(ref, driver.arcRunId);
+      expect(reads.counts()).toEqual({ state: 3, snapshot: 3, record: 6 });
+    } finally {
+      release.resolve();
+      await loading;
+      await restarted.stop();
+    }
+  });
+
+  it.each(["action", "trigger"] as const)(
+    "retains captured %s snapshot identity during session release",
+    async (stage) => {
+      const store = new InMemoryArcHostStore();
+      const host = await createTestArcHost({
+        store,
+        snapshotRuntimeCacheSize: 0,
+      });
+      await host.registerArc(
+        "release-cache",
+        parse(
+          `"arc"; function Main() { this.description = "Captured"; this.trigger = () => ${stage === "trigger" ? 'judge("Start?")' : "true"}; $instruct("Work"); }`,
+        ),
+        snapshotManifest,
+      );
+      const [step] = await host.begin({
+        dialog: snapshotDialog,
+        principal: ALICE_OWNER,
+        inbound: { content: "start" },
+        projectDialog: projectorFor(snapshotDialog),
+      });
+      if (step?.kind !== "trigger" && step?.kind !== "action")
+        throw new Error("Expected live session");
+      const entered = deferred();
+      const release = deferred();
+      const reads = observeSnapshotReads(store);
+      reads.snapshot.mockImplementationOnce(async (id) => {
+        entered.resolve();
+        await release.promise;
+        return InMemoryArcHostStore.prototype.getArcDocumentSnapshot.call(
+          store,
+          id,
+        );
+      });
+      const ref = toNodeRef("release-cache", ["Main"]);
+      const loading = Promise.all([
+        host.getRunWorkspaceContext(step.arcRunId),
+        host.nodeInfoForRef(ref, step.arcRunId),
+      ]);
+      try {
+        await entered.promise;
+        await host.releaseAction(step.arcRunId, step.frontier.frontierId);
+        await host.registerArc(
+          "release-cache",
+          parse('"arc"; function Main() { this.description = "Replacement"; }'),
+          { ...snapshotManifest, bundle: {} },
+          { replace: true },
+        );
+        release.resolve();
+        const [workspace, node] = await loading;
+        expect(workspace.workspaceBundle).toEqual(snapshotManifest.bundle);
+        expect(node.description).toBe("Captured");
+        expect(reads.state).not.toHaveBeenCalled();
+        if (stage === "trigger") {
+          await expect(host.nodeInfoForRef(ref, step.arcRunId)).rejects.toThrow(
+            "Unknown Arc run",
+          );
+          await expect(
+            host.getRunWorkspaceContext(step.arcRunId),
+          ).rejects.toThrow("no workspace context");
+        } else {
+          await expect(
+            host.nodeInfoForRef(ref, step.arcRunId),
+          ).resolves.toHaveProperty("description", "Captured");
+          expect(reads.state).toHaveBeenCalledTimes(1);
+        }
+      } finally {
+        release.resolve();
+        await loading;
+        await host.stop();
+      }
+    },
+  );
+
+  it("keeps cached manifests detached from returned workspace bundles", async () => {
+    const { host, driver, reads, ref } = await snapshotReadFixture();
+    try {
+      const workspace = await host.getRunWorkspaceContext(driver.arcRunId);
+      workspace.workspaceBundle["guide/"] = "/tmp/mutated";
+      await host.registerHostModule("unused-cache-module", {
+        declaration: HOST_MODULE_DECLARATIONS.booleanValue,
+      });
+      reads.reset();
+      expect(
+        (await host.getRunWorkspaceContext(driver.arcRunId)).workspaceBundle,
+      ).toEqual(snapshotManifest.bundle);
+      expect(
+        (await host.nodeInfoForRef(ref, driver.arcRunId)).description,
+      ).toBe("Pinned work");
+      expect(reads.counts()).toEqual({ state: 0, snapshot: 0, record: 0 });
+    } finally {
+      await host.stop();
+    }
+  });
+
+  it("reuses warm snapshot data and runtime without live action state reads", async () => {
+    const { host, driver, reads, ref } = await snapshotReadFixture();
+    try {
+      await host.getRunWorkspaceContext(driver.arcRunId);
+      await host.nodeInfoForRef(ref, driver.arcRunId);
+      reads.reset();
+      for (let i = 0; i < 3; i++) {
+        expect(
+          (await host.getRunWorkspaceContext(driver.arcRunId)).workspaceBundle,
+        ).toEqual(snapshotManifest.bundle);
+        expect(await host.nodeInfoForRef(ref, driver.arcRunId)).toEqual({
+          name: "Work",
+          description: "Pinned work",
+        });
+      }
+      expect(reads.counts()).toEqual({ state: 0, snapshot: 0, record: 0 });
+    } finally {
+      await host.stop();
+    }
+  });
+
+  it.each(["memory", "JSON"] as const)(
+    "loads one complete %s snapshot for reconstructed metadata and keeps durable identity reads",
+    async (storage) => {
+      const dir =
+        storage === "JSON"
+          ? await mkdtemp(join(tmpdir(), "arcade-snapshot-cache-"))
+          : undefined;
+      const { host, store, driver, reads, ref } = await snapshotReadFixture(
+        dir ? new JsonFileArcHostStore({ dir }) : undefined,
+      );
+      await host.stop();
+      const restarted = await createTestArcHost({ store });
+      try {
+        reads.reset();
+        expect(
+          (await restarted.getRunWorkspaceContext(driver.arcRunId))
+            .workspaceBundle,
+        ).toEqual(snapshotManifest.bundle);
+        expect(
+          (await restarted.nodeInfoForRef(ref, driver.arcRunId)).description,
+        ).toBe("Pinned work");
+        expect(reads.counts()).toEqual({ state: 2, snapshot: 1, record: 2 });
+        reads.reset();
+        await restarted.getRunWorkspaceContext(driver.arcRunId);
+        await restarted.nodeInfoForRef(ref, driver.arcRunId);
+        expect(reads.counts()).toEqual({ state: 2, snapshot: 0, record: 0 });
+      } finally {
+        await restarted.stop();
+        if (dir) await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
+});
 
 describe("Arc host interface", () => {
   it("omits node guidance from every request in a shared trigger role batch", async () => {
-    const host = makeArcHost();
+    const host = await makeArcHost();
     await host.registerArc(
       "guided-triggers",
       parse(`"arc";
@@ -100,7 +636,7 @@ function Third() {
   it("exposes preparing between accepted workspace and execution commit and cleans failed commits", async () => {
     for (const fail of [false, true]) {
       const store = new InMemoryArcHostStore();
-      const host = createTestArcHost({ store });
+      const host = await createTestArcHost({ store });
       await host.registerArc(
         "preparing-view",
         parse(
@@ -153,6 +689,10 @@ function Third() {
         stage: "preparing",
         workspacePath: "/tmp/preparing-view",
       });
+      expect(await host.getRunView(id)).not.toHaveProperty("reactivationCount");
+      await waitFor(
+        async () => (await workEventsFor(host).list(id)).length === 2,
+      );
       expect(
         (await workEventsFor(host).list(id)).map((event) => event.kind),
       ).toEqual(["run:handshake-pending", "run:handshake-resolved"]);
@@ -169,11 +709,22 @@ function Third() {
         ).toBe(false);
       } else {
         expect(result).toHaveProperty("value.status", "ok");
+        expect(result).toHaveProperty("value.step.reactivationCount", 0);
         expect(await host.getRunView(id)).toMatchObject({
           stage: "actioning",
           lifecycle: "active",
+          reactivationCount: 0,
         });
-        expect((await workEventsFor(host).list(id)).at(-1)).toMatchObject({
+        await waitFor(async () =>
+          (await workEventsFor(host).list(id)).some(
+            (event) => event.kind === "run:started",
+          ),
+        );
+        expect(
+          (await workEventsFor(host).list(id)).find(
+            (event) => event.kind === "run:started",
+          ),
+        ).toMatchObject({
           kind: "run:started",
           route: "fresh",
         });
@@ -182,7 +733,7 @@ function Third() {
   });
 
   it("keeps preparing readable while accepting an arc choice stages its next handshake", async () => {
-    const host = makeArcHost();
+    const host = await makeArcHost();
     for (const source of ["prepare-a", "prepare-b"])
       await host.registerArc(
         source,
@@ -568,8 +1119,8 @@ function Main() {
   });
 
   it("poisons action frontiers when a host call handler throws", async () => {
-    const arcHost = makeArcHost();
-    arcHost.registerHostModule(
+    const arcHost = await makeArcHost();
+    await arcHost.registerHostModule(
       "rng",
       hostModule(
         moduleHubFor(arcHost),
@@ -621,8 +1172,8 @@ function Main() {
       call: HostCall;
       context: { arcRunId?: ArcRunId };
     }[] = [];
-    const arcHost = makeArcHost();
-    arcHost.registerHostModule(
+    const arcHost = await makeArcHost();
+    await arcHost.registerHostModule(
       "gate",
       hostModule(
         moduleHubFor(arcHost),
@@ -684,8 +1235,8 @@ function Main() {
       call: HostCall;
       context: { arcRunId?: ArcRunId; arcRef?: string };
     }[] = [];
-    const arcHost = makeArcHost();
-    arcHost.registerHostModule(
+    const arcHost = await makeArcHost();
+    await arcHost.registerHostModule(
       "rng",
       hostModule(
         moduleHubFor(arcHost),
@@ -752,8 +1303,8 @@ function Main() {
 
   it("invalid handler results are rejected before traversal progress", async () => {
     let calls = 0;
-    const arcHost = makeArcHost();
-    arcHost.registerHostModule(
+    const arcHost = await makeArcHost();
+    await arcHost.registerHostModule(
       "rng",
       hostModule(
         moduleHubFor(arcHost),
@@ -800,8 +1351,8 @@ function Main() {
       call: HostCall;
       context: { arcRunId?: ArcRunId; arcRef?: string };
     }[] = [];
-    const arcHost = makeArcHost();
-    arcHost.registerHostModule(
+    const arcHost = await makeArcHost();
+    await arcHost.registerHostModule(
       "audit",
       hostModule(
         moduleHubFor(arcHost),
@@ -857,8 +1408,8 @@ function Main() {
 
   it("confirms host calls before continuing to later nodes", async () => {
     const effects: HostCall[] = [];
-    const arcHost = makeArcHost();
-    arcHost.registerHostModule(
+    const arcHost = await makeArcHost();
+    await arcHost.registerHostModule(
       "audit",
       hostModule(
         moduleHubFor(arcHost),
@@ -926,8 +1477,8 @@ function Main() {
   });
 
   it("poisons action frontiers when a standalone host call fails", async () => {
-    const arcHost = makeArcHost();
-    arcHost.registerHostModule(
+    const arcHost = await makeArcHost();
+    await arcHost.registerHostModule(
       "audit",
       hostModule(
         moduleHubFor(arcHost),
@@ -1378,7 +1929,7 @@ function Main() {
 
   it("carries transition metadata from the run's immutable snapshot", async () => {
     const store = new InMemoryArcHostStore();
-    const first = createTestArcHost({ store });
+    const first = await createTestArcHost({ store });
     await first.registerArc(
       "snapshot-transition",
       parse(`
@@ -1403,7 +1954,7 @@ function Main() {
         projectDialog: projectorFor(DEFAULT_VIEW),
       }),
     );
-    const second = createTestArcHost({ store });
+    const second = await createTestArcHost({ store });
     await second.registerArc(
       "snapshot-transition",
       parse(`
@@ -1421,14 +1972,24 @@ function Main() {
 `),
     );
     await expect(
-      second.nodeInfoForRunRef(
-        begun.arcRunId,
+      second.nodeInfoForRef(
         toNodeRef("snapshot-transition", ["Main", "Child"]),
+        begun.arcRunId,
       ),
     ).resolves.toEqual({
       name: "Child",
       description: "Old child description.",
     });
+    const ref = toNodeRef("snapshot-transition", ["Main", "Child"]);
+    await expect(second.nodeInfoForRef(ref)).resolves.toEqual({
+      name: "Child",
+      description: "Replacement child description.",
+    });
+    for (const unknownId of ["unknown-run", ""]) {
+      await expect(second.nodeInfoForRef(ref, unknownId)).rejects.toThrow(
+        `Unknown Arc run ${unknownId}.`,
+      );
+    }
   });
 
   it("settles corridors far past MAX_SETTLE_STEPS: transitions are exempt", async () => {

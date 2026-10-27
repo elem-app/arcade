@@ -28,7 +28,7 @@ describe("Worker hub worker selection", () => {
     const embedded = vi.fn(
       async () => ({ outcome: "disposition", deflect: {} }) as const,
     );
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     workerHub.addBackend(
       "configured-agent",
       workerBackend(["role"], configured),
@@ -50,7 +50,7 @@ describe("Worker hub worker selection", () => {
       async () => ({ outcome: "disposition", deflect: {} }) as const,
     );
     const embedded = vi.fn(async () => ({ outcome: "completed" }) as const);
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     workerHub.addBackend("default-agent", workerBackend(["default"], fallback));
     workerHub.registerRoleWorker("researcher", embedded);
     await workerHub.start({
@@ -66,7 +66,7 @@ describe("Worker hub worker selection", () => {
   it("routes an unbound role through the default worker slot", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const fallback = vi.fn(async () => ({ outcome: "completed" }) as const);
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     workerHub.addBackend("default-agent", workerBackend(["default"], fallback));
     await workerHub.start({
       workers: { default: { backend: "default-agent" } },
@@ -80,7 +80,7 @@ describe("Worker hub worker selection", () => {
   it("persists a terminal failed routine when no worker slot resolves", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    const workerHub = createWorkerHub(arcHost, routineStore);
+    const workerHub = await createWorkerHub(arcHost, routineStore);
     await workerHub.start();
 
     const { arcRunId } = await settleFirstRoutine(workerHub, routineStore);
@@ -106,7 +106,7 @@ describe("Worker hub worker selection", () => {
   it("persists the selected registry backend on the routine", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    const workerHub = createWorkerHub(arcHost, routineStore);
+    const workerHub = await createWorkerHub(arcHost, routineStore);
     workerHub.addBackend(
       "selected-agent",
       workerBackend(["role"], async () => ({ outcome: "completed" })),
@@ -130,7 +130,7 @@ describe("Worker hub worker selection", () => {
       semanticAnswer(input, false),
     );
     const ordinary = vi.fn(async () => ({ outcome: "completed" }) as const);
-    const workerHub = makeConfiguredRoutingHub(arcHost, fast, ordinary);
+    const workerHub = await makeConfiguredRoutingHub(arcHost, fast, ordinary);
     await workerHub.start({
       workers: {
         default: { backend: "ordinary-agent" },
@@ -163,7 +163,7 @@ function Watch() {
     const ordinary = vi.fn(async (input: RoutineInput) =>
       semanticAnswer(input, true),
     );
-    const workerHub = makeConfiguredRoutingHub(arcHost, fast, ordinary);
+    const workerHub = await makeConfiguredRoutingHub(arcHost, fast, ordinary);
     await workerHub.start({
       workers: {
         default: { backend: "ordinary-agent" },
@@ -181,7 +181,7 @@ function Watch() {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const fast = vi.fn(async () => ({ outcome: "completed" }) as const);
     const ordinary = vi.fn(async () => ({ outcome: "completed" }) as const);
-    const workerHub = makeConfiguredRoutingHub(arcHost, fast, ordinary);
+    const workerHub = await makeConfiguredRoutingHub(arcHost, fast, ordinary);
     await workerHub.start({
       workers: {
         default: { backend: "ordinary-agent" },
@@ -196,7 +196,7 @@ function Watch() {
   });
 
   it("overlaps different roles and trigger action contexts on one shared default worker", async () => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc("researcher", parse(roleSource("researcher")));
     await arcHost.registerArc("reviewer", parse(roleSource("reviewer")));
     const inputs: RoutineInput[] = [];
@@ -204,7 +204,7 @@ function Watch() {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     let created = 0;
     workerHub.addBackend("shared", {
       supportedSlotKinds: new Set(["default"]),
@@ -284,7 +284,7 @@ function Watch() {
         ? semanticAnswer(input, false)
         : ({ outcome: "completed" } as const);
     };
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     workerHub.addBackend("ordinary-agent", workerBackend(["default"], run));
     workerHub.addBackend("fast-agent", workerBackend(["fast-trigger"], run));
     await workerHub.start({
@@ -354,14 +354,15 @@ function semanticAnswer(input: RoutineInput, value: boolean): RoutineReport {
   };
 }
 
-function createWorkerHub(
-  arcHost: ArcHostService = makeArcHost(),
-  routineStore = executionControlFor(arcHost),
-): WorkerHubService {
+async function createWorkerHub(
+  arcHost?: ArcHostService,
+  routineStore?: ReturnType<typeof executionControlFor>,
+): Promise<WorkerHubService> {
+  arcHost ??= await makeArcHost();
   return new WorkerHubService({
     arcHost,
     historyStore: new InMemoryHistoryStore(),
-    routineStore,
+    routineStore: routineStore ?? executionControlFor(arcHost),
     workEvents: workEventsFor(arcHost),
     routineDiagnosticsStore: new FileRoutineDiagnosticsStore(
       join(tmpdir(), "arcade-worker-hub-selection-tests"),
@@ -380,12 +381,12 @@ function workerBackend(
   };
 }
 
-function makeConfiguredRoutingHub(
+async function makeConfiguredRoutingHub(
   arcHost: ArcHostService,
   fast: (input: RoutineInput) => Promise<unknown>,
   ordinary: (input: RoutineInput) => Promise<unknown>,
-): WorkerHubService {
-  const workerHub = createWorkerHub(arcHost);
+): Promise<WorkerHubService> {
+  const workerHub = await createWorkerHub(arcHost);
   workerHub.addBackend("fast-agent", workerBackend(["fast-trigger"], fast));
   workerHub.addBackend("ordinary-agent", workerBackend(["default"], ordinary));
   return workerHub;

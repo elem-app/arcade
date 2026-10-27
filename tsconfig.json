@@ -12,13 +12,6 @@
     "noUncheckedIndexedAccess": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": [
-    "src/**/*",
-    "__tests__/**/*",
-    "web/__tests__/**/*",
-    "e2e-test/**/*",
-    "examples/**/*",
-    "eval/**/*"
-  ],
-  "exclude": ["node_modules", "web/__tests__/**/*.tsx"]
+  "include": ["src/**/*", "__tests__/**/*", "examples/**/*", "eval/**/*"],
+  "exclude": ["node_modules"]
 }

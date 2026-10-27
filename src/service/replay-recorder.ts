@@ -276,7 +276,10 @@ export class RecordingRuntime {
       /** Checks execution admission immediately before runtime progress. */
       beforeProgress?: () => void;
       /** Runs after runtime progress, before recording the resulting checkpoint. */
-      progressed?: (output: ActionBrief | TerminalBrief) => void;
+      progressed?: (
+        output: ActionBrief | TerminalBrief,
+        moduleEffectAdmitted: boolean,
+      ) => void;
       moduleEffect?: HostModuleEffect;
     } = {},
   ): Promise<ActionBrief | TerminalBrief> {
@@ -293,7 +296,7 @@ export class RecordingRuntime {
       next,
       validation.rejected ? undefined : opts.moduleEffect,
     );
-    opts.progressed?.(next);
+    opts.progressed?.(next, admitted);
     if (position) {
       await this.#recordActionReport(
         position.index,

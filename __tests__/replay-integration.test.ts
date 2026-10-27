@@ -4,6 +4,7 @@ import { moduleHubFor, workEventsFor } from "./work-event-fixtures.js";
 
 import {
   ArcHostService,
+  arcRunKey,
   DEFAULT_WORKER_ROLE,
   handoffCheckpoint,
   InMemoryReplayStore,
@@ -77,7 +78,7 @@ type RecordedRun = {
 async function withRecordedRun(
   body: (ctx: RecordedRun) => Promise<void>,
 ): Promise<void> {
-  const { host, replay } = makeReplayHost();
+  const { host, replay } = await makeReplayHost();
   await host.registerArc("onboard", parse(ONBOARD_V1));
   const { workerHub } = makeWorkerHub({
     arcHost: host,
@@ -118,6 +119,68 @@ function workerActionReports(
 }
 
 describe("replay end-to-end via the hub + a testing operator connector", () => {
+  it("returns successor checkpoint identity at nonzero counts without WorkEvents", async () => {
+    const { host, replay, store } = await makeReplayHost();
+    workEventsFor(host).close();
+    await host.registerArc(
+      "successor-count",
+      parse(
+        '"arc"; function Main() { this.trigger = () => true; this.forgetfulEntry = true; $enter(Wait); function Wait() { this.guard = () => State.DEFLECTED; } }',
+      ),
+    );
+    const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+    const input = {
+      principal: REPLAY_OWNER,
+      dialog,
+      inbound: { content: "start" },
+      projectDialog: async () => dialog,
+    };
+    try {
+      const first = (await host.begin(input))[0];
+      if (first?.kind !== "action") throw new Error("Expected activation");
+      const gate = (await host.begin(input))[0];
+      if (gate?.kind !== "handshake")
+        throw new Error("Expected reentry choice");
+      const second = await host.resolveHandshake(
+        gate.handshakeId,
+        { runChoice: { action: "join", arcRunId: first.arcRunId } },
+        { projectDialog: input.projectDialog },
+      );
+      expect(second).toMatchObject({
+        status: "ok",
+        step: { kind: "action", reactivationCount: 1 },
+      });
+      const original = await store.getState(arcRunKey(first.arcRunId));
+      const checkpoints = (await replay.listCheckpoints(first.arcRunId)).filter(
+        (checkpoint) => checkpoint.position.reactivationCount === 1,
+      );
+      expect(checkpoints.length).toBeGreaterThan(1);
+      for (const checkpoint of [checkpoints[0]!, checkpoints.at(-1)!]) {
+        const fork = await host.rewind(first.arcRunId, checkpoint.position);
+        expect(fork.arcRunId).not.toBe(first.arcRunId);
+        expect(await host.getRunView(fork.arcRunId)).toMatchObject({
+          reactivationCount: checkpoint.position.reactivationCount,
+        });
+      }
+      const jumped = await host.jump(
+        first.arcRunId,
+        "arc:successor-count:Main",
+      );
+      if (jumped.status !== "compatible")
+        throw new Error("Expected compatible jump");
+      expect(jumped.arcRunId).not.toBe(first.arcRunId);
+      const installed = jumped.regenerated.checkpoints.at(-1)!;
+      expect(installed.position.reactivationCount).toBe(1);
+      expect(await host.getRunView(jumped.arcRunId)).toMatchObject({
+        reactivationCount: installed.position.reactivationCount,
+        lifecycle: "deflected",
+      });
+      expect(await store.getState(arcRunKey(first.arcRunId))).toEqual(original);
+    } finally {
+      await host.stop();
+    }
+  });
+
   it("records a trigger stream before the action stream, with a seed checkpoint", () =>
     withRecordedRun(async ({ replay, runId }) => {
       const steps = await replay.listSteps(runId);
@@ -291,7 +354,7 @@ describe("replay lifecycle publication", () => {
 });
 
 it("replay.jump dispatches only changed work after a replayed instruction completion", async () => {
-  const { host, replay } = makeReplayHost();
+  const { host, replay } = await makeReplayHost();
   const source = (next: string) =>
     parse(`"arc";
     function Main() {
@@ -357,7 +420,7 @@ it("replay.jump dispatches only changed work after a replayed instruction comple
 });
 
 it("replay.jump never repeats a completed host operation when the following instruction changes", async () => {
-  const { host } = makeReplayHost();
+  const { host } = await makeReplayHost();
   let executions = 0;
   const opaqueData = {
     ref: "node:source:Main",
@@ -370,7 +433,7 @@ it("replay.jump never repeats a completed host operation when the following inst
       executions += 1;
     },
   );
-  host.registerHostModule("audit", {
+  await host.registerHostModule("audit", {
     ...audit,
     submit: async (...args) =>
       (await audit.submit!(...args)).map((ack) => ({

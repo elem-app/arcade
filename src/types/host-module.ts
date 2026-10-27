@@ -45,6 +45,15 @@ export type HostCall = {
   moduleData?: PayloadValue;
 };
 
+/** Setup acknowledgment with private reconstruction data and optional public activity. */
+export type HostCallAck = {
+  hostCallId: string;
+  /** Retained privately for reconstruction. */
+  moduleData?: PayloadValue;
+  /** Omitted publishes nothing; null publishes the call without data. */
+  publishedData?: PayloadValue | null;
+};
+
 /** Registered module implementation. Setup acknowledges before operation completion. */
 export type HostModule = {
   declaration: HostModuleSpec;
@@ -59,7 +68,7 @@ export type HostModule = {
       arcRunId: ArcRunId;
       signal: AbortSignal;
     },
-  ) => Promise<readonly { hostCallId: string; moduleData?: PayloadValue }[]>;
+  ) => Promise<readonly HostCallAck[]>;
   releaseRun?: (arcRunId: ArcRunId) => Promise<void>;
 };
 

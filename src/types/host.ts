@@ -20,29 +20,10 @@ import type {
 } from "./core.js";
 import type { ActivationRequirement } from "./handshake.js";
 import type { HostModuleEffect, HostModuleState } from "./host-module.js";
+import type { ArcManifest } from "./manifest.js";
 import type { InboundMessage } from "./messaging.js";
 import type { RoutineReport } from "./routine.js";
 import type { ContextIsolation, InstructionIssue, Task } from "./task.js";
-
-/**
- * Normalized Arc manifest resolved at registration.
- *
- * - `workspaceScope: "run"` (default): each new Arc run gets a unique workspace
- *   under the resolved artifact root, named by a filesystem-safe run id.
- * - `workspaceScope: "arc"`: fresh runs use a connector-discovered workspace
- *   path when the Arc was registered from an Arcade workspace, otherwise
- *   activation asks the connecting client for a workspace path through a
- *   handshake.
- * - `bundle`: longest-prefix map from a logical artifact path prefix to an
- *   absolute directory. Matched paths resolve to the bundle directory instead
- *   of the workspace.
- * - `contextIsolation`: run-wide managed-agent context isolation floor.
- */
-export type ArcManifest = {
-  workspaceScope: "run" | "arc";
-  bundle: Record<string, string>;
-  contextIsolation: ContextIsolation;
-};
 
 /** Immutable parsed Arc document record id. */
 export type ArcDocumentRecordId = string;
@@ -55,6 +36,8 @@ export type ArcDocumentRecord = {
   source: string;
   /** Parsed Arc document for this source version. */
   document: Document;
+  /** Normalized manifest captured with this document version. */
+  manifest: ArcManifest;
   /** ISO creation timestamp. */
   createdAt: string;
 };
@@ -120,6 +103,7 @@ export type ArcRunView = { arcRunId: ArcRunId; ownerPrincipal: string } & (
       arcRef: ArcRef;
       workspacePath: string;
       lifecycle: ArcRunLifecycle;
+      reactivationCount: number;
       createdAt: string;
       updatedAt: string;
       artifactCount: number;
@@ -264,7 +248,12 @@ export type InstructionCoverage = Record<
  */
 export type ArcHostStep =
   | { kind: "trigger"; arcRunId: ArcRunId; frontier: RunFrontier }
-  | { kind: "action"; arcRunId: ArcRunId; frontier: RunFrontier }
+  | {
+      kind: "action";
+      arcRunId: ArcRunId;
+      frontier: RunFrontier;
+      reactivationCount: number;
+    }
   | {
       kind: "handshake";
       arcRunId: ArcRunId;
@@ -287,4 +276,4 @@ export type ResolveHandshakeResult =
   | { status: "missing" }
   | { status: "invalid"; reason: string }
   | { status: "ok"; step: ArcHostStep }
-  | { status: "joined"; arcRunId: ArcRunId };
+  | { status: "joined"; arcRunId: ArcRunId; reactivationCount: number };

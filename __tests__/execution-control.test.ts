@@ -11,6 +11,7 @@ import type {
   InstructionTask,
   OpenAiRunState,
   OpenAiSdkRunFn,
+  OutboundMessage,
   RoleWorker,
   RoutineContext,
   RoutineState,
@@ -37,6 +38,7 @@ import { makeControlledTime } from "./controlled-time.js";
 import {
   ALICE_OWNER,
   collectAsync,
+  deferred,
   makeArcHostWithSource,
   makeWorkerHub,
   waitFor,
@@ -50,12 +52,210 @@ import {
 } from "./worker-hub-helpers.js";
 
 describe("WorkerHubService execution control", () => {
+  it.each(["capacity-limited", "transport-lost"] as const)(
+    "retries a %s routine while WorkEvent persistence is held",
+    async (status) => {
+      const host = await makeArcHostWithSource(
+        "independent-retry",
+        '"arc"; function Main() { this.trigger = () => true; $instruct("work"); }',
+      );
+      const release = deferred();
+      let retry: (() => void) | undefined;
+      let calls = 0;
+      const { workerHub, workEventStore } = makeWorkerHub({
+        arcHost: host,
+        workers: {
+          "$default-worker": async () => {
+            if (++calls > 1) return { outcome: "completed" };
+            return status === "capacity-limited"
+              ? {
+                  suspension: "capacity-limited",
+                  reason: {
+                    reason: "api rate limit",
+                    provider: "test",
+                    message: "retry",
+                  },
+                }
+              : {
+                  suspension: "transport-lost",
+                  reason: { reason: "connection reset", message: "retry" },
+                };
+          },
+        },
+        capacityRetry: {
+          enabled: true,
+          schedule: (callback) => {
+            retry = callback;
+            return () => {};
+          },
+        },
+      });
+      vi.spyOn(workEventStore, "appendEvent").mockImplementation(async () => {
+        await release.promise;
+        throw new Error("observation unavailable");
+      });
+      try {
+        const runId = await submitActivation(workerHub, "start");
+        await waitFor(
+          () =>
+            retry !== undefined &&
+            workerHub.getLiveWorkCounts().continuations === 1,
+        );
+        expect(await workerHub.getExecutionControlView(runId)).toMatchObject({
+          status,
+          autoRetry: { pending: true },
+        });
+        retry!();
+        await waitFor(async () =>
+          (await host.listRunViews()).some(
+            (view) =>
+              view.stage === "actioning" && view.lifecycle === "completed",
+          ),
+        );
+        expect(calls).toBe(2);
+        expect(await host.getRunView(runId)).toMatchObject({
+          reactivationCount: 0,
+        });
+      } finally {
+        release.resolve();
+        await workerHub.stop();
+        await host.stop();
+      }
+    },
+  );
+
+  it.each([
+    ["question", "held"],
+    ["permission", "held"],
+    ["question", "rejected"],
+    ["permission", "rejected"],
+  ] as const)(
+    "answers a %s ask and pauses and resumes with %s WorkEvent storage",
+    async (ask, observation) => {
+      const host = await makeArcHostWithSource(
+        "independent-control",
+        '"arc"; function Main() { this.trigger = () => true; $instruct("work"); }',
+      );
+      const release = deferred();
+      let invocations = 0;
+      let answer: unknown;
+      let outbound: OutboundMessage | undefined;
+      const { workerHub, workEventStore } = makeWorkerHub({
+        arcHost: host,
+        workers: {
+          "$default-worker": async (_task, _context, effects) => {
+            invocations++;
+            if (invocations > 1) return { outcome: "completed" };
+            await effects.logToolEvent({
+              kind: "tool:started",
+              toolCallId: "tool",
+              toolName: "test",
+            });
+            answer =
+              ask === "question"
+                ? await effects.emit({
+                    situation: { cause: "question" },
+                    content: "answer?",
+                  })
+                : await effects.requestPermission({
+                    toolCallId: "permission",
+                    toolName: "test",
+                    input: {},
+                  });
+            await effects.logToolEvent({
+              kind: "tool:finished",
+              toolCallId: "tool",
+              toolName: "test",
+            });
+            if ((await effects.checkSignal())?.kind === "pause")
+              throw new RoutinePausedError();
+            return { outcome: "completed" };
+          },
+        },
+      });
+      vi.spyOn(workEventStore, "appendEvent").mockImplementation(async () => {
+        if (observation === "held") await release.promise;
+        throw new Error("optional WorkEvent store unavailable");
+      });
+      workerHub.registerOutboundHandler(
+        { role: "*", audience: "*", cause: "*" },
+        (message) => {
+          outbound = message;
+        },
+      );
+      try {
+        const runId = await submitActivation(workerHub, "start");
+        await waitFor(() => outbound !== undefined);
+        const askId = outbound!.metadata!.askId!;
+        expect(
+          workerHub.listAsks(runId, { role: "*", audience: "*", cause: "*" }),
+        ).toEqual([
+          expect.objectContaining({
+            metadata: expect.objectContaining({ askId }),
+            arcRunId: runId,
+          }),
+        ]);
+        const paused = await workerHub.requestPause(runId);
+        expect(paused).toMatchObject({
+          outcome: "requested",
+          control: { status: "pauseRequested" },
+        });
+        expect(
+          await collectAsync(
+            workerHub.submitInbound({
+              arcRunId: runId,
+              content: "yes",
+              metadata: {
+                askId,
+                ...(ask === "permission" ? { decision: "allow" } : {}),
+              },
+            }),
+          ),
+        ).toEqual([{ kind: "continued", arcRunId: runId }]);
+        await waitFor(
+          async () =>
+            (await workerHub.getExecutionControlView(runId)).status ===
+            "paused",
+        );
+        if (ask === "permission")
+          expect(answer).toMatchObject({ decision: "allow" });
+        else expect(answer).toBe("yes");
+        expect(
+          workerHub.listAsks(runId, { role: "*", audience: "*", cause: "*" }),
+        ).toEqual([]);
+        expect(await host.getRunView(runId)).toMatchObject({
+          lifecycle: "active",
+          reactivationCount: 0,
+        });
+        await expect(workerHub.resume(runId)).resolves.toMatchObject({
+          outcome: "resumed",
+        });
+        await waitFor(async () =>
+          (await host.listRunViews()).some(
+            (view) =>
+              view.stage === "actioning" && view.lifecycle === "completed",
+          ),
+        );
+        expect(await host.getRunView(runId)).toMatchObject({
+          lifecycle: "completed",
+          reactivationCount: 0,
+        });
+        expect(invocations).toBe(2);
+        await workerHub.stop();
+      } finally {
+        release.resolve();
+        await workerHub.stop();
+        await host.stop();
+      }
+    },
+  );
+
   it.each(["before feedback", "during dialog projection"] as const)(
     "exec.cooperative-pause preserves completed feedback and holds subsequent work when paused %s",
     async (pauseAt) => {
       const store = new InMemoryArcHostStore();
       const replayStore = new InMemoryReplayStore();
-      const arcHost = createTestArcHost({
+      const arcHost = await createTestArcHost({
         store,
         replayStore,
         ...makeControlledTime(),
@@ -163,7 +363,7 @@ function Main() {
     async (pauseAt) => {
       const store = new InMemoryArcHostStore();
       const replayStore = new InMemoryReplayStore();
-      const arcHost = createTestArcHost({
+      const arcHost = await createTestArcHost({
         store,
         replayStore,
         ...makeControlledTime(),
@@ -261,7 +461,7 @@ function Main() {
     "exec.control-inactive rejects retained controls for %s executions",
     async (lifecycle) => {
       const store = new InMemoryArcHostStore();
-      const arcHost = createTestArcHost({ store });
+      const arcHost = await createTestArcHost({ store });
       await arcHost.registerArc(
         "retained-control",
         parse(
@@ -375,7 +575,7 @@ function Main() {
   it("exec.control-inactive allows accepted resume to overlap final settlement without restarting", async () => {
     const store = new InMemoryArcHostStore();
     const replayStore = new InMemoryReplayStore();
-    const arcHost = createTestArcHost({ store, replayStore });
+    const arcHost = await createTestArcHost({ store, replayStore });
     await arcHost.registerArc(
       "resume-race",
       parse(
@@ -478,7 +678,7 @@ function Main() {
   it("exec.resume rebuilds an active run its uncaught interruption stopped", async () => {
     const store = new InMemoryArcHostStore();
     const time = makeControlledTime();
-    const host = createTestArcHost({ store, ...time });
+    const host = await createTestArcHost({ store, ...time });
     await host.registerArc(
       "interrupted-control",
       parse(
@@ -612,6 +812,15 @@ function Main() {
       workers: { researcher: handler },
       logger,
     });
+    const observedControls: { kind: string; status: string }[] = [];
+    workerHub.registerWorkEventHandler(async (event) => {
+      if (event.kind.startsWith("control:"))
+        observedControls.push({
+          kind: event.kind,
+          status: (await workerHub.getExecutionControlView(event.arcRunId))
+            .status,
+        });
+    });
 
     const { arcRunId, routine } = await startFirstRoutine(
       workerHub,
@@ -663,6 +872,11 @@ function Main() {
     );
 
     const events = await collectAsync(workEventStore.listEvents(arcRunId));
+    expect(observedControls).toEqual([
+      { kind: "control:pause-requested", status: "pauseRequested" },
+      { kind: "control:paused", status: "paused" },
+      { kind: "control:resumed", status: "running" },
+    ]);
     expect(events).toEqual([
       expect.objectContaining({ kind: "run:started", route: "fresh" }),
       expect.objectContaining({
@@ -678,10 +892,6 @@ function Main() {
         routineId: routine.id,
       }),
       expect.objectContaining({ kind: "run:started", route: "join" }),
-      expect.objectContaining({
-        kind: "control:resume-requested",
-        routineId: routine.id,
-      }),
       expect.objectContaining({
         kind: "control:resumed",
         routineId: routine.id,
@@ -775,12 +985,10 @@ function Main() {
     expect(taskId(rebuilt!.task)).toBe(taskId(task));
     const controlEvents = (
       await collectAsync(workEvents.store.listEvents(task.arcRunId))
-    ).filter(
-      (event) =>
-        event.kind === "control:resume-requested" ||
-        event.kind === "control:resumed",
-    );
-    expect(controlEvents).toHaveLength(2);
+    ).filter((event) => event.kind === "control:resumed");
+    expect(controlEvents).toEqual([
+      expect.objectContaining({ kind: "control:resumed" }),
+    ]);
     for (const event of controlEvents)
       expect(event).not.toHaveProperty("routineId");
     expect(query).toHaveBeenCalledTimes(1);
@@ -1141,7 +1349,7 @@ function Main() {
 
   it("pauses a quiescent run with no routine id and resumes it back to draining", async () => {
     const time = makeControlledTime();
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       ...time,
     });
@@ -1217,7 +1425,7 @@ function Watch() {
 
   it("pauses a routine waiting for its worker context before it starts", async () => {
     const time = makeControlledTime();
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       ...time,
     });
@@ -1595,7 +1803,7 @@ async function hostOver(
   durable: ReturnType<typeof durableStores>,
   source: string,
 ) {
-  const arcHost = createTestArcHost({
+  const arcHost = await createTestArcHost({
     store: durable.store,
     executionControl: durable.routineStore,
     workEvents: durable.workEvents,

@@ -3,7 +3,10 @@ import type { RoutineEffects } from "./types/routine.js";
 export type { ArcRef, Dialog, PayloadValue } from "@elem-app/arc/runtime";
 export type { PrimitiveValue } from "@elem-app/arc/types";
 export type { ArcDocumentSnapshotId, ArcRunId } from "./types/core.js";
-export type { CapacityLimit } from "./types/execution-control.js";
+export type {
+  CapacityLimit,
+  ExecutionControlView,
+} from "./types/execution-control.js";
 export type {
   ExternalWorkerTool,
   ExternalWorkerToolContext,
@@ -20,7 +23,6 @@ export type {
   ArcDocumentRecordId,
   ArcDocumentSnapshot,
   ArcHostStep,
-  ArcManifest,
   ArcRunState,
   ArcRunView,
   BeginInput,
@@ -36,6 +38,7 @@ export type {
   TaskResult,
 } from "./types/hub.js";
 export { asJsonObject } from "./types/json.js";
+export type { ArcManifest } from "./types/manifest.js";
 export type {
   HistoryEntry,
   HistoryParty,
@@ -86,7 +89,11 @@ export {
   type Task,
   type WorkerContextOwner,
 } from "./types/task.js";
-export type { AskEvent, WorkEvent } from "./types/work-event.js";
+export type {
+  AskEvent,
+  HostModuleEvent,
+  WorkEvent,
+} from "./types/work-event.js";
 export type { BackendName } from "./types/worker-slot.js";
 
 export function noopRoutineEffects(
@@ -127,7 +134,6 @@ export { arcRunKey } from "./storage/base.js";
 export {
   InMemoryArcHostStore,
   InMemoryHistoryStore,
-  InMemoryMcpOutboundInboxStore,
   InMemoryReplayStore,
   InMemoryWorkerHubStore,
   InMemoryWorkEventStore,
@@ -135,33 +141,11 @@ export {
 export {
   JsonFileArcHostStore,
   JsonFileHistoryStore,
-  JsonFileMcpOutboundInboxStore,
   JsonFileReplayStore,
   JsonFileWorkerHubStore,
   JsonFileWorkEventStore,
 } from "./storage/json-file.js";
 
-export {
-  McpConnector,
-  type CreateMcpOutboundInboxItemInput,
-  type McpConnectorOptions,
-  type McpDeliveryPolicy,
-  type McpOutboundInboxAnswer,
-  type McpOutboundInboxItem,
-  type McpOutboundInboxListFilter,
-  type McpOutboundInboxStatus,
-  type McpOutboundInboxStore,
-  type McpOutboundInboxUpdate,
-  type McpPrincipal,
-} from "./connectors/mcp.js";
-export {
-  deliveryRulesToPolicies,
-  deliveryRuleToPolicy,
-  type DeliveryRule,
-  type DeliveryRuleSituation,
-  type DeliveryTarget,
-} from "./connectors/mcp/delivery.js";
-export { WebAppConnector } from "./connectors/web-app.js";
 export { renderInstructionTaskText } from "./service/task-renderer.js";
 export {
   semanticTaskSourceRef,
@@ -276,6 +260,7 @@ export type { HandshakeOutcome } from "./types/handshake.js";
 
 export type {
   HostCall,
+  HostCallAck,
   HostCallRecord,
   HostModuleEffect,
   HostModuleState,

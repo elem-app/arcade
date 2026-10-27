@@ -5,7 +5,7 @@ import { createTestArcHost, workEventsFor } from "./work-event-fixtures.js";
 
 import { parse } from "@elem-app/arc/parser";
 import { toArcRef } from "@elem-app/arc/runtime";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   HandshakeStore,
@@ -35,10 +35,157 @@ import {
   ALICE_OWNER,
   GREET_SOURCE,
   collectAsync,
+  deferred,
   makeArcHostWithSource,
 } from "./helpers.js";
 
 describe("Activation handshakes", () => {
+  it.each(["join", "workspace", "decline"] as const)(
+    "serializes host resolutions of one %s handshake through its decision",
+    async (kind) => {
+      const store = new InMemoryArcHostStore();
+      const host = await createTestArcHost({ store });
+      await host.registerArc("serialized", parse(GREET_SOURCE), {
+        workspaceScope: kind === "join" ? "run" : "arc",
+        bundle: {},
+        contextIsolation: "role",
+      });
+      const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+      const existing =
+        kind === "join" ? await beginActivatedDriver(host, dialog) : undefined;
+      const before = await collectAsync(store.listStates());
+      const gate = expectSoleHandshake(
+        await beginActivation(host, dialog, {
+          principal: ALICE_OWNER,
+          inbound: { content: "start" },
+        }),
+      );
+      const values: HandshakeResolution =
+        kind === "join"
+          ? { runChoice: { action: "join", arcRunId: existing!.arcRunId } }
+          : kind === "workspace"
+            ? { workspace: "/tmp/serialized-handshake" }
+            : { decline: true };
+      const results = await Promise.all([
+        host.resolveHandshake(gate.handshakeId, values, {
+          projectDialog: projectorFor(dialog),
+        }),
+        host.resolveHandshake(gate.handshakeId, values, {
+          projectDialog: projectorFor(dialog),
+        }),
+      ]);
+      expect(results[0]).toMatchObject({
+        status: kind === "join" ? "joined" : "ok",
+      });
+      expect(results[1]).toEqual({ status: "missing" });
+      if (kind !== "workspace")
+        expect(await collectAsync(store.listStates())).toEqual(before);
+      expect(
+        (await workEventsFor(host).list(gate.arcRunId)).filter(
+          (event) => event.kind === "run:handshake-resolved",
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("keeps invalid handshake retry ordered while another handshake resolves independently", async () => {
+    const host = await createTestArcHost({ store: new InMemoryArcHostStore() });
+    workEventsFor(host).close();
+    for (const name of ["first", "second"])
+      await host.registerArc(name, parse(GREET_SOURCE), {
+        workspaceScope: "arc",
+        bundle: {},
+        contextIsolation: "role",
+      });
+    const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+    const gates = await host.begin({
+      principal: ALICE_OWNER,
+      dialog,
+      inbound: { content: "start" },
+      activationPolicy: "all",
+      projectDialog: projectorFor(dialog),
+    });
+    const [first, second] = gates;
+    if (first?.kind !== "handshake" || second?.kind !== "handshake")
+      throw new Error("Expected independent workspace handshakes");
+    const entered = deferred();
+    const release = deferred();
+    const invalid = host.resolveHandshake(
+      first.handshakeId,
+      { workspace: "relative" },
+      { projectDialog: projectorFor(dialog) },
+    );
+    const valid = host.resolveHandshake(
+      first.handshakeId,
+      { workspace: "/tmp/first-independent" },
+      {
+        projectDialog: async () => {
+          entered.resolve();
+          await release.promise;
+          return dialog;
+        },
+      },
+    );
+    try {
+      await expect(invalid).resolves.toMatchObject({ status: "invalid" });
+      await entered.promise;
+      await expect(
+        host.resolveHandshake(
+          second.handshakeId,
+          { decline: true },
+          { projectDialog: projectorFor(dialog) },
+        ),
+      ).resolves.toMatchObject({ status: "ok", step: { kind: "rejected" } });
+      release.resolve();
+      await expect(valid).resolves.toMatchObject({
+        status: "ok",
+        step: { kind: "action", reactivationCount: 0 },
+      });
+    } finally {
+      release.resolve();
+      await valid;
+      await host.stop();
+    }
+  });
+
+  it("returns missing when a handshake expires during asynchronous validation", async () => {
+    const store = new InMemoryArcHostStore();
+    const handshakes = new HandshakeStore({ ttlMs: 1_000 });
+    const host = await createTestArcHost({ store, handshakes });
+    await host.registerArc("expiring", parse(GREET_SOURCE));
+    const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+    const existing = await beginActivatedDriver(host, dialog);
+    const gate = expectSoleHandshake(
+      await beginActivation(host, dialog, {
+        principal: ALICE_OWNER,
+        inbound: { content: "start" },
+      }),
+    );
+    const entered = deferred();
+    const release = deferred();
+    const original = store.getState.bind(store);
+    vi.spyOn(store, "getState").mockImplementationOnce(async (key) => {
+      entered.resolve();
+      await release.promise;
+      return original(key);
+    });
+    const resolution = host.resolveHandshake(
+      gate.handshakeId,
+      {
+        runChoice: { action: "join", arcRunId: existing.arcRunId },
+      },
+      { projectDialog: projectorFor(dialog) },
+    );
+    await entered.promise;
+    handshakes.get(gate.handshakeId)!.createdAt = new Date(0).toISOString();
+    release.resolve();
+    await expect(resolution).resolves.toEqual({ status: "missing" });
+    expect(await host.getRunView(gate.arcRunId)).toBeUndefined();
+    expect(await host.getRunView(existing.arcRunId)).toMatchObject({
+      lifecycle: "active",
+    });
+  });
+
   it.each([
     "workspace",
     "active-run-choice",
@@ -49,7 +196,7 @@ describe("Activation handshakes", () => {
     async (kind) => {
       const store = new InMemoryArcHostStore();
       const handshakes = new HandshakeStore();
-      const host = createTestArcHost({ store, handshakes });
+      const host = await createTestArcHost({ store, handshakes });
       const existingOnly = kind === "existing-only-run-choice";
       const source = `"arc"; function Main() {
         this.trigger = () => true;
@@ -157,7 +304,7 @@ describe("Activation handshakes", () => {
       { decline: true, arcChoice: { activate: false } },
     ]) {
       const store = new InMemoryArcHostStore();
-      const host = createTestArcHost({ store });
+      const host = await createTestArcHost({ store });
       await host.registerArc("decline-validation", parse(GREET_SOURCE), {
         workspaceScope: "arc",
         bundle: {},
@@ -206,7 +353,7 @@ describe("Activation handshakes", () => {
 
   it("uses a separate existing-only selection identity and commits reentry without changing its sibling", async () => {
     const store = new InMemoryArcHostStore();
-    const host = createTestArcHost({ store });
+    const host = await createTestArcHost({ store });
     const source = `"arc"; function Main() { this.trigger = () => true; $enter(Wait); function Wait() { this.guard = () => State.DEFLECTED; } }`;
     await host.registerArc("selection-identity", parse(source));
     const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
@@ -288,7 +435,7 @@ describe("Activation handshakes", () => {
 
   it("releases declined and expired handshake views while retaining their event histories", async () => {
     const handshakes = new HandshakeStore({ ttlMs: 1000 });
-    const host = createTestArcHost({
+    const host = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       handshakes,
     });
@@ -327,7 +474,7 @@ describe("Activation handshakes", () => {
   it("recognizes an active JSON-persisted run as a current-document candidate", async () => {
     const dir = await mkdtemp(join(tmpdir(), "arcade-host-current-json-"));
     const store = new JsonFileArcHostStore({ dir });
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "current-json",
       parse(`"arc";
@@ -357,7 +504,7 @@ function Main() {
 
   it("asks before resuming a non-terminal scope:'arc' run for the same user", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("stock-research", parse(GREET_SOURCE), {
       workspaceScope: "arc",
       bundle: {},
@@ -483,7 +630,7 @@ function Main() {
 
   it("keeps run-choice precedence and uses registered workspace for fresh choice", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "stock-research",
       parse(GREET_SOURCE),
@@ -535,7 +682,7 @@ function Main() {
   });
 
   it("filters run-choice candidates to the activated arc", async () => {
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
     });
     await arcHost.registerArc(
@@ -628,7 +775,7 @@ function Jazz() {
 
   it("resolves a trigger-stage workspace handshake from the selected trigger state", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "scratchpad",
       parse(`
@@ -721,7 +868,7 @@ function Stock() {
 
   it("carries a resolved workspace through semantic trigger activation", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "stock-research",
       parse(`
@@ -821,7 +968,7 @@ function StockResearch() {
   });
 
   it("allows any client to resolve a handshake (the id itself is the capability token)", async () => {
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
     });
     await arcHost.registerArc("stock-research", parse(GREET_SOURCE), {
@@ -856,7 +1003,7 @@ function StockResearch() {
   it("keeps a staged handshake out of durable state and loses it on restart", async () => {
     const dir = await mkdtemp(join(tmpdir(), "arcade-handshake-volatile-"));
     const store = new JsonFileArcHostStore({ dir });
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("stock-research", parse(GREET_SOURCE), {
       workspaceScope: "arc",
       bundle: {},
@@ -896,7 +1043,7 @@ function StockResearch() {
 
     // A fresh service over the same persisted store has no memory of it, which
     // is what a process restart looks like from the client's side.
-    const restarted = createTestArcHost({
+    const restarted = await createTestArcHost({
       store: new JsonFileArcHostStore({ dir }),
     });
     await expect(
@@ -913,7 +1060,7 @@ function StockResearch() {
 
   it("garbage collects an unresolved handshake on the next store access", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store,
       // A zero TTL makes any already-staged handshake eligible for the
       // opportunistic sweep that every later store access runs.
@@ -957,7 +1104,7 @@ function StockResearch() {
 
   it("keeps multiple matching deflected runs of one Arc as separate candidates", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "many-runs",
       parse(`"arc";
@@ -1005,7 +1152,7 @@ function Main() {
 
   it("rejects a deflected candidate that changed after trigger calculation", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "changed-run",
       parse(`"arc";
@@ -1045,7 +1192,9 @@ function Main() {
   });
 
   it("rejects an Arc run id absent from the run-choice candidates", async () => {
-    const arcHost = createTestArcHost({ store: new InMemoryArcHostStore() });
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+    });
     await arcHost.registerArc(
       "wrong-run",
       parse(`"arc";
@@ -1084,7 +1233,7 @@ function Main() {
 
   it("includes active and deflected candidates after accepting an arc choice", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "choice-a",
       parse(`"arc";
@@ -1176,7 +1325,7 @@ function ChoiceB() {
 
   it("declines an arc choice without disturbing its siblings", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "choice-a",
       parse(`"arc";

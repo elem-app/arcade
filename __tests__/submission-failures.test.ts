@@ -88,14 +88,12 @@ function Main() {
 }
 
 describe("Submission failure settlement and executor boundaries", () => {
-  it("propagates executor storage and publication errors without converting them to queue exhaustion", async () => {
+  it("propagates required executor storage errors without converting them to queue exhaustion", async () => {
     for (const stage of ["trigger", "action"] as const) {
       for (const boundary of [
         "setup",
         "initial-routine",
         "routine",
-        "started-event",
-        "failed-event",
         "bookkeeping",
       ] as const) {
         const logging = createCapturingLogger();
@@ -104,9 +102,6 @@ describe("Submission failure settlement and executor boundaries", () => {
         });
         const error = new Error(`${stage} ${boundary} unavailable`);
         const put = setup.routineStore.putRoutine.bind(setup.routineStore);
-        const append = setup.workEventStore.appendEvent.bind(
-          setup.workEventStore,
-        );
         let injected = false;
         if (boundary === "setup") {
           injected = true;
@@ -129,22 +124,6 @@ describe("Submission failure settlement and executor boundaries", () => {
                 throw error;
               }
               await put(routine);
-            },
-          );
-        if (boundary === "started-event" || boundary === "failed-event")
-          vi.spyOn(setup.workEventStore, "appendEvent").mockImplementation(
-            async (event) => {
-              if (
-                !injected &&
-                event.kind ===
-                  (boundary === "started-event"
-                    ? "routine:started"
-                    : "routine:failed")
-              ) {
-                injected = true;
-                throw error;
-              }
-              return append(event);
             },
           );
         if (boundary === "bookkeeping") {
@@ -202,51 +181,106 @@ describe("Submission failure settlement and executor boundaries", () => {
     }
   });
 
-  it("rejects trigger admission when failed-routine evidence cannot be stored", async () => {
-    for (const boundary of ["routine", "event"] as const) {
-      const setup = await fixture("trigger", async () => failure);
-      const error = new Error(`Cannot store failed ${boundary}.`);
-      let injected = false;
-      const put = setup.routineStore.putRoutine.bind(setup.routineStore);
-      const append = setup.workEventStore.appendEvent.bind(
-        setup.workEventStore,
-      );
-      vi.spyOn(setup.routineStore, "putRoutine").mockImplementation(
-        async (routine) => {
-          if (
-            boundary === "routine" &&
-            !injected &&
-            routine.status === "finished"
-          ) {
-            injected = true;
-            throw error;
+  it.each(["held", "rejected"] as const)(
+    "preserves routine outcomes with %s WorkEvent storage",
+    async (mode) => {
+      for (const stage of ["trigger", "action"] as const) {
+        for (const outcome of ["completed", "failed"] as const) {
+          let calls = 0;
+          const release = barrier();
+          const setup = await fixture(stage, async (task) => {
+            calls++;
+            return outcome === "failed" ? failure : completed(task);
+          });
+          vi.spyOn(setup.workEventStore, "appendEvent").mockImplementation(
+            async () => {
+              if (mode === "held") await release.promise;
+              throw new Error("optional storage unavailable");
+            },
+          );
+          try {
+            const receipts = await collectAsync(
+              setup.workerHub.submitInbound(inbound),
+            );
+            await waitFor(async () => {
+              const routines = await collectAsync(
+                setup.routineStore.listRoutines(),
+              );
+              return (
+                routines.length ===
+                  (stage === "trigger" && outcome === "completed" ? 2 : 1) &&
+                routines.every((routine) => routine.status === "finished")
+              );
+            });
+            const routines = await collectAsync(
+              setup.routineStore.listRoutines(),
+            );
+            expect(routines.length).toBeGreaterThan(0);
+            if (outcome === "failed")
+              expect(routines[0]?.error).toEqual({
+                code: failure.code,
+                message: failure.message,
+              });
+            else expect(routines.every((routine) => !routine.error)).toBe(true);
+            if (stage === "trigger" && outcome === "failed")
+              expect(receipts).toEqual([
+                expect.objectContaining({
+                  kind: "failed",
+                  reason: failure.message,
+                }),
+              ]);
+            else {
+              expect(receipts).toEqual([
+                expect.objectContaining({
+                  kind: "activated",
+                  reactivationCount: 0,
+                }),
+              ]);
+              await waitFor(async () =>
+                (await setup.arcHost.listRunViews()).some(
+                  (view) =>
+                    view.stage === "actioning" &&
+                    view.lifecycle ===
+                      (outcome === "failed" ? "poisoned" : "completed"),
+                ),
+              );
+            }
+            expect(calls).toBe(
+              stage === "trigger" && outcome === "completed" ? 2 : 1,
+            );
+            await setup.workerHub.stop();
+          } finally {
+            release.resolve();
+            await setup.workerHub.stop();
           }
-          await put(routine);
-        },
-      );
-      vi.spyOn(setup.workEventStore, "appendEvent").mockImplementation(
-        async (event) => {
-          if (
-            boundary === "event" &&
-            !injected &&
-            event.kind === "routine:failed"
-          ) {
-            injected = true;
-            throw error;
-          }
-          return append(event);
-        },
-      );
-      try {
-        await expect(
-          collectAsync(setup.workerHub.submitInbound(inbound)),
-        ).rejects.toBe(error);
-        const routines = await collectAsync(setup.routineStore.listRoutines());
-        expect(routines).toHaveLength(1);
-        expect(routines[0]!.status).not.toBe("skipped");
-      } finally {
-        await setup.workerHub.stop();
+        }
       }
+    },
+  );
+
+  it("rejects trigger admission when failed-routine evidence cannot be stored", async () => {
+    const setup = await fixture("trigger", async () => failure);
+    const error = new Error("Cannot store failed routine.");
+    let injected = false;
+    const put = setup.routineStore.putRoutine.bind(setup.routineStore);
+    vi.spyOn(setup.routineStore, "putRoutine").mockImplementation(
+      async (routine) => {
+        if (!injected && routine.status === "finished") {
+          injected = true;
+          throw error;
+        }
+        await put(routine);
+      },
+    );
+    try {
+      await expect(
+        collectAsync(setup.workerHub.submitInbound(inbound)),
+      ).rejects.toBe(error);
+      const routines = await collectAsync(setup.routineStore.listRoutines());
+      expect(routines).toHaveLength(1);
+      expect(routines[0]!.status).not.toBe("skipped");
+    } finally {
+      await setup.workerHub.stop();
     }
   });
 
@@ -411,7 +445,7 @@ function Independent() {
 
   it("propagates resumed trigger and action operational errors to their owning boundaries", async () => {
     for (const stage of ["trigger", "action"] as const) {
-      for (const boundary of ["setup", "routine", "event"] as const) {
+      for (const boundary of ["setup", "routine"] as const) {
         let calls = 0;
         const captured = createCapturingLogger();
         const setup = await fixture(
@@ -453,17 +487,6 @@ function Independent() {
             async (routine) => {
               if (routine.status === "finished") throw error;
               await put(routine);
-            },
-          );
-        }
-        if (boundary === "event") {
-          const append = setup.workEventStore.appendEvent.bind(
-            setup.workEventStore,
-          );
-          vi.spyOn(setup.workEventStore, "appendEvent").mockImplementation(
-            async (event) => {
-              if (event.kind === "routine:failed") throw error;
-              return append(event);
             },
           );
         }
@@ -711,14 +734,12 @@ function Main() { this.trigger = () => judge("start"); $enter(Wait); function Wa
     try {
       await collectAsync(setup.workerHub.submitInbound(inbound));
       seed = false;
-      const error = new Error("Event store unavailable.");
-      const append = setup.workEventStore.appendEvent.bind(
-        setup.workEventStore,
-      );
-      vi.spyOn(setup.workEventStore, "appendEvent").mockImplementation(
-        (event) => {
-          if (event.kind === "routine:failed") return Promise.reject(error);
-          return append(event);
+      const error = new Error("Routine store unavailable.");
+      const put = setup.routineStore.putRoutine.bind(setup.routineStore);
+      vi.spyOn(setup.routineStore, "putRoutine").mockImplementation(
+        async (routine) => {
+          if (routine.status === "finished" && routine.error) throw error;
+          await put(routine);
         },
       );
       const pending = collectAsync(setup.workerHub.submitInbound(inbound));

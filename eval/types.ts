@@ -3,7 +3,6 @@ export const EVAL_TARGET_NAMES = [
   "openai-sdk",
   "claude-sdk-tst",
   "openai-sdk-tst",
-  "claude-mcp-client",
 ] as const;
 
 export type EvalTargetName = (typeof EVAL_TARGET_NAMES)[number];
@@ -17,8 +16,7 @@ export type EvalTargetCapability =
   | "semantic-trigger"
   | "prepared-start"
   | "session-continuity"
-  | "filesystem"
-  | "mcp-handshake";
+  | "filesystem";
 
 export type EvalCaseMetadata = {
   id: string;

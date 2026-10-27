@@ -62,7 +62,7 @@ async function fixture(worker?: Worker, poison = false) {
   const clock = makeControlledTime();
   const store = new InMemoryArcHostStore();
   const replayStore = new InMemoryReplayStore();
-  const host = createTestArcHost({ store, replayStore, ...clock });
+  const host = await createTestArcHost({ store, replayStore, ...clock });
   const logging = createCapturingLogger();
   await host.registerArc("ownership", parse(source(true, poison)));
   const hub = worker
@@ -694,13 +694,13 @@ describe("Host interruption ownership", () => {
   it("interruption.continuation settles retained catch host work after a concurrent pause", async () => {
     const clock = makeControlledTime();
     const executionControl = new InMemoryWorkerHubStore();
-    const host = createTestArcHost({
+    const host = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       executionControl,
       ...clock,
     });
     let called = 0;
-    host.registerHostModule(
+    await host.registerHostModule(
       "gate",
       hostModule(
         moduleHubFor(host),
@@ -1053,9 +1053,10 @@ describe("Host interruption ownership", () => {
     },
   );
 
-  it("interruption.publication releases work and disposes its backend before an occurrence append fails", async () => {
+  it("interruption.publication dispatches replacement and disposes old work despite a held then failed occurrence append", async () => {
     const releaseWorker = deferred();
     const releaseAppend = deferred();
+    const releaseReplacement = deferred();
     let old: RoutineInput | undefined;
     let releasedAsk = false;
     let disposed = false;
@@ -1063,6 +1064,10 @@ describe("Host interruption ownership", () => {
     const env = await fixture({
       async run(input) {
         runs++;
+        if (runs > 1) {
+          await releaseReplacement.promise;
+          return { outcome: "completed" };
+        }
         old = input;
         await input.effects
           .emit({ situation: { cause: "question" }, content: "hold" })
@@ -1123,15 +1128,18 @@ describe("Host interruption ownership", () => {
       expect(await old!.effects.checkSignal()).toEqual({ kind: "cancel" });
       releaseWorker.resolve();
       await waitFor(() => disposed);
+      await waitFor(() => runs === 2);
+      expect(advancementError).toBeUndefined();
+      expect(env.host.getLiveSessionCounts().actioning).toBe(1);
+      expect(env.workerHub!.getLiveWorkCounts().scopes).toBe(1);
       releaseAppend.resolve();
-      await waitFor(() => advancementError !== undefined);
-      expect(advancementError).toEqual(new Error("occurrence append failed"));
-      await waitFor(
-        () =>
-          env.host.getLiveSessionCounts().actioning === 0 &&
-          env.workerHub!.getLiveWorkCounts().scopes === 0,
+      await waitFor(async () =>
+        (await env.events.list(old!.routine.arcRunId)).some(
+          (event) => event.kind === "asks:invalidated",
+        ),
       );
-      expect(runs).toBe(1);
+      expect(advancementError).toBeUndefined();
+      expect(runs).toBe(2);
       expect(env.clock.pendingCount).toBe(0);
       const state = (await env.store.getState(
         arcRunKey(old!.routine.arcRunId),
@@ -1144,8 +1152,10 @@ describe("Host interruption ownership", () => {
     } finally {
       releaseWorker.resolve();
       releaseAppend.resolve();
-      env.host.stop();
+      const stopping = env.host.stop();
+      releaseReplacement.resolve();
       await env.workerHub!.stop();
+      await stopping;
     }
   });
 
@@ -1356,7 +1366,7 @@ describe("Host interruption ownership", () => {
   it("interruption.retirement cleans targeted begin with no returned token", async () => {
     const clock = makeControlledTime();
     const store = new InMemoryArcHostStore();
-    const host = createTestArcHost({ store, ...clock });
+    const host = await createTestArcHost({ store, ...clock });
     try {
       for (let i = 0; i < 20; i++) {
         expect(
@@ -1427,7 +1437,7 @@ describe("Host interruption ownership", () => {
   });
 
   it("interruption.retirement releases earlier activations when a fan-out cannot return its tokens", async () => {
-    const host = createTestArcHost({ store: new InMemoryArcHostStore() });
+    const host = await createTestArcHost({ store: new InMemoryArcHostStore() });
     await host.registerArc(
       "fanout",
       parse(`"arc";
@@ -1465,7 +1475,9 @@ describe("Host interruption ownership", () => {
   it.each([false, true])(
     "interruption.retirement drains completed runs with immediate=%s",
     async (immediate) => {
-      const host = createTestArcHost({ store: new InMemoryArcHostStore() });
+      const host = await createTestArcHost({
+        store: new InMemoryArcHostStore(),
+      });
       await host.registerArc(
         "finished",
         parse(
@@ -1559,11 +1571,11 @@ describe("Host interruption ownership", () => {
 describe("Host module execution retirement", () => {
   it("interruption.setup stop aborts opening host module work before a release token exists", async () => {
     const store = new InMemoryArcHostStore();
-    const host = createTestArcHost({ store });
+    const host = await createTestArcHost({ store });
     const entered = deferred();
     const released = vi.fn(async () => {});
     let signal: AbortSignal | undefined;
-    host.registerHostModule("gate", {
+    await host.registerHostModule("gate", {
       declaration: hmd.define({ wait: () => hmd.Bool() }),
       submit: async (calls, options) => {
         signal = options.signal;
@@ -1619,14 +1631,14 @@ describe("Host module execution retirement", () => {
   });
 
   it("interruption.setup failure returns poison and leaves participating modules for explicit release", async () => {
-    const host = createTestArcHost({ store: new InMemoryArcHostStore() });
+    const host = await createTestArcHost({ store: new InMemoryArcHostStore() });
     const firstRelease = vi.fn(async () => {
       throw new Error("cleanup failed");
     });
     const secondRelease = vi.fn(async () => {});
     const signals: AbortSignal[] = [];
     const failure = new Error("second setup failed");
-    host.registerHostModule("first", {
+    await host.registerHostModule("first", {
       declaration: hmd.define({ value: () => hmd.Bool() }),
       submit: async (calls, { arcRunId, signal }) => {
         signals.push(signal);
@@ -1644,7 +1656,7 @@ describe("Host module execution retirement", () => {
       },
       releaseRun: firstRelease,
     });
-    host.registerHostModule("second", {
+    await host.registerHostModule("second", {
       declaration: hmd.define({ value: () => hmd.Bool() }),
       submit: async (_calls, { signal }) => {
         signals.push(signal);
@@ -1690,11 +1702,11 @@ describe("Host module execution retirement", () => {
 describe("Host module execution generation boundaries", () => {
   it("interruption.setup release aborts host module submission reached during advancement", async () => {
     const store = new InMemoryArcHostStore();
-    const host = createTestArcHost({ store });
+    const host = await createTestArcHost({ store });
     const entered = deferred();
     const released = vi.fn(async () => {});
     let signal: AbortSignal | undefined;
-    host.registerHostModule("gate", {
+    await host.registerHostModule("gate", {
       declaration: hmd.define({ wait: () => hmd.Bool() }),
       submit: async (calls, options) => {
         signal = options.signal;
@@ -1745,7 +1757,7 @@ describe("Host module execution generation boundaries", () => {
 
   it("interruption.setup restoration failure returns poison with ordinary release ownership", async () => {
     const store = new InMemoryArcHostStore();
-    const host = createTestArcHost({ store });
+    const host = await createTestArcHost({ store });
     const firstRelease = vi.fn(async () => {});
     const secondRelease = vi.fn(async () => {});
     let restoring = false;
@@ -1754,7 +1766,7 @@ describe("Host module execution generation boundaries", () => {
       ["first", firstRelease],
       ["second", secondRelease],
     ] as const) {
-      host.registerHostModule(name, {
+      await host.registerHostModule(name, {
         declaration: hmd.define({ value: () => hmd.Bool() }),
         submit: async (calls, { arcRunId, signal }) => {
           if (restoring && name === "second") throw failure;
@@ -1825,7 +1837,7 @@ describe("Host module execution generation boundaries", () => {
 
   it("interruption.generation drops queued and late host module effects in the hub after reopening the same run", async () => {
     const store = new InMemoryArcHostStore();
-    const host = createTestArcHost({ store });
+    const host = await createTestArcHost({ store });
     let runs = 0;
     const { workerHub } = makeWorkerHub({
       arcHost: host,
@@ -1837,7 +1849,7 @@ describe("Host module execution generation boundaries", () => {
       },
     });
     const emissions: (() => void)[] = [];
-    host.registerHostModule("gate", {
+    await host.registerHostModule("gate", {
       declaration: hmd.define({ value: () => hmd.Bool() }),
       submit: async (calls, { arcRunId, signal }) => {
         const id = calls[0]!.call.hostCallId;

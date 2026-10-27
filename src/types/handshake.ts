@@ -138,7 +138,8 @@ export type HandshakeResolution =
  *
  * `ok` means the resolve was accepted; the resulting activation, join, rejection,
  * or next-round handshake is delivered on the originating submission channel.
- * Invalid answers leave the handshake pending; consumed ids return `missing`.
+ * Invalid answers leave the handshake pending. Consumed or unavailable fresh
+ * selections return `missing`, including when their root was deleted.
  */
 export type HandshakeReceipt =
   | { status: "missing" }

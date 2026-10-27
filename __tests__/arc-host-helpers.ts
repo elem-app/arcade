@@ -6,7 +6,7 @@
  * behavior area; the helpers are unchanged.
  */
 
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 
 import {
   ArcHostService,
@@ -28,6 +28,28 @@ import {
 export type ActionStep = Extract<ArcHostStep, { kind: "action" }>;
 export type TriggerStep = Extract<ArcHostStep, { kind: "trigger" }>;
 export type HandshakeStep = Extract<ArcHostStep, { kind: "handshake" }>;
+
+/** Count metadata storage reads separately from mutable execution operations. */
+export function observeSnapshotReads(store: ArcHostStore) {
+  const state = vi.spyOn(store, "getState");
+  const snapshot = vi.spyOn(store, "getArcDocumentSnapshot");
+  const record = vi.spyOn(store, "getArcDocumentRecord");
+  return {
+    state,
+    snapshot,
+    record,
+    counts: () => ({
+      state: state.mock.calls.length,
+      snapshot: snapshot.mock.calls.length,
+      record: record.mock.calls.length,
+    }),
+    reset: () => {
+      state.mockClear();
+      snapshot.mockClear();
+      record.mockClear();
+    },
+  };
+}
 
 /**
  * Thin driver-like wrapper over an action step, so action-stage test bodies can

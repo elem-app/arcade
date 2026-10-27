@@ -571,7 +571,7 @@ function Watch() {
 
   it("poisons the run when handler work fails", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("greet", parse(GREET_SOURCE));
     const advanceInputs = recordAdvanceInputs(arcHost);
     const worker = vi.fn<RoleWorker>(async () => {
@@ -680,7 +680,7 @@ function Main() {
     arcRunId: ArcRunId;
     texts: string[];
   }> {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc("stale", parse(STALE_SOURCE));
     const texts: string[] = [];
     const worker: RoleWorker = async (task, _context, effects) => {

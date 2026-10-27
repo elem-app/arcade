@@ -5,27 +5,148 @@ import { join } from "node:path";
 import { parse } from "@elem-app/arc/parser";
 import { describe, expect, it, vi } from "vitest";
 
-import { createAppConnectors, startApp, type AppOptions } from "../src/app.js";
+import { startApp, type AppOptions } from "../src/app.js";
 import { startArcade } from "../src/arcade.js";
 import { createCliBackends } from "../src/cli-backends.js";
 import { parseAppConfig } from "../src/config.js";
 import type { Backend } from "../src/index.js";
 import {
+  ArcHostService,
   FileRoutineDiagnosticsStore,
   InMemoryArcHostStore,
   InMemoryHistoryStore,
-  InMemoryMcpOutboundInboxStore,
   InMemoryReplayStore,
   InMemoryWorkerHubStore,
   InMemoryWorkEventStore,
-  McpConnector,
-  WebAppConnector,
+  WorkEventService,
 } from "../src/testing.js";
 import type { Connector } from "../src/types/connector.js";
-import { waitFor, WATCH_SOURCE } from "./helpers.js";
+import { deferred, waitFor, WATCH_SOURCE } from "./helpers.js";
+import { createTestArcHost } from "./work-event-fixtures.js";
 import { submitActivation } from "./worker-hub-helpers.js";
 
 describe("Arcade and internal App lifecycle", () => {
+  it.each([
+    "run-list",
+    "control-read",
+    "append-held",
+    "append-rejected",
+    "observer-held",
+  ] as const)(
+    "starts and stops Arcade independently of a restart announcement at %s",
+    async (boundary) => {
+      const root = await arcadeRoot();
+      const release = deferred();
+      const allowDelivery = deferred();
+      const entered = deferred();
+      const stopped = vi.fn();
+      const startup = await options(
+        root,
+        {
+          supportedSlotKinds: new Set(["default"]),
+          createWorker: () => ({
+            disposeRoutine: async () => {},
+            run: async () => ({ outcome: "completed" }),
+            stop: stopped,
+          }),
+        },
+        { backend: "custom" },
+      );
+      const seed = await createTestArcHost({ store: startup.arcHostStore });
+      await seed.registerArc(
+        "restored",
+        parse(
+          '"arc"; function Main() { this.trigger = () => true; $instruct("wait"); }',
+        ),
+      );
+      const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+      const [step] = await seed.begin({
+        principal: "owner",
+        dialog,
+        inbound: { content: "start" },
+        projectDialog: async () => dialog,
+      });
+      if (step?.kind !== "action") throw new Error("Expected active seed");
+      await seed.stop();
+      if (boundary === "run-list") {
+        const list = ArcHostService.prototype.listRunViews;
+        vi.spyOn(
+          ArcHostService.prototype,
+          "listRunViews",
+        ).mockImplementationOnce(async function (
+          this: ArcHostService,
+          ...args
+        ) {
+          entered.resolve();
+          await release.promise;
+          return list.apply(this, args);
+        });
+      } else if (boundary === "control-read") {
+        const get = startup.workerHubStore.getExecutionControl.bind(
+          startup.workerHubStore,
+        );
+        vi.spyOn(
+          startup.workerHubStore,
+          "getExecutionControl",
+        ).mockImplementationOnce(async (id) => {
+          entered.resolve();
+          await release.promise;
+          return get(id);
+        });
+      } else if (boundary === "observer-held") {
+        const append = startup.workEventStore.appendEvent.bind(
+          startup.workEventStore,
+        );
+        vi.spyOn(startup.workEventStore, "appendEvent").mockImplementationOnce(
+          async (input) => {
+            await allowDelivery.promise;
+            return append(input);
+          },
+        );
+      } else {
+        vi.spyOn(startup.workEventStore, "appendEvent").mockImplementationOnce(
+          async () => {
+            entered.resolve();
+            if (boundary === "append-held") await release.promise;
+            throw new Error("restart announcement unavailable");
+          },
+        );
+      }
+      const close = vi.spyOn(WorkEventService.prototype, "close").mockClear();
+      const app = await startArcade(startup);
+      const handler = vi.fn(async () => {
+        if (boundary === "observer-held") {
+          entered.resolve();
+          await release.promise;
+        }
+      });
+      app.workerHub.registerWorkEventHandler(handler);
+      try {
+        allowDelivery.resolve();
+        await entered.promise;
+        expect(await app.arcHost.getRunView(step.arcRunId)).toMatchObject({
+          lifecycle: "active",
+          reactivationCount: 0,
+        });
+        await app.stop();
+        expect(stopped).toHaveBeenCalledTimes(1);
+        expect(close).toHaveBeenCalled();
+        expect(close.mock.invocationCallOrder[0]).toBeLessThan(
+          stopped.mock.invocationCallOrder[0]!,
+        );
+      } finally {
+        allowDelivery.resolve();
+        release.resolve();
+        await app.stop();
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(handler).toHaveBeenCalledTimes(
+        boundary === "observer-held" ? 1 : 0,
+      );
+    },
+  );
+
   it("starts Arcade without discovering configured files and registers workspaces only on explicit calls", async () => {
     const root = await arcadeRoot();
     await mkdir(join(root, "arcs", "invalid-bundle"));
@@ -120,8 +241,15 @@ describe("Arcade and internal App lifecycle", () => {
     );
     startup.backends = {};
 
+    const close = vi.spyOn(WorkEventService.prototype, "close").mockClear();
+    const hostStop = vi.spyOn(ArcHostService.prototype, "stop").mockClear();
     await expect(startArcade(startup)).rejects.toThrow(
       'Worker slot selects unregistered backend "claude-sdk".',
+    );
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(hostStop).toHaveBeenCalledTimes(1);
+    expect(close.mock.invocationCallOrder[0]).toBeLessThan(
+      hostStop.mock.invocationCallOrder[0]!,
     );
   });
 
@@ -138,45 +266,6 @@ describe("Arcade and internal App lifecycle", () => {
       "openai-sdk",
       "openai-sdk-tst",
     ]);
-  });
-
-  it("constructs configured MCP and Web connectors only in the internal App composition", async () => {
-    const root = await arcadeRoot();
-    const startup = await options(
-      root,
-      {
-        supportedSlotKinds: new Set(["default"]),
-        createWorker: () => ({
-          disposeRoutine: async () => {},
-          run: async () => ({ outcome: "completed" }),
-        }),
-      },
-      { backend: "custom" },
-    );
-    startup.config = parseAppConfig(
-      JSON.stringify({
-        dataDir: join(root, "data"),
-        arcsDir: join(root, "arcs"),
-        workers: { default: { backend: "custom" }, fastTrigger: null },
-        connectors: {
-          mcp: { host: "127.0.0.1", port: 3177, path: "/mcp" },
-          web: { host: "127.0.0.1", port: 3180 },
-        },
-        logging: { level: "silent", format: "json" },
-      }),
-      "test.jsonc",
-    );
-    startup.mcpInboxStore = new InMemoryMcpOutboundInboxStore();
-    const arcade = await startArcade(startup);
-
-    try {
-      expect(createAppConnectors(startup, arcade)).toEqual([
-        expect.any(McpConnector),
-        expect.any(WebAppConnector),
-      ]);
-    } finally {
-      await arcade.stop();
-    }
   });
 
   it("registers a custom backend through Arcade and routes its configured Arc role", async () => {

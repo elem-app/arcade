@@ -4,11 +4,6 @@ import { readFile } from "node:fs/promises";
 import { parse as parseJsonc } from "jsonc-parser";
 import { z } from "zod";
 
-import type {
-  DeliveryRule,
-  DeliveryRuleSituation,
-  DeliveryTarget,
-} from "./connectors/mcp/delivery.js";
 import { RawWorkersConfigSchema } from "./types/worker-slot.js";
 
 const WorkersSchema = RawWorkersConfigSchema.default({}).transform(
@@ -17,42 +12,6 @@ const WorkersSchema = RawWorkersConfigSchema.default({}).transform(
     roles: workers.roles ?? {},
   }),
 );
-
-const DeliveryTargetSchema: z.ZodType<DeliveryTarget> = z.union([
-  z.object({ kind: z.literal("activator") }),
-  z.object({ kind: z.literal("principal"), id: z.string().min(1) }),
-]);
-
-const DeliveryRuleSituationSchema: z.ZodType<DeliveryRuleSituation> = z.object({
-  role: z.string().min(1),
-  audience: z.string().min(1),
-  cause: z.string().min(1),
-});
-
-const DeliveryRuleSchema: z.ZodType<DeliveryRule> = z.object({
-  situation: DeliveryRuleSituationSchema,
-  delivery: z.enum(["elicitation", "inbox"]),
-  target: DeliveryTargetSchema,
-});
-
-const McpSchema = z.object({
-  host: z.string().default("127.0.0.1"),
-  port: z.number().int().positive().default(3177),
-  path: z.string().default("/mcp"),
-  requirePrincipal: z.boolean().default(false),
-});
-
-const WebSchema = z.object({
-  host: z.string().default("127.0.0.1"),
-  port: z.number().int().positive().default(3180),
-});
-
-const ConnectorsSchema = z
-  .object({
-    mcp: McpSchema.optional(),
-    web: WebSchema.optional(),
-  })
-  .default({});
 
 const ArcHostSchema = z.object({
   snapshotRuntimeCacheSize: z.number().int().nonnegative().default(32),
@@ -89,8 +48,6 @@ const AppConfigSchema = z
   .object({
     ...ArcadeConfigShape,
     secrets: SecretsSchema.optional(),
-    deliveryRules: z.array(DeliveryRuleSchema).default([]),
-    connectors: ConnectorsSchema,
   })
   .strict();
 

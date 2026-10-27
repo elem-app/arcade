@@ -156,10 +156,10 @@ export type ReplayHost = {
   store: InMemoryArcHostStore;
 };
 
-export function makeReplayHost(): ReplayHost {
+export async function makeReplayHost(): Promise<ReplayHost> {
   const replay = new InMemoryReplayStore();
   const store = new InMemoryArcHostStore();
-  const host = createTestArcHost({
+  const host = await createTestArcHost({
     store,
     replayStore: replay,
   });

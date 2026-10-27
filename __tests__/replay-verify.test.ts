@@ -119,7 +119,7 @@ async function recordedGreetRun(): Promise<{
   env: ReplayHost;
   runId: ArcRunId;
 }> {
-  const env = makeReplayHost();
+  const env = await makeReplayHost();
   await env.host.registerArc("greet", parse(GREET_SOURCE));
   const runId = await runToCompletion(env.host, "hi");
   return { env, runId };
@@ -315,9 +315,9 @@ function GreetRenamed() {
 
 describe("host-call replay (id remapping)", () => {
   it("pairs recorded host calls and remaps their report ids under a renamed candidate", async () => {
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     const appliedIds: string[] = [];
-    env.host.registerHostModule(
+    await env.host.registerHostModule(
       "audit",
       hostModule(
         moduleHubFor(env.host),
@@ -360,8 +360,8 @@ describe("host-call replay (id remapping)", () => {
 
 describe("cross-SEG edit (element-id stability boundary)", () => {
   it("replays the recorded body prefix past an added effects hook, diverging only when the new effect runs", async () => {
-    const env = makeReplayHost();
-    env.host.registerHostModule(
+    const env = await makeReplayHost();
+    await env.host.registerHostModule(
       "audit",
       hostModule(
         moduleHubFor(env.host),
@@ -485,7 +485,7 @@ describe("rewind", () => {
   });
 
   it("inherits context isolation into fork and rewind runs", async () => {
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     await env.host.registerArc("greet", parse(GREET_SOURCE), {
       workspaceScope: "run",
       bundle: {},
@@ -557,7 +557,7 @@ function CheckReadyRenamed() {
 
 describe("rename reconciles a shifted BriefId through iso.briefIds", () => {
   it("rewrites a recorded report's judgment key onto the renamed candidate", async () => {
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     await env.host.registerArc("ready", parse(DEFLECTABLE_SOURCE));
     const { arcRunId, firstJudgmentIds } = await runAnsweringJudgments(
       env.host,
@@ -603,7 +603,7 @@ describe("rename reconciles a shifted BriefId through iso.briefIds", () => {
 
 describe("handshake-activated runs are trigger-replayable", () => {
   it("flushes the buffered trigger stream when activation completes via a handshake", async () => {
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     // An `arc`-scoped arc with no registered workspace path stages a workspace
     // handshake on activation — deferring activation onto resolveHandshake.
     await env.host.registerArc("greet", parse(GREET_SOURCE), {
@@ -675,7 +675,7 @@ describe("a semantic fan-out replicates its trigger stream and survives a rename
     //  1. Each run carries a verbatim copy of the one shared trigger stream.
     //  2. A recorded semantic run replays compatibly after its arc is renamed —
     //     exercising trigger-stage iso rewrite, which a `() => true` fork skips.
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     await env.host.registerArc("alphasem", parse(ALPHA_SEM));
     await env.host.registerArc("betasem", parse(BETA_SEM));
 
@@ -774,7 +774,7 @@ function AlphaSem() {
 
 describe("a fanned-out run diverges mid-body against an edited arc", () => {
   it("reproduces the trigger prefix and action brief 1, then parts at brief 2", async () => {
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     await env.host.registerArc("alphagated", parse(ALPHA_SEM_GATED));
     await env.host.registerArc("betasem", parse(BETA_SEM));
 
@@ -895,7 +895,7 @@ describe("candidate that omits a recorded item", () => {
     // drops that judgment leaves the recorded item with no counterpart, so the
     // action matcher diverges at that brief. Activation still reproduces, so
     // the result is a handoff (diverged), not a failure.
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     await env.host.registerArc("ready", parse(DEFLECTABLE_SOURCE));
     const { arcRunId } = await runAnsweringJudgments(env.host, "ready");
 
@@ -931,7 +931,7 @@ function CheckReady() {
 
 describe("mid-stream action divergence", () => {
   it("reproduces the first action step, then diverges at the second", async () => {
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     await env.host.registerArc("ready", parse(DEFLECTABLE_SOURCE));
     const { arcRunId } = await runAnsweringJudgments(env.host, "ready");
 
@@ -963,7 +963,7 @@ describe("mid-stream action divergence", () => {
 
 describe("multi-brief self-replay", () => {
   it("reproduces a two-step run across the report boundary", async () => {
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     await env.host.registerArc("ready", parse(DEFLECTABLE_SOURCE));
     const { arcRunId } = await runAnsweringJudgments(env.host, "ready");
 
@@ -1024,7 +1024,7 @@ describe("trigger matches but the body differs", () => {
 
 describe("idle trigger probe persists nothing", () => {
   it("drops the buffered trigger steps when a turn ends idle", async () => {
-    const env = makeReplayHost();
+    const env = await makeReplayHost();
     await env.host.registerArc(
       "never",
       parse(`"arc";

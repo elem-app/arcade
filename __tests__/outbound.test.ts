@@ -10,6 +10,7 @@ import {
 import { makeControlledTime } from "./controlled-time.js";
 import {
   WATCH_SOURCE,
+  deferred,
   makeArcHostWithSource,
   makeWorkerHub,
   waitFor,
@@ -322,6 +323,121 @@ describe("WorkerHubService outbound handler tree", () => {
 describe("WorkerHubService live ask listing", () => {
   const ALL = { role: "*", audience: "*", cause: "*" } as const;
 
+  it("out.handler-settlement publishes both blocked asks after delivery acceptance and settles their answers independently", async () => {
+    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
+    const accepted = deferred();
+    const delivered: OutboundMessage[] = [];
+    const questionAnswered = vi.fn();
+    const permissionAnswered = vi.fn();
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: {
+        researcher: async (_task, _context, effects) => {
+          await Promise.all([
+            effects
+              .emit({
+                situation: { audience: "supervisor", cause: "question" },
+                content: "Approve the draft?",
+              })
+              .then(questionAnswered),
+            effects
+              .requestPermission({
+                toolCallId: "tool:write",
+                toolName: "Write",
+                input: { file_path: "notes.txt" },
+              })
+              .then(permissionAnswered),
+          ]);
+          return { outcome: "completed" };
+        },
+      },
+    });
+    workerHub.registerOutboundHandler(ALL, async (message) => {
+      delivered.push(message);
+      await accepted.promise;
+    });
+
+    try {
+      const arcRunId = await submitActivation(workerHub, "review the draft");
+      await waitFor(() => delivered.length === 2);
+      expect(workerHub.listAsks(arcRunId, ALL)).toEqual(delivered);
+      expect(
+        (await workerHub.listWorkEvents(arcRunId)).filter((event) =>
+          event.kind.startsWith("blocked:"),
+        ),
+      ).toEqual([]);
+
+      accepted.resolve();
+      await waitFor(
+        async () =>
+          (await workerHub.listWorkEvents(arcRunId)).filter((event) =>
+            event.kind.startsWith("blocked:"),
+          ).length === 2,
+      );
+      const question = delivered.find(
+        (message) => message.situation.cause === "question",
+      )!;
+      const permission = delivered.find(
+        (message) => message.situation.cause === "permission-ask",
+      )!;
+      expect(question.metadata?.askId).not.toBe(permission.metadata?.askId);
+      expect(await workerHub.listWorkEvents(arcRunId)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "blocked:question",
+            askId: question.metadata?.askId,
+          }),
+          expect.objectContaining({
+            kind: "blocked:permission",
+            askId: permission.metadata?.askId,
+          }),
+        ]),
+      );
+      expect(questionAnswered).not.toHaveBeenCalled();
+      expect(permissionAnswered).not.toHaveBeenCalled();
+
+      await expect(
+        drainLifecycle(
+          workerHub.submitInbound({
+            arcRunId,
+            content: "approved",
+            metadata: { askId: question.metadata?.askId },
+          }),
+        ),
+      ).resolves.toEqual([{ kind: "continued", arcRunId }]);
+      await waitFor(() => questionAnswered.mock.calls.length === 1);
+      expect(questionAnswered).toHaveBeenCalledWith("approved");
+      expect(permissionAnswered).not.toHaveBeenCalled();
+      expect(workerHub.listAsks(arcRunId, ALL)).toEqual([permission]);
+      expect(await arcHost.getRunView(arcRunId)).toMatchObject({
+        lifecycle: "active",
+      });
+
+      await expect(
+        drainLifecycle(
+          workerHub.submitInbound({
+            arcRunId,
+            content: "allow writing",
+            metadata: { askId: permission.metadata?.askId, decision: "allow" },
+          }),
+        ),
+      ).resolves.toEqual([{ kind: "continued", arcRunId }]);
+      await waitFor(async () => {
+        const view = await arcHost.getRunView(arcRunId);
+        return view?.stage === "actioning" && view.lifecycle === "completed";
+      });
+      expect(permissionAnswered).toHaveBeenCalledWith({
+        decision: "allow",
+        message: "allow writing",
+      });
+      expect(workerHub.listAsks(arcRunId, ALL)).toEqual([]);
+    } finally {
+      accepted.resolve();
+      await workerHub.stop();
+      await arcHost.stop();
+    }
+  });
+
   /** A researcher run whose worker holds one question and one permission ask. */
   async function hubWithTwoAsks() {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
@@ -450,7 +566,7 @@ function Watch() {
 
   it("out.live-asks omits asks released by supersession", async () => {
     const time = makeControlledTime();
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       ...time,
     });

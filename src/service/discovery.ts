@@ -5,7 +5,11 @@ import { isAbsolute, join, resolve } from "node:path";
 import { parse } from "@elem-app/arc/parser";
 import type { Document } from "@elem-app/arc/types";
 
-import type { ArcManifest } from "../types/host.js";
+import {
+  RawArcManifestSchema,
+  type ArcManifest,
+  type RawArcManifest,
+} from "../types/manifest.js";
 import type { ArcHostService, ArcRegistrationInput } from "./arc-host.js";
 
 // Temporarily inactive while workspace discovery checks explicit roots only.
@@ -222,88 +226,35 @@ async function readManifest(
   directory: string,
 ): Promise<ArcManifest> {
   const manifestPath = join(directory, "arcade.json");
-  let raw: string;
+  let raw = "{}";
   try {
     raw = await readFile(manifestPath, "utf8");
   } catch (error) {
-    if (isNotFoundError(error)) {
-      return {
-        workspaceScope: "run",
-        bundle: {},
-        contextIsolation: "role",
-      };
-    }
-    throw error;
+    if (!isNotFoundError(error)) throw error;
   }
-  let parsed: unknown;
+  let manifest: RawArcManifest;
   try {
-    parsed = JSON.parse(raw);
+    manifest = RawArcManifestSchema.parse(JSON.parse(raw));
   } catch (error) {
     throw new Error(
       `Invalid arcade.json for ${source}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  return await parseManifest(source, directory, parsed);
-}
-
-async function parseManifest(
-  source: string,
-  directory: string,
-  parsed: unknown,
-): Promise<ArcManifest> {
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`Invalid arcade.json for ${source}: expected object.`);
-  }
-  const record = parsed as Record<string, unknown>;
-  const workspace = record["workspace"];
-  let workspaceScope: ArcManifest["workspaceScope"] = "run";
-  if (workspace !== undefined) {
-    if (
-      workspace === null ||
-      typeof workspace !== "object" ||
-      Array.isArray(workspace)
-    ) {
-      throw new Error(`Invalid workspace in arcade.json for ${source}.`);
-    }
-    const workspaceRecord = workspace as Record<string, unknown>;
-    const authoredWorkspaceScope = workspaceRecord["scope"];
-    if (authoredWorkspaceScope === "run" || authoredWorkspaceScope === "arc") {
-      workspaceScope = authoredWorkspaceScope;
-    } else if (authoredWorkspaceScope !== undefined) {
-      throw new Error(
-        `Invalid workspace.scope in arcade.json for ${source}: expected "run" or "arc".`,
-      );
-    }
-  }
-  const rawContextIsolation = record["contextIsolation"];
-  const contextIsolation =
-    rawContextIsolation === undefined ? "role" : rawContextIsolation;
-  if (contextIsolation !== "role" && contextIsolation !== "node") {
-    throw new Error(
-      `Invalid contextIsolation in arcade.json for ${source}: expected "role" or "node".`,
-    );
-  }
-  const bundle = await readBundle(source, directory, record["bundle"]);
-  return { workspaceScope, bundle, contextIsolation };
+  const bundle = await readBundle(source, directory, manifest.bundle);
+  return {
+    workspaceScope: manifest.workspace.scope,
+    bundle,
+    contextIsolation: manifest.contextIsolation,
+  };
 }
 
 async function readBundle(
   source: string,
   directory: string,
-  raw: unknown,
+  raw: Record<string, string>,
 ): Promise<Record<string, string>> {
-  if (raw === undefined) return {};
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error(`Invalid bundle in arcade.json for ${source}.`);
-  }
-  const entries = Object.entries(raw as Record<string, unknown>);
   const bundle: Record<string, string> = {};
-  for (const [prefix, value] of entries) {
-    if (typeof value !== "string" || value.trim() === "") {
-      throw new Error(
-        `Invalid bundle entry for prefix ${prefix} in arcade.json for ${source}.`,
-      );
-    }
+  for (const [prefix, value] of Object.entries(raw)) {
     const resolved = isAbsolute(value) ? value : resolve(directory, value);
     if (!(await directoryExists(resolved))) {
       throw new Error(

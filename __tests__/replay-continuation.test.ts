@@ -1,5 +1,5 @@
 import { parse } from "@elem-app/arc/parser";
-import { Runtime } from "@elem-app/arc/runtime";
+import { Runtime, toNodeRef } from "@elem-app/arc/runtime";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,7 @@ import {
   beginActivatedDriver,
   beginDriver,
   expectSoleHandshake,
+  observeSnapshotReads,
   projectorFor,
   type StepDriver,
 } from "./arc-host-helpers.js";
@@ -64,7 +65,7 @@ it.each([
 ])(
   "replay.verify retains completed A before a divergent $edit output",
   async ({ body, kind }) => {
-    const { host, replay, store } = makeReplayHost();
+    const { host, replay, store } = await makeReplayHost();
     try {
       await host.registerArc(
         "source",
@@ -111,7 +112,7 @@ it.each(["memory", "json"] as const)(
       kind === "memory"
         ? new InMemoryReplayStore()
         : new JsonFileReplayStore({ dir: join(dir, "replay") });
-    let host = createTestArcHost({ store, replayStore: replay });
+    let host = await createTestArcHost({ store, replayStore: replay });
     try {
       await host.registerArc(
         "source",
@@ -154,7 +155,7 @@ it.each(["memory", "json"] as const)(
         "completed",
       );
       await host.stop();
-      host = createTestArcHost({ store, replayStore: replay });
+      host = await createTestArcHost({ store, replayStore: replay });
       const continued = await beginDriver(host, jumped.arcRunId, afterA);
       expect(
         continued.frontier.briefs.instructions.map((item) => item.text),
@@ -189,7 +190,7 @@ it.each(["memory", "json"] as const)(
 );
 
 it("replay.iso discards tentative pairings when a later item in the frontier differs", async () => {
-  const { host } = makeReplayHost();
+  const { host } = await makeReplayHost();
   try {
     await host.registerArc(
       "source",
@@ -215,7 +216,7 @@ it("replay.iso discards tentative pairings when a later item in the frontier dif
 });
 
 it("replay.verify validates targets against the selected prefix and preserves earlier divergence", async () => {
-  const { host } = makeReplayHost();
+  const { host } = await makeReplayHost();
   try {
     await host.registerArc("source", source('$instruct("A"); $instruct("B");'));
     const first = await beginActivatedDriver(host, dialog);
@@ -277,7 +278,7 @@ it("replay.verify validates targets against the selected prefix and preserves ea
 });
 
 it("replay.verify bounds source reads by saved state and selects the latest equivalent checkpoint", async () => {
-  const { host, replay } = makeReplayHost();
+  const { host, replay } = await makeReplayHost();
   try {
     await host.registerArc("source", source('$instruct("A"); $instruct("B");'));
     const first = await beginActivatedDriver(host, dialog);
@@ -330,7 +331,7 @@ it("replay.verify bounds source reads by saved state and selects the latest equi
 });
 
 it("replay.verify rejects malformed selected history before candidate divergence", async () => {
-  const { host, replay } = makeReplayHost();
+  const { host, replay } = await makeReplayHost();
   try {
     await host.registerArc("source", source('$instruct("A"); $instruct("B");'));
     const pending = await complete(await beginActivatedDriver(host, dialog));
@@ -349,7 +350,7 @@ it("replay.verify rejects malformed selected history before candidate divergence
 });
 
 it("replay.verify waits for an in-flight run commit before capturing the source", async () => {
-  const { host, replay, store } = makeReplayHost();
+  const { host, replay, store } = await makeReplayHost();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
@@ -388,7 +389,7 @@ it("replay.verify waits for an in-flight run commit before capturing the source"
 });
 
 it("replay.verify propagates an unexpected runtime failure after matching the frontier", async () => {
-  const { host } = makeReplayHost();
+  const { host } = await makeReplayHost();
   try {
     await host.registerArc("source", source('$instruct("A"); $instruct("B");'));
     const pending = await complete(await beginActivatedDriver(host, dialog));
@@ -413,7 +414,7 @@ it.each([
 ] as const)(
   "replay.verify composes reactivations through %s admission",
   async (edit) => {
-    const { host, replay } = makeReplayHost();
+    const { host, replay } = await makeReplayHost();
     const arc = (first: string, second: string, trigger = "true") =>
       parse(`"arc";
     function Main() {
@@ -496,7 +497,7 @@ it.each([
 );
 
 it("replay.verify retains completed A before a changed semantic frontier across a node transition", async () => {
-  const { host, replay } = makeReplayHost();
+  const { host, replay } = await makeReplayHost();
   const arc = (question: string) =>
     source(
       `$instruct("A"); $enter(Next); function Next() { if (judge("${question}")) $instruct("after"); }`,
@@ -530,7 +531,7 @@ it("replay.verify retains completed A before a changed semantic frontier across 
 });
 
 it("replay.jump keeps the captured candidate snapshot stable through materialization", async () => {
-  const { host, store } = makeReplayHost();
+  const { host, store } = await makeReplayHost();
   try {
     await host.registerArc("source", source('$instruct("A"); $instruct("B");'));
     const pending = await complete(await beginActivatedDriver(host, dialog));
@@ -563,4 +564,80 @@ it("replay.jump keeps the captured candidate snapshot stable through materializa
     await host.stop();
     vi.restoreAllMocks();
   }
+});
+
+it("pins rewind and jump bundle mappings independently of later registrations", async () => {
+  const { host, store, replay } = await makeReplayHost();
+  const policy = (path: string) => ({
+    workspaceScope: "run" as const,
+    contextIsolation: "role" as const,
+    bundle: { "guide/": path },
+  });
+  const document = source(
+    'this.description = "Original label"; $instruct("Pending work");',
+  );
+  await host.registerArc("source", document, policy("/tmp/rewind-original"));
+  const driver = await beginActivatedDriver(host, dialog);
+  await host.registerArc(
+    "candidate",
+    source('this.description = "Candidate label"; $instruct("Pending work");'),
+    policy("/tmp/jump-candidate"),
+  );
+  const jumped = await host.jump(driver.arcRunId, "arc:candidate:Main");
+  if (jumped.status !== "compatible") throw new Error(jumped.reason);
+  await host.getRunWorkspaceContext(driver.arcRunId);
+  await host.getRunWorkspaceContext(jumped.arcRunId);
+  await host.nodeInfoForRef(toNodeRef("source", ["Main"]), driver.arcRunId);
+  await host.nodeInfoForRef(toNodeRef("candidate", ["Main"]), jumped.arcRunId);
+  await host.registerArc(
+    "candidate",
+    document,
+    policy("/tmp/later-candidate"),
+    { replace: true },
+  );
+  const rewound = await host.rewind(driver.arcRunId, position(1));
+  await host.registerArcs([
+    { source: "source", delete: true },
+    { source: "candidate", delete: true },
+  ]);
+  const reads = observeSnapshotReads(store);
+  expect(
+    (await host.getRunWorkspaceContext(jumped.arcRunId)).workspaceBundle,
+  ).toEqual(policy("/tmp/jump-candidate").bundle);
+  expect(
+    (await host.getRunWorkspaceContext(rewound.arcRunId)).workspaceBundle,
+  ).toEqual(policy("/tmp/rewind-original").bundle);
+  expect(
+    (await host.nodeInfoForRef(toNodeRef("source", ["Main"]), rewound.arcRunId))
+      .description,
+  ).toBe("Original label");
+  expect(
+    (
+      await host.nodeInfoForRef(
+        toNodeRef("candidate", ["Main"]),
+        jumped.arcRunId,
+      )
+    ).description,
+  ).toBe("Candidate label");
+  expect(reads.snapshot).not.toHaveBeenCalled();
+  expect(reads.record).not.toHaveBeenCalled();
+  await host.stop();
+  const restarted = await createTestArcHost({ store, replayStore: replay });
+  for (const [id, path, sourceName, label] of [
+    [jumped.arcRunId, "/tmp/jump-candidate", "candidate", "Candidate label"],
+    [rewound.arcRunId, "/tmp/rewind-original", "source", "Original label"],
+  ] as const) {
+    await beginDriver(restarted, id, dialog);
+    expect(
+      (await restarted.getRunWorkspaceContext(id)).workspaceBundle,
+    ).toEqual(policy(path).bundle);
+    reads.reset();
+    expect(
+      (await restarted.nodeInfoForRef(toNodeRef(sourceName, ["Main"]), id))
+        .description,
+    ).toBe(label);
+    await restarted.getRunWorkspaceContext(id);
+    expect(reads.counts()).toEqual({ state: 0, snapshot: 0, record: 0 });
+  }
+  await restarted.stop();
 });

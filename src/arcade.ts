@@ -100,7 +100,7 @@ export async function startArcade(
     routineDiagnosticsStore: options.routineDiagnosticsStore,
     logger,
   });
-  arcHost.registerHostModule(
+  await arcHost.registerHostModule(
     "time",
     new TimeModule(
       workerHub,
@@ -117,6 +117,7 @@ export async function startArcade(
   try {
     await workerHub.start({ workers: config.workers });
   } catch (error) {
+    workEvents.close();
     await arcHost.stop();
     throw error;
   }
@@ -126,10 +127,14 @@ export async function startArcade(
     resolveDone = resolve;
   });
   let cleanupPromise: Promise<unknown[]> | undefined;
-  const cleanup = (): Promise<unknown[]> =>
-    (cleanupPromise ??= stopWorkerHub(workerHub, arcHost, logger).finally(
-      resolveDone,
-    ));
+  const cleanup = (): Promise<unknown[]> => {
+    workEvents.close();
+    return (cleanupPromise ??= stopWorkerHub(
+      workerHub,
+      arcHost,
+      logger,
+    ).finally(resolveDone));
+  };
 
   try {
     await arcHost.pruneOrphanedRunWorkspaces();

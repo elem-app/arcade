@@ -1,3 +1,4 @@
+import { afterEach } from "vitest";
 import { createArcadeLogger } from "../src/logging.js";
 import {
   ArcHostService,
@@ -14,6 +15,11 @@ import {
 import type { ArcRunId } from "../src/types/core.js";
 import type { HostModuleEffect } from "../src/types/host-module.js";
 const services = new WeakMap<ArcHostService, WorkEventService>();
+const publishers = new Set<WorkEventService>();
+afterEach(() => {
+  for (const publisher of publishers) publisher.close();
+  publishers.clear();
+});
 type ModuleDelivery = {
   arcRunId: ArcRunId;
   effect: HostModuleEffect;
@@ -28,20 +34,26 @@ const moduleDeliveries = new WeakMap<
   }
 >();
 const executionControls = new WeakMap<ArcHostService, WorkerHubStore>();
-export function createTestArcHost(
+export async function createTestArcHost(
   opts: Omit<ArcHostServiceOptions, "workEvents" | "executionControl"> & {
     workEvents?: WorkEventService;
     executionControl?: WorkerHubStore;
+    workEventLimits?: {
+      publications?: number;
+      deliveriesPerSubscriber?: number;
+    };
     nowMillis?: () => number;
     scheduleTimeout?: ScheduleTimeout;
   },
-): ArcHostService {
+): Promise<ArcHostService> {
   const workEvents =
     opts.workEvents ??
     new WorkEventService(
       new InMemoryWorkEventStore(),
       opts.logger ?? createArcadeLogger(),
+      opts.workEventLimits,
     );
+  publishers.add(workEvents);
   const executionControl =
     opts.executionControl ?? new InMemoryWorkerHubStore();
   const delivery: {
@@ -63,7 +75,7 @@ export function createTestArcHost(
     workEvents,
     executionControl,
   });
-  host.registerHostModule(
+  await host.registerHostModule(
     "time",
     new TimeModule(
       delivery.hub,

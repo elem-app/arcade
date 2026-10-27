@@ -7,7 +7,6 @@ import { loadAppConfig } from "./config.js";
 import {
   JsonFileArcHostStore,
   JsonFileHistoryStore,
-  JsonFileMcpOutboundInboxStore,
   JsonFileReplayStore,
   JsonFileWorkerHubStore,
   JsonFileWorkEventStore,
@@ -39,9 +38,6 @@ await runApp({
   routineDiagnosticsStore: new FileRoutineDiagnosticsStore(
     `${config.dataDir}/routine-diagnostics`,
   ),
-  mcpInboxStore: new JsonFileMcpOutboundInboxStore({
-    dir: `${config.dataDir}/outbound-inbox`,
-  }),
   replayStore: new JsonFileReplayStore({
     dir: `${config.dataDir}/replay`,
   }),

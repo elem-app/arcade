@@ -24,7 +24,7 @@ describe("required deflection host acknowledgement", () => {
   it.each(["guard", "policy"] as const)(
     "persists and records a %s deflection before catch and resumes without another acknowledgement",
     async (origin) => {
-      const { host, replay, store } = makeReplayHost();
+      const { host, replay, store } = await makeReplayHost();
       await host.registerArc("deflection", parse(source(origin)));
       const dialog = userDialog("start");
       let acknowledgements = 0;
@@ -95,7 +95,7 @@ describe("required deflection host acknowledgement", () => {
         }),
       );
 
-      const restored = createTestArcHost({ store, replayStore: replay });
+      const restored = await createTestArcHost({ store, replayStore: replay });
       const [restoredStep] = await restored.begin({
         arcRunId: driver.arcRunId,
         projectDialog: projectorFor(dialog),
@@ -126,7 +126,7 @@ describe("required deflection host acknowledgement", () => {
   );
 
   it("verifies required deflection context through renamed replay and detects altered payloads", async () => {
-    const { host, replay } = makeReplayHost();
+    const { host, replay } = await makeReplayHost();
     const rootSource = `"arc"; function Main() {
       this.trigger = () => true;
       this.catchDeflection = () => judge(\`catch\`);

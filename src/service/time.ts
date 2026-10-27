@@ -280,6 +280,8 @@ export class TimeModule {
         signal.throwIfAborted();
         const prepared = submissions.map(({ call, effects, context }) => ({
           hostCallId: call.hostCallId,
+          publishRemoval:
+            call.operation === "removeTimeout" && effects.length === 0,
           ...this.#prepareCall(call, effects, context),
         }));
         signal.throwIfAborted();
@@ -319,6 +321,18 @@ export class TimeModule {
           });
         }
         execution.timers = timers;
+        const installed = new Set(
+          timers.map(({ effect }) => effect.hostCallId),
+        );
+        const acknowledgments = prepared.map((result) => ({
+          hostCallId: result.hostCallId,
+          moduleData: result.moduleData,
+          ...(result.timer && installed.has(result.hostCallId)
+            ? { publishedData: { deadlineMillis: result.timer.deadline } }
+            : result.publishRemoval
+              ? { publishedData: structuredClone(result.moduleData) }
+              : {}),
+        }));
         // Install the entire batch before enabling callbacks, including zero-delay work.
         queueMicrotask(() => {
           if (signal.aborted) return;
@@ -326,10 +340,7 @@ export class TimeModule {
             if (result.effect) this.#emit(execution!, result.effect);
           this.#check(execution!);
         });
-        return prepared.map(({ hostCallId, moduleData }) => ({
-          hostCallId,
-          moduleData,
-        }));
+        return acknowledgments;
       },
       releaseRun: async (runId) => {
         for (const [signal, execution] of this.#executions)

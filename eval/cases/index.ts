@@ -1,4 +1,3 @@
-import "./claude-mcp-client-handshakes.js";
 import "./claude-sdk-artifacts.js";
 import "./claude-sdk-fast-trigger.js";
 import "./claude-sdk.js";

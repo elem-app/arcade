@@ -1,6 +1,6 @@
 import { createTestArcHost } from "./work-event-fixtures.js";
 /**
- * Deterministic connector-to-provider context regressions.
+ * Deterministic service-to-provider context regressions.
  *
  * These always-on tests own *input integrity* and the Arc-to-provider context
  * boundary. They prove that inbound facts reach the effective provider input,
@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { parse } from "@elem-app/arc/parser";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   asJsonObject,
@@ -26,23 +26,15 @@ import {
   InMemoryArcHostStore,
   InMemoryHistoryStore,
   InMemoryWorkerHubStore,
-  WebAppConnector,
-  type DiscoveryService,
   type InstructionTask,
   type OpenAiSdkRunFn,
   type OpenAiSdkTstRunFn,
   type OutboundMessage,
   type RoutineState,
 } from "../src/testing.js";
-import { firstActivation, freePort, makeWorkerHub } from "./helpers.js";
+import { firstActivation, makeWorkerHub } from "./helpers.js";
 
-describe("connector-to-provider context propagation", () => {
-  const connectors: WebAppConnector[] = [];
-
-  afterEach(async () => {
-    await Promise.all(connectors.splice(0).map((c) => c.stop()));
-  });
-
+describe("service-to-provider context propagation", () => {
   it("carries the inbound fact through history, trigger, action routine, and provider input", async () => {
     // Independent opaque markers, each with exactly one intended source.
     const inboundFact = `inbound-fact-${randomUUID()}`;
@@ -94,7 +86,7 @@ describe("connector-to-provider context propagation", () => {
     const logger = createArcadeLogger("info", "json");
     const historyStore = new InMemoryHistoryStore();
     const routineStore = new InMemoryWorkerHubStore();
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       executionControl: routineStore,
       store: new InMemoryArcHostStore(),
       artifactRoot: join(root, "artifacts"),
@@ -134,47 +126,21 @@ describe("connector-to-provider context propagation", () => {
       { workspacePath: workspace },
     );
 
-    const port = await freePort();
-    const connector = new WebAppConnector({
-      workerHub: workerHub,
-      discovery: noopDiscovery(),
-      arcHost,
-      transport: { host: "127.0.0.1", port },
-      staticDir: "/does-not-exist",
-      arcsDir: ".arcade/arcs",
-    });
-    connectors.push(connector);
-    await connector.start();
-
-    // --- One execution through the real HTTP endpoint. ---
-    const response = await fetch(
-      `http://127.0.0.1:${port}/api/entry/messages`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ content: submittedContent }),
-      },
+    const arcRunId = await firstActivation(
+      workerHub.submitInbound({
+        content: submittedContent,
+        metadata: { principal: "context-test" },
+      }),
     );
 
-    // (1) Connector and activation.
-    expect(response.status).toBe(202);
-    const body = (await response.json()) as {
-      wired: boolean;
-      receipt: { status: string; arcRunId?: string };
-    };
-    expect(body.wired).toBe(true);
-    expect(body.receipt.status).toBe("activated");
-    const arcRunId = body.receipt.arcRunId;
-    expect(arcRunId).toBeTruthy();
-
     const instructionRoutine = await waitFor(async () => {
-      const routine = await findInstructionRoutine(routineStore, arcRunId!);
+      const routine = await findInstructionRoutine(routineStore, arcRunId);
       return routine?.status === "finished" ? routine : undefined;
     });
     await waitFor(async () => (replies.length > 0 ? true : undefined));
 
     // (2) History: the originator entry equals the submission; the fact appears once.
-    const entries = await historyStore.listEntries(arcRunId!);
+    const entries = await historyStore.listEntries(arcRunId);
     const originatorEntry = entries.find(
       (entry) =>
         entry.from.kind === "audience" && entry.from.name === "originator",
@@ -241,7 +207,7 @@ describe("connector-to-provider context propagation", () => {
       }),
     ]);
     expect(instructionRoutine.error).toBeUndefined();
-    expect(await arcHost.getRunView(arcRunId!)).toMatchObject({
+    expect(await arcHost.getRunView(arcRunId)).toMatchObject({
       artifactCount: 1,
     });
     expect(instructionRoutine.backendDetails).toMatchObject({
@@ -270,7 +236,7 @@ describe("connector-to-provider context propagation", () => {
         };
       });
       const routineStore = new InMemoryWorkerHubStore();
-      const arcHost = createTestArcHost({
+      const arcHost = await createTestArcHost({
         executionControl: routineStore,
         store: new InMemoryArcHostStore(),
         artifactRoot: join(root, "artifacts"),
@@ -459,14 +425,6 @@ async function waitForInstructionRoutines(
 function occurrences(haystack: string, needle: string): number {
   if (!needle) return 0;
   return haystack.split(needle).length - 1;
-}
-
-function noopDiscovery(): DiscoveryService {
-  return {
-    discoverArcadeWorkspaces: vi.fn(async () => []),
-    registerArcsFromWorkspace: vi.fn(async () => 0),
-    registerArcsFromDirectory: vi.fn(async () => 0),
-  } satisfies Partial<DiscoveryService> as unknown as DiscoveryService;
 }
 
 async function waitFor<T>(

@@ -65,7 +65,7 @@ describe("instruction communication eval cases", () => {
 
     const renderedByCase = new Map<string, string>();
     for (const item of cases) {
-      const arcHost = makeArcHost();
+      const arcHost = await makeArcHost();
       await arcHost.registerArc(
         `instruction-communication-${item.name}`,
         parse(item.source),
@@ -169,7 +169,7 @@ describe("instruction communication eval cases", () => {
     expect(source).toContain("${Audience.supervisor}");
     expect(source).not.toContain("<audience:supervisor>");
 
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc("instruction-audience-question", parse(source));
     let captured:
       | { task: InstructionTask; context: RoutineContext }

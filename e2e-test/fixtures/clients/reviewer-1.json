@@ -1,6 +1,0 @@
-{
-  "role": "reviewer",
-  "principal": "reviewer-1",
-  "inboxUri": "arcade://inbox/reviewer-1",
-  "skill": "../agent-skills/arcade/SKILL.md"
-}

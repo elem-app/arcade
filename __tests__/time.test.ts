@@ -236,6 +236,39 @@ function timeModuleFixture(now = 1000) {
 }
 
 describe("host:time module submission", () => {
+  it("time.publication omits read-only operations and failed retained calls", async () => {
+    const env = timeModuleFixture();
+    try {
+      const reads = await env.submit([
+        { call: timeCall("nowMillis", "now", []) },
+        { call: timeCall("offset", "offset", [0, {}]) },
+        { call: timeCall("startOf", "start", [0, "day"]) },
+        { call: timeCall("format", "format", [0, "iso"]) },
+      ]);
+      expect(reads.every((ack) => ack.publishedData === undefined)).toBe(true);
+      env.effects.length = 0;
+      const failed = await env.submit(
+        [
+          { call: timeCall("sleep", "sleep", [100], 1100) },
+          { call: timeCall("addTimeout", "timeout", [100, "timeout"], 1100) },
+          { call: timeCall("removeTimeout", "remove", ["timeout"]) },
+        ].map(({ call }) => ({
+          call,
+          effects: [
+            {
+              hostCallId: call.hostCallId,
+              hostCallOutcome: { kind: "failure" as const, reason: "failed" },
+            },
+          ],
+        })),
+      );
+      expect(failed.every((ack) => ack.publishedData === undefined)).toBe(true);
+      expect(env.effects).toEqual([]);
+      expect(env.clock.pendingCount).toBe(0);
+    } finally {
+      env.controller.abort();
+    }
+  });
   it.each<{ operation: string; args: HostCall["arguments"] }>([
     { operation: "sleep", args: [10] },
     { operation: "addTimeout", args: [10] },
@@ -284,7 +317,11 @@ describe("host:time module submission", () => {
       ]);
       expect(env.effects).toEqual([]);
       expect(await pending).toEqual([
-        { hostCallId: "registration", moduleData: { deadlineMillis: 1000 } },
+        {
+          hostCallId: "registration",
+          moduleData: { deadlineMillis: 1000 },
+          publishedData: { deadlineMillis: 1000 },
+        },
       ]);
       expect(env.effects).toEqual([
         resolution("registration"),
@@ -334,7 +371,7 @@ describe("host:time module submission", () => {
   it("time.module consumes completed timeout sleep and clock history without new effects or handles", async () => {
     const env = timeModuleFixture(300);
     try {
-      await env.submit([
+      const acknowledgments = await env.submit([
         {
           call: timeCall("addTimeout", "A", [100, "A"], 100),
           effects: [resolution("A"), interruption("A")],
@@ -357,6 +394,9 @@ describe("host:time module submission", () => {
           ],
         },
       ]);
+      expect(
+        acknowledgments.every((ack) => ack.publishedData === undefined),
+      ).toBe(true);
       expect(env.effects).toEqual([]);
       expect(env.clock.pendingCount).toBe(0);
     } finally {
@@ -370,13 +410,14 @@ describe("host:time module submission", () => {
       { call: timeCall("sleep", "sleep", [200]) },
     ]);
     expect(ack?.moduleData).toEqual({ deadlineMillis: 1200 });
+    expect(ack?.publishedData).toEqual({ deadlineMillis: 1200 });
     expect(first.effects).toEqual([]);
     expect(first.clock.pendingCount).toBe(1);
     first.controller.abort();
     expect(first.clock.pendingCount).toBe(0);
     const restored = timeModuleFixture(1150);
     try {
-      await restored.submit([
+      const [restoredAck] = await restored.submit([
         {
           call: {
             ...timeCall("sleep", "sleep", [200]),
@@ -384,6 +425,7 @@ describe("host:time module submission", () => {
           },
         },
       ]);
+      expect(restoredAck?.publishedData).toEqual({ deadlineMillis: 1200 });
       restored.clock.advanceTo(1199);
       restored.clock.fireDue();
       expect(restored.effects).toEqual([]);
@@ -635,6 +677,9 @@ describe("host:time timeout cancellation", () => {
         {
           hostCallId: "remove",
           moduleData: { removedHostCallIds: ["first", "second", "explicit"] },
+          publishedData: {
+            removedHostCallIds: ["first", "second", "explicit"],
+          },
         },
       ]);
       expect(env.effects).toEqual([resolution("remove")]);
@@ -687,9 +732,18 @@ describe("host:time timeout cancellation", () => {
           {
             hostCallId: "remove",
             moduleData: { removedHostCallIds: ["first", "second"] },
+            publishedData: { removedHostCallIds: ["first", "second"] },
           },
-          { hostCallId: "again", moduleData: { removedHostCallIds: [] } },
-          { hostCallId: "unknown", moduleData: { removedHostCallIds: [] } },
+          {
+            hostCallId: "again",
+            moduleData: { removedHostCallIds: [] },
+            publishedData: { removedHostCallIds: [] },
+          },
+          {
+            hostCallId: "unknown",
+            moduleData: { removedHostCallIds: [] },
+            publishedData: { removedHostCallIds: [] },
+          },
         ]);
         expect(env.effects.slice(2)).toEqual([
           resolution("remove"),
@@ -739,6 +793,9 @@ describe("host:time timeout cancellation", () => {
           {
             hostCallId: "remove",
             moduleData: {
+              removedHostCallIds: emitted ? ["future"] : ["due", "future"],
+            },
+            publishedData: {
               removedHostCallIds: emitted ? ["future"] : ["due", "future"],
             },
           },
@@ -810,6 +867,11 @@ describe("host:time timeout cancellation", () => {
           },
         ]);
         expect(acks[1]?.moduleData).toEqual(selection);
+        expect(acks.map((ack) => ack.publishedData)).toEqual([
+          undefined,
+          resolved ? undefined : selection,
+          { deadlineMillis: 1200 },
+        ]);
         expect(env.effects).toEqual([
           ...(resolved ? [] : [resolution("remove")]),
           {
@@ -991,7 +1053,7 @@ async function hostFixture(body: string, hook = "") {
   const clock = makeControlledTime();
   const store = new InMemoryArcHostStore();
   const replayStore = new InMemoryReplayStore();
-  const host = createTestArcHost({ store, replayStore, ...clock });
+  const host = await createTestArcHost({ store, replayStore, ...clock });
   await host.registerArc("time", parse(source(body, hook)));
   return { clock, store, replayStore, host };
 }
@@ -1109,7 +1171,9 @@ describe("host:time caller-driven advancement", () => {
   ])(
     "time.cancellation rejects an invalid authored call %s at registration",
     async (body) => {
-      const host = createTestArcHost({ store: new InMemoryArcHostStore() });
+      const host = await createTestArcHost({
+        store: new InMemoryArcHostStore(),
+      });
       try {
         await expect(async () =>
           host.registerArc("invalid", parse(source(body))),
@@ -1286,7 +1350,7 @@ describe("host:time caller-driven advancement", () => {
         kind === "memory"
           ? new InMemoryReplayStore()
           : new JsonFileReplayStore({ dir: join(dir, "replay") });
-      let host = createTestArcHost({ store, replayStore, ...clock });
+      let host = await createTestArcHost({ store, replayStore, ...clock });
       try {
         await host.registerArc(
           "time",
@@ -1299,9 +1363,19 @@ describe("host:time caller-driven advancement", () => {
         expect(clock.pendingCount).toBe(0);
         await host.stop();
         clock.advanceTo(1150);
-        host = createTestArcHost({ store, replayStore, ...clock });
+        host = await createTestArcHost({ store, replayStore, ...clock });
         const resumed = await beginDriver(host, first.arcRunId, dialog);
         expect(resumed.frontier.status).toBe("blocked");
+        expect(
+          (await workEventsFor(host).list(first.arcRunId)).filter(
+            (event) => event.kind === "host-module:call",
+          ),
+        ).toEqual([
+          expect.objectContaining({
+            hostCallId: original.call.hostCallId,
+            publishedData: { deadlineMillis: 1200 },
+          }),
+        ]);
         expect(
           (await store.getState(arcRunKey(first.arcRunId)))?.hostModules
             .calls[0]?.call,
@@ -1431,9 +1505,15 @@ describe("host:time hub delivery", () => {
         await waitFor(async () =>
           caught
             ? inputs.length === 2
-            : (await env.store.getState(arcRunKey(state!.arcRunId)))
-                ?.traversals[0]?.state === "interrupted",
+            : (await workEventsFor(env.host).list(state!.arcRunId)).some(
+                (event) => event.kind === "control:parked",
+              ),
         );
+        expect(
+          (await workEventsFor(env.host).list(state!.arcRunId)).filter(
+            (event) => event.kind === "control:parked",
+          ),
+        ).toHaveLength(caught ? 0 : 1);
         const final = (await env.store.getState(arcRunKey(state!.arcRunId)))!;
         expect(
           final.hostModules.calls.filter((r) => r.call.operation === "sleep"),
@@ -1462,7 +1542,7 @@ describe("host:time hub delivery", () => {
     async (operation) => {
       const clock = makeControlledTime();
       const store = new InMemoryArcHostStore();
-      const host = createTestArcHost({ store, ...clock });
+      const host = await createTestArcHost({ store, ...clock });
       const setupEntered = deferred();
       const allowSetup = deferred();
       const finish = deferred();
@@ -1471,7 +1551,7 @@ describe("host:time hub delivery", () => {
         clock.nowMillis,
         clock.scheduleTimeout,
       ).module;
-      host.registerHostModule("gate", {
+      await host.registerHostModule("gate", {
         ...time,
         submit: async (calls, options) => {
           const acknowledgments = await time.submit!(calls, options);
@@ -1535,7 +1615,7 @@ describe("host:time hub delivery", () => {
   it("time.hub advances a trigger host call through the probe identity before activation", async () => {
     const clock = makeControlledTime();
     const store = new InMemoryArcHostStore();
-    const host = createTestArcHost({ store, ...clock });
+    const host = await createTestArcHost({ store, ...clock });
     await host.registerArc(
       "time",
       parse(
@@ -1599,7 +1679,7 @@ describe("host:time replay and cancellation", () => {
         : kind === "memory"
           ? new InMemoryReplayStore()
           : new JsonFileReplayStore({ dir: join(dir, "replay") });
-      let host = createTestArcHost({ store, replayStore, ...clock });
+      let host = await createTestArcHost({ store, replayStore, ...clock });
       try {
         await host.registerArc(
           "time",
@@ -1642,7 +1722,7 @@ describe("host:time replay and cancellation", () => {
         });
         await host.stop();
         clock.advanceTo(1500);
-        host = createTestArcHost({ store, replayStore, ...clock });
+        host = await createTestArcHost({ store, replayStore, ...clock });
         const restored = await beginDriver(host, step.arcRunId, dialog);
         expect(restored.frontier.briefs.instructions[0]?.text).toBe(
           "after removal",
@@ -1651,6 +1731,22 @@ describe("host:time replay and cancellation", () => {
         expect(takeModuleEffects(host)).toEqual([]);
         const calls = (await store.getState(arcRunKey(step.arcRunId)))!
           .hostModules.calls;
+        const publications = (
+          await workEventsFor(host).list(step.arcRunId)
+        ).filter((event) => event.kind === "host-module:call");
+        expect(publications).toEqual(
+          resolved
+            ? []
+            : [
+                expect.objectContaining({
+                  operation: "removeTimeout",
+                  hostCallId: calls[1]!.call.hostCallId,
+                  publishedData: {
+                    removedHostCallIds: [calls[0]!.call.hostCallId],
+                  },
+                }),
+              ],
+        );
         expect(calls.map((record) => record.call)).toEqual(
           saved.hostModules.calls.map((record) => record.call),
         );
@@ -1691,7 +1787,7 @@ describe("host:time replay and cancellation", () => {
         kind === "memory"
           ? new InMemoryReplayStore()
           : new JsonFileReplayStore({ dir: join(dir, "replay") });
-      let host = createTestArcHost({ store, replayStore, ...clock });
+      let host = await createTestArcHost({ store, replayStore, ...clock });
       const put = store.putState.bind(store);
       try {
         await host.registerArc(
@@ -1752,7 +1848,7 @@ describe("host:time replay and cancellation", () => {
         await host.stop();
         store.putState = put;
         clock.advanceTo(1500);
-        host = createTestArcHost({ store, replayStore, ...clock });
+        host = await createTestArcHost({ store, replayStore, ...clock });
         const restored = await beginDriver(host, step.arcRunId, dialog);
         expect(restored.frontier.briefs.instructions[0]?.text).toBe(
           "after removal",
@@ -1914,7 +2010,7 @@ describe("host:time replay and cancellation", () => {
     const replayStore = new InMemoryReplayStore();
     const now = vi.fn(() => ms("2026-09-24T12:34:56Z"));
     const schedule = vi.fn(() => () => {});
-    const host = createTestArcHost({
+    const host = await createTestArcHost({
       store,
       replayStore,
       nowMillis: now,
@@ -2036,7 +2132,7 @@ describe("host:time replay and cancellation", () => {
       const clock = makeControlledTime();
       const store = new InMemoryArcHostStore();
       const replayStore = recording ? new InMemoryReplayStore() : undefined;
-      let host = createTestArcHost({ store, replayStore, ...clock });
+      let host = await createTestArcHost({ store, replayStore, ...clock });
       try {
         await host.registerArc(
           "time",
@@ -2049,7 +2145,7 @@ describe("host:time replay and cancellation", () => {
           .hostModules.calls[0]!;
         await host.stop();
         clock.advanceTo(1100);
-        host = createTestArcHost({ store, replayStore, ...clock });
+        host = await createTestArcHost({ store, replayStore, ...clock });
         const next = await beginDriver(host, first.arcRunId, dialog);
         expect(next.frontier.traversals[0]?.state).toBe("interrupted");
         expect(
@@ -2195,7 +2291,7 @@ describe("host:time operation failure and execution control", () => {
         expect(await env.store.getState(arcRunKey(step.arcRunId))).toEqual(
           state,
         );
-        const restarted = createTestArcHost({
+        const restarted = await createTestArcHost({
           store: env.store,
           replayStore: env.replayStore,
         });
@@ -2250,7 +2346,7 @@ describe("host:time operation failure and execution control", () => {
 
   it("time.failure retires a failed trigger submission before returning work", async () => {
     const store = new InMemoryArcHostStore();
-    const env = { store, host: createTestArcHost({ store }) };
+    const env = { store, host: await createTestArcHost({ store }) };
     try {
       await env.host.registerArc(
         "time",
@@ -2283,7 +2379,7 @@ describe("host:time operation failure and execution control", () => {
     async (operation) => {
       const store = new InMemoryArcHostStore();
       const replayStore = new InMemoryReplayStore();
-      const host = createTestArcHost({
+      const host = await createTestArcHost({
         store,
         replayStore,
         nowMillis: () => 1000,
@@ -2424,7 +2520,7 @@ describe("host:time recording boundaries", () => {
         kind === "memory"
           ? new InMemoryReplayStore()
           : new JsonFileReplayStore({ dir: join(dir, "replay") });
-      const host = createTestArcHost({
+      const host = await createTestArcHost({
         store,
         replayStore,
         ...makeControlledTime(),
@@ -2489,7 +2585,7 @@ describe("host:time recording boundaries", () => {
         kind === "memory"
           ? new InMemoryReplayStore()
           : new JsonFileReplayStore({ dir: join(dir, "replay") });
-      let host = createTestArcHost({ store, replayStore, ...clock });
+      let host = await createTestArcHost({ store, replayStore, ...clock });
       const put = store.putState.bind(store);
       try {
         await host.registerArc(
@@ -2512,7 +2608,7 @@ describe("host:time recording boundaries", () => {
         expect(host.getLiveSessionCounts().actioning).toBe(0);
         await host.stop();
         store.putState = put;
-        host = createTestArcHost({ store, replayStore, ...clock });
+        host = await createTestArcHost({ store, replayStore, ...clock });
         const restored = await beginDriver(host, first.arcRunId, dialog);
         expect(restored.frontier.tasks[0]?.kind).toBe("instruction");
         const record = (await store.getState(arcRunKey(first.arcRunId)))!
@@ -2959,7 +3055,12 @@ it.each(["accepted", "rejected"] as const)(
     const nowMillis = vi.fn(clock.nowMillis);
     const store = new InMemoryArcHostStore();
     const replayStore = new InMemoryReplayStore();
-    const host = createTestArcHost({ store, replayStore, ...clock, nowMillis });
+    const host = await createTestArcHost({
+      store,
+      replayStore,
+      ...clock,
+      nowMillis,
+    });
     const arc = (pattern: string) =>
       parse(`"arc"; import Time from "host:time";
       function Main() {

@@ -30,7 +30,9 @@ import { submitActivation } from "./worker-hub-helpers.js";
 
 describe("Concurrent production dispatch", () => {
   it("resumes concurrent paused capacity and transport routines once without replaying effects", async () => {
-    const arcHost = createTestArcHost({ store: new InMemoryArcHostStore() });
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+    });
     await arcHost.registerArc("suspensions", parse(WATCH_SOURCE));
     const entered = deferred();
     const park = deferred();
@@ -148,7 +150,9 @@ describe("Concurrent production dispatch", () => {
   });
 
   it("shutdown settles concurrent production asks and disposes each owned invocation", async () => {
-    const arcHost = createTestArcHost({ store: new InMemoryArcHostStore() });
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+    });
     await arcHost.registerArc("shutdown", parse(WATCH_SOURCE));
     const asked = deferred();
     const questions: OutboundMessage[] = [];
@@ -249,7 +253,7 @@ describe("Concurrent production dispatch", () => {
       const eventStore = fileBacked
         ? new JsonFileWorkEventStore(storePaths.events)
         : new InMemoryWorkEventStore();
-      const arcHost = createTestArcHost({
+      const arcHost = await createTestArcHost({
         store: fileBacked
           ? new JsonFileArcHostStore(storePaths.host)
           : new InMemoryArcHostStore(),
@@ -391,7 +395,9 @@ describe("Concurrent production dispatch", () => {
   );
 
   it("settles concurrent production permission asks with colliding provider call IDs", async () => {
-    const arcHost = createTestArcHost({ store: new InMemoryArcHostStore() });
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+    });
     await arcHost.registerArc("permissions", parse(WATCH_SOURCE));
     const requests: OutboundMessage[] = [];
     const verdicts = new Map<string, unknown>();

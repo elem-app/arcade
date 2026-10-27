@@ -8,7 +8,7 @@ export default defineConfig({
         test: {
           name: "unit",
           include: ["**/*.{test,spec}.?(c|m)[jt]s?(x)"],
-          exclude: ["**/node_modules/**", "benchmarks/**", "web/**"],
+          exclude: ["**/node_modules/**", "benchmarks/**"],
         },
       },
     ],

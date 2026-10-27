@@ -103,6 +103,28 @@ The three interfaces:
 - **Work event** — a durable, originator-visible activity record appended during a routine.
 - **Execution control** — the mechanism for pausing and resuming an arc run, covering both a cooperative pause and the recoverable parks Arcade raises to hold a run through a recoverable backend failure.
 
+## Concurrency and Coordination
+
+Arcade must coordinate concurrent connector intentions, worker completions, and host-module outcomes. It deliberately keeps that coordination local and simple: where a component needs ordering or mutual exclusion, it handles arrivals first come, first served through the queue or lock that protects its state. The worker hub and arc host may see different arrival orders. Their local coordination does not establish a unified order for all actions across Arcade. More elaborate coordination requires a concrete operational requirement that these local mechanisms cannot satisfy.
+
+Connector intentions follow these rules:
+
+- Two valid intentions emitted by the same connector must arrive at Arcade in the same order. The connector and its transport preserve that order; other connectors' intentions may arrive between them. Arrival order does not guarantee adjacency or completion order.
+- Handling a valid intention must preserve its meaning. It can apply its defined transition or receive an appropriate rejection, no-op, or current-state result. Interleaving with another intention must not turn it into an unintended state change or poison the run.
+- A valid intention provides no guarantee that the run will reach or remain in its intended state. Its receipt describes that action's decision or result; it neither reserves the run's state nor establishes whether a later action will be applicable. Each action is evaluated afresh when handled, and a state read is only an observation.
+
+For example, connector A requests pause, connector B joins and asks to resume, and A then observes the run still running. That is a valid outcome. A cannot rely on its `requestPause` result to assume the run is paused or that A can later resume it; the later action determines its own applicability.
+
+## Source Registration and Snapshots
+
+Applications own the source catalog and register it with the arc host. One `registerArcs` batch can add documents, replace existing documents, and delete sources through `{ source, delete: true }`. Validation uses the complete resulting registry, so related sources can change together. All arc-host registration calls and module removals share one queue; each operation validates against its predecessor's committed state and publishes a coherent registry and runtime.
+
+Each source revision stores its parsed document and normalized manifest in one immutable document record. A snapshot references those records and captures the imported host-module declarations. Fresh probes capture the latest revisions when probing starts; runs and deflected re-entry retain their snapshots. The worker hub resolves task metadata through the corresponding run or probe snapshot. The activating root's bundle map governs imported work and survives source replacement, deletion, and reconstruction. Rewind retains the original map; jump uses the candidate snapshot's map. Workspace paths and captured context isolation retain their run-owned lifecycle.
+
+The arc host shares immutable snapshot-data loads between workspace and runtime lookup. Concurrent reads of one snapshot share a load; completed data and compiled runtimes each have a bounded LRU cache controlled by `snapshotRuntimeCacheSize`. Live action and trigger lookups capture snapshot identity before awaiting and perform no snapshot, document-record, or run-state reads while their required entries are resident. Host-module registry changes clear compiled runtimes while retaining immutable data for validation and reconstruction. Fresh trigger rounds can pin different snapshot IDs, so each new ID has its own cold load. The worker hub continues to resolve workspace and node metadata before dispatch and reuses that metadata in Work events.
+
+Source deletion removes fresh discovery and invalidates pending fresh selections for the removed roots. Those handshakes resolve as `missing`, including after the source is registered again. Existing runs and their snapshots remain available. The application retains the referenced bundle directories and keeps their contents stable while runs use them. Source-name diagnostic storage records the last written document; the application rebuilds live catalog membership when starting Arcade. Immutable document records require valid manifest metadata.
+
 ## Host Modules
 
 Arcade registers each `host:*` module as one Arc-visible type declaration plus its host implementation. The declaration describes the module's nested operation paths, parameter specs, and optional return specs. The implementation supplies `submit` for both value-producing and standalone host calls. Submission acknowledges setup; host module outcomes enter the hub queue and return to the host through advancement.
@@ -308,7 +330,7 @@ Connectors register delivery policy for the situations they support. If no conne
 
 ## Connectors
 
-A connector is a channel adapter.
+A connector is an application-owned channel adapter. Arcade provides the service APIs and lifecycle contract; connector implementations live in the applications that expose them.
 
 It has four responsibilities:
 
@@ -324,13 +346,6 @@ Connector examples:
 - **Slack connector**: maps Slack users and channels to principals, posts outbound messages, and treats thread replies or buttons as answers.
 - **Email connector**: maps inboxes to principals, sends outbound questions, and routes replies back into the originating Arc run.
 - **Web app connector**: exposes Arcade as part of a product UI with product authentication and product-specific delivery policy.
-
-The MCP submit and handshake-resolution tools return submission decisions. A successful terminal decision carries `activated`, `joined`, `outbound`, and `control`. Before building it, the connector reconciles each joined run's inbox against the hub's live asks:
-
-- An open question or permission item whose ask the hub no longer lists, as after a restart, becomes `obsolete`. An answer to an obsolete item is rejected before it reaches the hub.
-- A live ask without an open item gets one, including an ask whose earlier item `failed` when its answer was rejected.
-
-`outbound` then contains open connector-owned items for the joined runs that belong to the client session's principals, and `control` lists each joined run's execution-control view. The connector resumes nothing; whether to continue a paused or parked run is the client's decision through `arcade_resume`, which reconciles the run again when it resumes. When joining is followed by another handshake in the same submission, the handshake response carries the completed join, outbound snapshot, and control views before the next handshake instructions. Later run output is available through the MCP inbox.
 
 Arcade can run with one connector or many. A local daemon might expose only MCP. A product deployment might use a web connector for primary interaction, Slack for approvals, and email for external reviewers. An enterprise deployment might route all channels through a central identity and policy layer.
 
@@ -384,7 +399,7 @@ Arcade treats worker output as untrusted at the workflow boundary:
 
 Arcade does not let workers own traversal state, history, or connector identity. A worker receives only its backend-and-slot-scoped canonical JSON state store, routine diagnostics, and routine-scoped effects for outbound messages and permission asks. Workers return validated reports to the worker hub, and the worker hub advances Arc traversal on their behalf.
 
-Application builders import `startArcade(...)`, configuration types, and production stores from `arcade`. The connector-free factory performs no filesystem Arc discovery or registration; the application calls those APIs with its chosen directories or workspaces. It registers only its `backends` option and returns the worker hub, arc host, discovery, and logger services for an owning application to compose. The `arcade` CLI separately supplies the five stock backend names and owns its Web and MCP connectors, so importing the library lifecycle selects neither providers nor connectors.
+Application builders import `startArcade(...)`, configuration types, and production stores from `arcade`. The connector-free factory performs no filesystem Arc discovery or registration; the application calls those APIs with its chosen directories or workspaces. It registers only its `backends` option and returns the worker hub, arc host, discovery, and logger services for an owning application to compose. The `arcade` CLI separately supplies the five stock backend names. Applications compose their own connectors around the returned services.
 
 Backend authors import the structural protocol from `arcade`. The package root includes `Backend`, `Worker`, task and report types, shared Zod schemas and inferred types for backend names, raw worker declarations, the workers object, complete worker bindings, reports, canonical JSON, external worker-tool types, typed `defineBackend(...)`, canonical task renderers, stock prompt builders, labeled structural validators, and `parseAgentJsonOutput(...)`. System builders import Arcade's optional provider adapters, production option types, and secret-resolver helper from `arcade/backends`. SDK transport injection hooks remain on `arcade/testing`. File parsing and programmatic worker hub startup both use `RawWorkersConfigSchema`; worker hub adds placement identity and validates it with `WorkerSlotSchema` before selecting the backend-specific schema. Backend worker-slot schemas are synchronous: they may normalize backend-owned fields exactly once, while Arcade verifies that their output remains canonical JSON and preserves the hub-owned binding identity. `defineBackend(...)` applies the same validation to direct factory calls. `RoutineReportSchema` is the canonical report definition from which `RoutineReport` is inferred. The public report parser preserves reported semantic keys; only worker hub knows the dispatched request set and therefore owns completeness checks and drift removal. A system builder can construct a stock Claude backend with its private pre-resume identity resolver and register that implementation under a deployment-selected name.
 
@@ -454,13 +469,13 @@ Handling a failure means reporting its outcome and releasing resources that are 
 | Routine execution failure | A worker reports failure, throws, or returns an invalid report; a required worker or handler is missing. | Record the failed routine and apply the trigger- or action-stage policy below. |
 | Execution suspension | Provider capacity limit, transport loss, or cooperative pause. | Park the work for continuation. Retryable parks can use bounded automatic retries under the [execution-control policy](#execution-control---pause-and-resume). |
 | Worker unavailable | A worker reports `unavailable`. | Record the work as skipped using the worker's diagnostic. |
-| Infrastructure failure | Storage, workspace preparation, or diagnostic persistence fails. | Propagate the exception and release resources owned by the affected operation. |
+| Infrastructure failure | Required operational storage or workspace preparation fails. | Propagate the exception and release resources owned by the affected operation. |
 | Internal consistency failure | Required execution state is missing, or submission bookkeeping contradicts itself. | Surface the exception through the affected operation. |
-| Observer failure | A work-event listener throws while receiving a stored event. | Log the listener's failure and continue execution and delivery to other listeners. |
+| Observation failure | WorkEvent construction, optional metadata, storage, eligibility lookup, or a subscriber fails or remains pending. | Diagnose failures and bounded-queue drops independently; operational execution and other subscribers continue. |
 
 Skipped work remains unfinished. Arcade schedules no automatic retry for it; a later execution round may attempt it again, but another round is not guaranteed. If all work in a trigger round is skipped, its submission may remain pending.
 
-Exceptions escaping a worker invocation are converted into routine failure reports. This includes errors propagated from services called by the worker. Exceptions from Arcade's own setup, storage, and publication follow the infrastructure route.
+Exceptions escaping a worker invocation are converted into routine failure reports. This includes errors propagated from services called by the worker. Exceptions from Arcade's required setup and operational storage follow the infrastructure route. WorkEvent publication is optional observation and cannot change the action's result or delay progression.
 
 No-match, handshake requests, rejection, and deflection are normal workflow outcomes.
 
@@ -565,6 +580,6 @@ In an enterprise environment, Arcade's conceptual boundaries map cleanly onto ma
 - The worker hub resolves configured worker slots and schedules role jobs.
 - Worker infrastructure starts sandboxed agents with approved tools and data access.
 - The Arc host maintains traversal state and artifact references.
-- Stores provide durable history, audit logs, host state, routine state, and connector inboxes.
+- Arcade stores provide durable history, work events, host state, routine state, and replay records; applications own their connector inboxes.
 
 This lets platform teams control who may start arcs, which roles may run, where agents execute, what tools they receive, and how outbound interactions are approved or audited.

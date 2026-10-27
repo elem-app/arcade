@@ -31,7 +31,7 @@ import { settleFirstRoutine, submitActivation } from "./worker-hub-helpers.js";
 
 describe("backend registry", () => {
   it("creates distinct workers for two role slots selecting one backend", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     const slots: WorkerSlot[] = [];
     const workers: Worker[] = [];
     workerHub.addBackend(
@@ -61,7 +61,7 @@ describe("backend registry", () => {
   });
 
   it("passes default and fast-trigger slot kinds without synthetic roles", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     const slots: WorkerSlot[] = [];
     workerHub.addBackend(
       "custom-agent",
@@ -86,7 +86,7 @@ describe("backend registry", () => {
   });
 
   it("rejects an unsupported worker slot kind before creating workers", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     const createWorker = vi.fn(() => completedWorker());
     workerHub.addBackend("custom-agent", backend(["role"], createWorker));
 
@@ -102,7 +102,7 @@ describe("backend registry", () => {
   });
 
   it("stops created workers in reverse order after worker construction fails", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     const stopped: string[] = [];
     workerHub.addBackend(
       "custom-agent",
@@ -134,7 +134,7 @@ describe("backend registry", () => {
   });
 
   it("continues startup rollback after a worker stop failure", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     const stopped: string[] = [];
     workerHub.addBackend(
       "custom-agent",
@@ -167,7 +167,7 @@ describe("backend registry", () => {
   });
 
   it("stops every worker in reverse order when normal shutdown aggregates a stop failure", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     const stopped: string[] = [];
     workerHub.addBackend(
       "custom-agent",
@@ -196,7 +196,7 @@ describe("backend registry", () => {
   });
 
   it("rejects one worker object returned for two slots", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     const shared = completedWorker();
     workerHub.addBackend(
       "custom-agent",
@@ -216,7 +216,7 @@ describe("backend registry", () => {
   });
 
   it("accepts backend registration before worker hub startup", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
 
     expect(() =>
       workerHub.addBackend("custom-agent", backend(["role"], completedWorker)),
@@ -224,8 +224,8 @@ describe("backend registry", () => {
     await expect(workerHub.start()).resolves.toBeUndefined();
   });
 
-  it("rejects duplicate and reserved backend registration", () => {
-    const workerHub = createWorkerHub();
+  it("rejects duplicate and reserved backend registration", async () => {
+    const workerHub = await createWorkerHub();
     workerHub.addBackend("custom-agent", backend(["role"], completedWorker));
 
     expect(() =>
@@ -239,7 +239,7 @@ describe("backend registry", () => {
     ).toThrow("is reserved");
   });
 
-  it("rejects every non-canonical backend name", () => {
+  it("rejects every non-canonical backend name", async () => {
     const invalid = [
       "",
       "UPPER",
@@ -254,7 +254,7 @@ describe("backend registry", () => {
       `a${"b".repeat(64)}`,
     ];
     for (const name of invalid) {
-      const workerHub = createWorkerHub();
+      const workerHub = await createWorkerHub();
       expect(() =>
         workerHub.addBackend(name, backend(["role"], completedWorker)),
       ).toThrow("canonical kebab-case");
@@ -262,7 +262,7 @@ describe("backend registry", () => {
   });
 
   it("rejects backend registration while worker hub startup is pending", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     let resolveWorker!: (worker: Worker) => void;
     workerHub.addBackend(
       "slow-agent",
@@ -286,7 +286,7 @@ describe("backend registry", () => {
   });
 
   it("rejects backend registration after worker hub startup", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     await workerHub.start();
 
     expect(() =>
@@ -294,16 +294,16 @@ describe("backend registry", () => {
     ).toThrow("while worker hub is started");
   });
 
-  it("rejects an unknown configured backend during worker hub startup", () => {
-    const workerHub = createWorkerHub();
+  it("rejects an unknown configured backend during worker hub startup", async () => {
+    const workerHub = await createWorkerHub();
 
     expect(() =>
       workerHub.start({ workers: { default: { backend: "unknown-agent" } } }),
     ).toThrow('selects unregistered backend "unknown-agent"');
   });
 
-  it("rejects non-canonical programmatic worker config before backend construction", () => {
-    const workerHub = createWorkerHub();
+  it("rejects non-canonical programmatic worker config before backend construction", async () => {
+    const workerHub = await createWorkerHub();
     const createWorker = vi.fn(() => completedWorker());
     workerHub.addBackend("custom-agent", backend(["default"], createWorker));
 
@@ -320,8 +320,8 @@ describe("backend registry", () => {
     expect(createWorker).not.toHaveBeenCalled();
   });
 
-  it("rejects unknown programmatic workers fields before backend construction", () => {
-    const workerHub = createWorkerHub();
+  it("rejects unknown programmatic workers fields before backend construction", async () => {
+    const workerHub = await createWorkerHub();
     const createWorker = vi.fn(() => completedWorker());
     workerHub.addBackend("custom-agent", backend(["default"], createWorker));
 
@@ -337,7 +337,7 @@ describe("backend registry", () => {
   });
 
   it("delegates backend-specific worker config validation to the selected backend", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     const workerSlotSchema = createWorkerSlotSchema({
       flavor: z.string().trim().pipe(z.literal("sour")),
     });
@@ -359,7 +359,7 @@ describe("backend registry", () => {
     ).toThrow("worker slot failed validation");
     expect(createWorker).not.toHaveBeenCalled();
 
-    const validWorkerHub = createWorkerHub();
+    const validWorkerHub = await createWorkerHub();
     validWorkerHub.addBackend("custom-agent", customBackend);
     await validWorkerHub.start({
       workers: {
@@ -369,7 +369,7 @@ describe("backend registry", () => {
     expect(createWorker).toHaveBeenCalledOnce();
   });
 
-  it("rejects worker slot schemas that rewrite hub-owned binding identity", () => {
+  it("rejects worker slot schemas that rewrite hub-owned binding identity", async () => {
     const transforms: Array<(input: unknown) => unknown> = [
       (input) => ({
         ...(input as Record<string, unknown>),
@@ -386,7 +386,7 @@ describe("backend registry", () => {
     ];
 
     for (const transform of transforms) {
-      const workerHub = createWorkerHub();
+      const workerHub = await createWorkerHub();
       const createWorker = vi.fn(() => completedWorker());
       workerHub.addBackend("custom-agent", {
         supportedSlotKinds: new Set(["role"]),
@@ -407,8 +407,8 @@ describe("backend registry", () => {
     }
   });
 
-  it("rejects non-canonical worker slot schema output", () => {
-    const workerHub = createWorkerHub();
+  it("rejects non-canonical worker slot schema output", async () => {
+    const workerHub = await createWorkerHub();
     const createWorker = vi.fn(() => completedWorker());
     workerHub.addBackend("custom-agent", {
       supportedSlotKinds: new Set(["default"]),
@@ -427,8 +427,8 @@ describe("backend registry", () => {
     expect(createWorker).not.toHaveBeenCalled();
   });
 
-  it("rejects asynchronous worker slot schemas before construction", () => {
-    const workerHub = createWorkerHub();
+  it("rejects asynchronous worker slot schemas before construction", async () => {
+    const workerHub = await createWorkerHub();
     const createWorker = vi.fn(() => completedWorker());
     const workerSlotSchema = createWorkerSlotSchema({
       flavor: z.string().refine(async () => true),
@@ -451,7 +451,7 @@ describe("backend registry", () => {
   });
 
   it("applies worker slot schema normalization once before construction", async () => {
-    const workerHub = createWorkerHub();
+    const workerHub = await createWorkerHub();
     const transform = vi.fn((value: number) => value + 1);
     const workerSlotSchema = createWorkerSlotSchema({
       sequence: z.number().transform(transform),
@@ -484,7 +484,7 @@ describe("backend registry", () => {
       { run: 1 },
       { run: async () => ({ outcome: "completed" }) },
     ]) {
-      const workerHub = createWorkerHub();
+      const workerHub = await createWorkerHub();
       workerHub.addBackend("custom-agent", {
         supportedSlotKinds: new Set(["default"]),
         createWorker: () => invalid as unknown as Worker,
@@ -499,7 +499,7 @@ describe("backend registry", () => {
   it("warms the selected worker before non-trigger dispatch with resolved identity", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     const calls: string[] = [];
     const warm = vi.fn(async () => {
       calls.push("warm");
@@ -534,7 +534,7 @@ describe("backend registry", () => {
   it("continues cold worker execution when warm state is absent or warm fails", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     const run = vi.fn(async () => ({ outcome: "completed" }) as const);
     workerHub.addBackend(
       "custom-agent",
@@ -560,7 +560,7 @@ describe("backend registry", () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
     const { logger, records } = createCapturingLogger();
-    const workerHub = createWorkerHub(arcHost, logger);
+    const workerHub = await createWorkerHub(arcHost, logger);
     const run = vi.fn(async () => ({ outcome: "completed" }) as const);
     workerHub.addBackend(
       "custom-agent",
@@ -600,7 +600,7 @@ describe("backend registry", () => {
       "fast",
       '"arc"; function Main() { this.trigger = () => judge("fast?"); }',
     );
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     const warm = vi.fn();
     let captured: RoutineInput["routine"] | undefined;
     workerHub.addBackend(
@@ -644,7 +644,7 @@ describe("backend registry", () => {
   it("detaches and recursively freezes the routine descriptor at dispatch", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     let captured: RoutineInput["routine"] | undefined;
     workerHub.addBackend(
       "custom-agent",
@@ -677,7 +677,7 @@ describe("backend registry", () => {
   it("maps an escaping worker exception to backend-error after recording usage", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     workerHub.addBackend(
       "custom-agent",
       backend(["role"], () => ({
@@ -713,7 +713,7 @@ describe("backend registry", () => {
   it("keeps in-process callback exceptions on the handler-error path", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     workerHub.registerRoleWorker("researcher", async () => {
       throw new Error("callback exploded");
     });
@@ -729,7 +729,7 @@ describe("backend registry", () => {
   it("parks a custom backend capacity interrupt without hub classifier changes", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     workerHub.addBackend(
       "custom-agent",
       backend(["role"], () => ({
@@ -755,7 +755,7 @@ describe("backend registry", () => {
   it("parks a custom backend transport interrupt without hub classifier changes", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     workerHub.addBackend(
       "custom-agent",
       backend(["role"], () => ({
@@ -779,7 +779,7 @@ describe("backend registry", () => {
 
   it("logs every normal shutdown worker failure before aggregating them", async () => {
     const { logger, records } = createCapturingLogger();
-    const workerHub = createWorkerHub(makeArcHost(), logger);
+    const workerHub = await createWorkerHub(await makeArcHost(), logger);
     workerHub.addBackend(
       "custom-agent",
       backend(["role"], (_host, slot) => ({
@@ -828,7 +828,7 @@ describe("backend registry", () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);
     const { logger, records } = createCapturingLogger();
-    const workerHub = createWorkerHub(arcHost, logger);
+    const workerHub = await createWorkerHub(arcHost, logger);
     workerHub.addBackend(
       "custom-agent",
       backend(["role"], () => ({
@@ -855,10 +855,11 @@ describe("backend registry", () => {
   });
 });
 
-function createWorkerHub(
-  arcHost: ArcHostService = makeArcHost(),
+async function createWorkerHub(
+  arcHost?: ArcHostService,
   logger = createCapturingLogger().logger,
-): WorkerHubService {
+): Promise<WorkerHubService> {
+  arcHost ??= await makeArcHost();
   return new WorkerHubService({
     arcHost,
     historyStore: new InMemoryHistoryStore(),

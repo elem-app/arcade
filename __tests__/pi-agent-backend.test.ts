@@ -379,7 +379,7 @@ function Watch() {
     const ordinaryRun = vi.fn(async (input: RoutineInput) =>
       answerAll(input.routine.task),
     );
-    const workerHub = createWorkerHub(arcHost);
+    const workerHub = await createWorkerHub(arcHost);
     workerHub.addBackend(
       "pi-agent",
       createPiAgentBackend({ runner: piRunner }),
@@ -500,9 +500,10 @@ function resetFakeAgent(): void {
   fakeAgent.error = undefined;
 }
 
-function createWorkerHub(
-  arcHost: ArcHostService = makeArcHost(),
-): WorkerHubService {
+async function createWorkerHub(
+  arcHost?: ArcHostService,
+): Promise<WorkerHubService> {
+  arcHost ??= await makeArcHost();
   return new WorkerHubService({
     arcHost,
     historyStore: new InMemoryHistoryStore(),
@@ -523,7 +524,7 @@ async function makePiHub(
     model: "gpt-test",
   },
 ) {
-  const workerHub = createWorkerHub(arcHost);
+  const workerHub = await createWorkerHub(arcHost);
   workerHub.addBackend("pi-agent", backend);
   await workerHub.start({
     workers: {

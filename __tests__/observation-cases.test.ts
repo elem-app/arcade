@@ -50,7 +50,7 @@ describe("observation eval cases", () => {
     expect(registry.get("grouped-observe-or-ask")?.profile).toBe("smoke");
 
     for (const item of cases) {
-      const arcHost = makeArcHost();
+      const arcHost = await makeArcHost();
       await arcHost.registerArc(
         `observation-case-${item.name}`,
         parse(item.arcSource),

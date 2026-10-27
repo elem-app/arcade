@@ -74,7 +74,11 @@ import type {
   ToolEventInput,
 } from "../types/routine.js";
 import { taskId, type Task, type TaskDisposition } from "../types/task.js";
-import type { BlockedEventFields, WorkEvent } from "../types/work-event.js";
+import type {
+  BlockedEventFields,
+  ControlEvent,
+  WorkEvent,
+} from "../types/work-event.js";
 import type { BackendName, RawWorkersConfig } from "../types/worker-slot.js";
 import { HotAsyncQueue } from "../utils/hot-async-queue.js";
 import { KeyedSerializer } from "../utils/keyed-serializer.js";
@@ -170,6 +174,7 @@ const MAX_HOST_STEPS_PER_DRAIN = 16;
 type QueueEntrypoint = "submit" | "handshake" | "background";
 type SubmissionState = {
   channel: HotAsyncQueue<InboundLifecycleEvent>;
+  /** Holds owned by handshakes, trigger probes, and in-flight fork dispatches. */
   pending: number;
   triggerProbeIds: Set<ArcRunId>;
   inbound: InboundMessage;
@@ -298,7 +303,6 @@ type FrontierWorkScope = {
   superseded: boolean;
   routines: Map<string, OwnedRoutine>;
   invalidatedAskIds: Set<string>;
-  publication: Promise<unknown>;
   cleanup: Promise<void>;
   released: boolean;
   dispatched: boolean;
@@ -392,6 +396,7 @@ export class WorkerHubService {
   readonly #routineDiagnosticsStore: RoutineDiagnosticsStore;
   readonly #logger: ArcadeLogger;
   readonly #runSerializer = new KeyedSerializer<string>();
+  readonly #handshakeResolutions = new KeyedSerializer<string>();
   readonly #controlMutations = new KeyedSerializer<ArcRunId>();
   readonly #workerRegistry: WorkerRegistry;
   readonly #routineWorkers = new Map<string, ResolvedWorker>();
@@ -440,7 +445,7 @@ export class WorkerHubService {
    */
   readonly #lapFailures = new Map<
     ArcRunId,
-    { message: string; failedAt: string }
+    { message: string; failedAt: string; announced?: boolean }
   >();
   readonly #uncaughtInterruptions = new Map<
     ArcRunId,
@@ -494,7 +499,6 @@ export class WorkerHubService {
         event,
         routines: new Map(),
         invalidatedAskIds: new Set(),
-        publication: Promise.resolve(),
         cleanup: Promise.resolve(),
         released: false,
         superseded: false,
@@ -527,7 +531,6 @@ export class WorkerHubService {
     scope.routines.clear();
     scope.event = undefined;
     scope.cleanup = Promise.resolve();
-    scope.publication = Promise.resolve();
   }
 
   /** Completion and failure both relinquish the host session after fencing queued work. */
@@ -553,7 +556,6 @@ export class WorkerHubService {
     }
     const results = await Promise.allSettled([
       this.#arcHost.releaseAction(scope.arcRunId, scope.frontierId),
-      scope.publication,
       ...[...scope.routines.values()].map((owned) =>
         this.#clearSupersededControl(owned),
       ),
@@ -649,23 +651,11 @@ export class WorkerHubService {
     const exact = askIds.filter((id) => !scope.invalidatedAskIds.has(id));
     for (const id of exact) scope.invalidatedAskIds.add(id);
     if (!exact.length) return;
-    let publication: Promise<unknown>;
-    try {
-      publication = this.#workEvents.append({
-        kind: "asks:invalidated",
-        arcRunId: scope.arcRunId,
-        askIds: exact,
-      });
-    } catch (error) {
-      publication = Promise.reject(error);
-    }
-    scope.publication = Promise.all([scope.publication, publication]);
-    void scope.publication.catch((error: unknown) =>
-      this.#logger.info("worker_hub.interruption.publication_failed", {
-        arcRunId: scope.arcRunId,
-        message: String(error),
-      }),
-    );
+    this.#workEvents.publish({
+      kind: "asks:invalidated",
+      arcRunId: scope.arcRunId,
+      askIds: exact,
+    });
   }
 
   #disposeOwnedRoutine(owned: OwnedRoutine): Promise<void> {
@@ -918,7 +908,6 @@ export class WorkerHubService {
       return this.#dispatchForkSteps(steps, inbound, prior.submissionId);
     } finally {
       this.#publishAskInvalidation(scope, invalidated);
-      await scope.publication;
     }
   }
 
@@ -932,7 +921,7 @@ export class WorkerHubService {
     this.#workerRegistry.addBackend(name, backend);
   }
 
-  /** Resolve configured slots and create every worker as one startup transaction. */
+  /** Create configured workers, then announce restored restart parks. */
   start(options: WorkerHubStartOptions = {}): Promise<void> {
     if (this.#lifecycle !== "registering") {
       throw new Error(`Worker hub cannot start while ${this.#lifecycle}.`);
@@ -946,21 +935,43 @@ export class WorkerHubService {
       this.#lifecycle = "failed";
       throw error;
     }
-    if (this.#workerRegistry.started) {
-      this.#lifecycle = "started";
-      this.#startupPromise = startup;
-    } else {
-      this.#startupPromise = startup.then(
-        () => {
-          this.#lifecycle = "started";
-        },
-        (error: unknown) => {
-          this.#lifecycle = "failed";
-          throw error;
-        },
-      );
-    }
+    if (this.#workerRegistry.started) this.#lifecycle = "started";
+    this.#startupPromise = startup.then(
+      () => {
+        this.#lifecycle = "started";
+        void this.#announceRestartParks().catch((error: unknown) => {
+          try {
+            this.#logger.info(
+              "worker_hub.work_event.restart_announcement_failed",
+              { message: String(error) },
+            );
+          } catch {
+            /* Optional startup observations cannot affect readiness. */
+          }
+        });
+      },
+      (error: unknown) => {
+        this.#lifecycle = "failed";
+        throw error;
+      },
+    );
     return this.#startupPromise;
+  }
+
+  /** Announce restored active runs once at startup; control reads stay pure. */
+  async #announceRestartParks(): Promise<void> {
+    for (const run of await this.#arcHost.listRunViews()) {
+      if (this.#lifecycle !== "started") return;
+      if (run.stage === "actioning" && run.lifecycle === "active")
+        this.#emitParkedControl(
+          {
+            kind: "control:parked",
+            arcRunId: run.arcRunId,
+            status: "hub-restarted",
+          },
+          () => !this.#runsSinceStart.has(run.arcRunId),
+        );
+    }
   }
 
   /** Stop every created worker in reverse order and aggregate cleanup failures. */
@@ -971,11 +982,11 @@ export class WorkerHubService {
   }
 
   async #stopAllWorkers(): Promise<void> {
-    if (this.#lifecycle === "starting") {
+    if (this.#lifecycle === "starting" || this.#lifecycle === "started") {
       try {
         await this.#startupPromise;
       } catch {
-        return;
+        if (!this.#workerRegistry.started) return;
       }
     }
     if (this.#lifecycle === "stopped" || this.#lifecycle === "failed") return;
@@ -1120,7 +1131,11 @@ export class WorkerHubService {
     // `trigger` step is not an activation yet → the fork it settles into does.
     if (step.kind === "action") {
       this.#runsSinceStart.add(step.arcRunId);
-      channel?.push({ kind: "activated", arcRunId: step.arcRunId });
+      channel?.push({
+        kind: "activated",
+        arcRunId: step.arcRunId,
+        reactivationCount: step.reactivationCount,
+      });
     }
     return {
       kind: "schedule",
@@ -1142,8 +1157,8 @@ export class WorkerHubService {
    * Dispatch a fork's steps. Each `action` step records the held inbound into its
    * (new) run before scheduling; `trigger` steps keep the submission open while
    * they resolve. Every fork is an activation, so action births announce
-   * `activated`. Closes the submission only when the fork is terminal (no
-   * in-progress trigger) and nothing else is outstanding.
+   * `activated`. A dispatch hold keeps the channel open until all outcomes are
+   * delivered and continuing branches own their holds.
    */
   async #dispatchForkSteps(
     steps: readonly ArcHostStep[],
@@ -1155,6 +1170,7 @@ export class WorkerHubService {
       submissionId === undefined
         ? undefined
         : this.#submissions.get(submissionId);
+    if (submission) submission.pending += 1;
     try {
       for (const step of steps) {
         if (
@@ -1172,6 +1188,9 @@ export class WorkerHubService {
         commands.push(this.#dispatchStep(step, dialog, submissionId));
       }
     } catch (error) {
+      // Fail before asynchronous cleanup or hold release lets a sibling finish.
+      if (submissionId !== undefined && submission)
+        this.#failSubmissionChannel(submissionId, submission, error);
       await Promise.all(
         steps.map((step) =>
           step.kind === "action"
@@ -1183,12 +1202,10 @@ export class WorkerHubService {
         ),
       );
       throw error;
+    } finally {
+      if (submission) submission.pending -= 1;
     }
-    // A trigger step is still resolving; keep the submission open until it fans
-    // out. Otherwise this fork is terminal — close if nothing is outstanding.
-    if (!steps.some((step) => step.kind === "trigger")) {
-      this.#closeSubmissionIfIdle(submissionId);
-    }
+    this.#closeSubmissionIfIdle(submissionId);
     return commands.length > 0 ? commands : { kind: "continue" };
   }
 
@@ -1277,31 +1294,35 @@ export class WorkerHubService {
     values: HandshakeResolution,
     clientId?: string,
   ): Promise<HandshakeReceipt> {
-    this.#assertStarted();
-    const correlation = this.#handshakeSubmissions.get(id);
-    const submission = correlation
-      ? this.#submissions.get(correlation.submissionId)
-      : undefined;
-    let result: QueueDrainResult;
-    try {
-      result = await this.#drainQueue(
-        [{ kind: "connector-handshake", id, values, clientId }],
-        "handshake",
-      );
-    } catch (error) {
-      if (correlation && submission) {
-        this.#failSubmissionChannel(
-          correlation.submissionId,
-          submission,
-          error,
+    return this.#handshakeResolutions.run(id, async () => {
+      this.#assertStarted();
+      const correlation = this.#handshakeSubmissions.get(id);
+      const submission = correlation
+        ? this.#submissions.get(correlation.submissionId)
+        : undefined;
+      let result: QueueDrainResult;
+      try {
+        result = await this.#drainQueue(
+          [{ kind: "connector-handshake", id, values, clientId }],
+          "handshake",
+        );
+      } catch (error) {
+        if (correlation && submission) {
+          this.#failSubmissionChannel(
+            correlation.submissionId,
+            submission,
+            error,
+          );
+        }
+        throw error;
+      }
+      if (result.kind !== "handshake-receipt") {
+        throw new Error(
+          "handshake queue returned without a handshake receipt.",
         );
       }
-      throw error;
-    }
-    if (result.kind !== "handshake-receipt") {
-      throw new Error("handshake queue returned without a handshake receipt.");
-    }
-    return result.receipt;
+      return result.receipt;
+    });
   }
 
   #scheduleRun(arcRunId: ArcRunId, events: QueueEvent[]): void {
@@ -1327,20 +1348,38 @@ export class WorkerHubService {
       try {
         return await task();
       } catch (error) {
-        this.#recordLapFailure(arcRunId, error);
         const scope = this.#workScopes.get(arcRunId);
-        if (scope) await this.#releaseScope(scope);
+        await this.#recordLapFailure(arcRunId, error, scope);
         throw error;
       }
     });
   }
 
-  /** Remember why a lap of the run failed, until a resume is admitted. */
-  #recordLapFailure(arcRunId: ArcRunId, error: unknown): void {
-    this.#lapFailures.set(arcRunId, {
+  /** Retain the first failure, release its work, and announce the resulting park. */
+  async #recordLapFailure(
+    arcRunId: ArcRunId,
+    error: unknown,
+    scope?: FrontierWorkScope,
+  ): Promise<void> {
+    const failure = this.#lapFailures.get(arcRunId) ?? {
       message: error instanceof Error ? error.message : String(error),
       failedAt: new Date().toISOString(),
-    });
+      announced: false,
+    };
+    this.#lapFailures.set(arcRunId, failure);
+    if (scope) await this.#releaseScope(scope);
+    if (failure.announced || this.#lifecycle !== "started") return;
+    failure.announced = true;
+    this.#emitParkedControl(
+      {
+        kind: "control:parked",
+        arcRunId,
+        status: "internal-error",
+        error: { message: failure.message },
+        failedAt: failure.failedAt,
+      },
+      () => this.#lapFailures.get(arcRunId) === failure,
+    );
   }
 
   async #drainQueue(
@@ -1600,14 +1639,15 @@ export class WorkerHubService {
     };
 
     if (result.status === "joined") {
-      await this.#appendWorkEvent({
+      this.#appendWorkEvent(() => ({
         kind: "run:started",
         route: "join",
         arcRunId: result.arcRunId,
-      });
+      }));
       submission.channel.push({
         kind: "joined",
         arcRunId: result.arcRunId,
+        reactivationCount: result.reactivationCount,
         arcRef,
       });
       submission.pending -= 1;
@@ -1620,8 +1660,6 @@ export class WorkerHubService {
       return okReceipt;
     }
 
-    submission.pending -= 1;
-
     // status === "ok": one step — a fresh `action`, a next-round `handshake`, or
     // a semantic rejection. Dispatch it like a single-step fork.
 
@@ -1630,6 +1668,8 @@ export class WorkerHubService {
       submission.inbound,
       submissionId,
     );
+    submission.pending -= 1;
+    this.#closeSubmissionIfIdle(submissionId);
     return [
       ...(Array.isArray(forkCommands) ? forkCommands : [forkCommands]),
       okReceipt,
@@ -1672,9 +1712,25 @@ export class WorkerHubService {
     if (step.kind === "action" && !frontier.canProgress) {
       if (frontier.interruption)
         this.#uncaughtInterruptions.set(arcRunId, frontier.interruption);
+      // Every other handback leaves the active lifecycle, where no park applies.
+      else this.#runsSinceStart.delete(arcRunId);
       const scope = event.scope ?? this.#workScopes.get(arcRunId);
       if (scope) await this.#releaseScope(scope);
       else await this.#arcHost.releaseAction(arcRunId, frontier.frontierId);
+      if (frontier.interruption) {
+        // The host handback precedes hub settlement. Publish only once reads
+        // expose the park; a concurrent pause can instead own control.
+        const interruption = frontier.interruption;
+        this.#emitParkedControl(
+          {
+            kind: "control:parked",
+            arcRunId,
+            status: "uncaught-interruption",
+            interruption,
+          },
+          () => this.#uncaughtInterruptions.get(arcRunId) === interruption,
+        );
+      }
       return this.#acceptFrontier(
         arcRunId,
         lap,
@@ -1713,8 +1769,7 @@ export class WorkerHubService {
         ]);
       },
       async (error: unknown) => {
-        this.#recordLapFailure(arcRunId, error);
-        if (workScope) await this.#releaseScope(workScope);
+        await this.#recordLapFailure(arcRunId, error, workScope);
         if (event.submissionId) {
           const submission = this.#submissions.get(event.submissionId);
           if (submission)
@@ -1832,7 +1887,6 @@ export class WorkerHubService {
         },
       );
       this.#retireAcceptedResults(workScope, event.results);
-      if (workScope && scopeCancelled(workScope)) await workScope.publication;
 
       return {
         kind: "enqueue",
@@ -2249,12 +2303,7 @@ export class WorkerHubService {
                   return this.#skipSupersededRoutine(owned);
                 return { status: "queued", routineId: routine.id };
               }
-              await this.#emitRoutineEvent(
-                routine,
-                backend,
-                node,
-                "routine:started",
-              );
+              this.#emitRoutineEvent(routine, backend, node, "routine:started");
               // Preparation shares the context serializer with invocation and
               // continuity writes; independent contexts can prepare concurrently.
               context = await this.#prepareRoutineContext(task, context);
@@ -2365,7 +2414,7 @@ export class WorkerHubService {
           : undefined;
       routine.updatedAt = new Date().toISOString();
       await this.#routineStore.putRoutine(routine);
-      await this.#emitRoutineEvent(
+      this.#emitRoutineEvent(
         routine,
         backend,
         node,
@@ -2539,7 +2588,7 @@ export class WorkerHubService {
     routine.error = { code, message };
     routine.updatedAt = new Date().toISOString();
     await this.#routineStore.putRoutine(routine);
-    await this.#emitRoutineEvent(routine, backend, node, "routine:skipped", {
+    this.#emitRoutineEvent(routine, backend, node, "routine:skipped", {
       error: routine.error,
     });
     this.#logger.info("worker_hub.routine.skipped", {
@@ -2645,9 +2694,9 @@ export class WorkerHubService {
         };
         registerAsk(askId, entry);
         void this.#emit(outbound, workScope)
-          .then(async () => {
+          .then(() => {
             if (scopeCancelled(workScope)) return;
-            await this.#emitBlockedEvent(routine, backend, node, {
+            this.#emitBlockedEvent(routine, backend, node, {
               kind: "blocked:question",
               audience: audienceName,
               askId,
@@ -2713,9 +2762,9 @@ export class WorkerHubService {
         };
         registerAsk(askId, entry);
         void this.#emit(outbound, workScope)
-          .then(async () => {
+          .then(() => {
             if (scopeCancelled(workScope)) return;
-            await this.#emitBlockedEvent(routine, backend, node, {
+            this.#emitBlockedEvent(routine, backend, node, {
               kind: "blocked:permission",
               audience: PERMISSION_APPROVER_AUDIENCE,
               askId,
@@ -2736,15 +2785,10 @@ export class WorkerHubService {
         emit: emitOutbound,
         requestPermission,
         logToolEvent: async (event) => {
-          await this.#appendRoutineToolEvent(routine, backend, node, event);
+          this.#appendRoutineToolEvent(routine, backend, node, event);
         },
         recordTokenUsage: async (tokenUsage) => {
-          await this.#appendRoutineUsageEvent(
-            routine,
-            backend,
-            node,
-            tokenUsage,
-          );
+          this.#appendRoutineUsageEvent(routine, backend, node, tokenUsage);
         },
         checkSignal: async () => {
           if (scopeCancelled(workScope)) return { kind: "cancel" };
@@ -2788,9 +2832,7 @@ export class WorkerHubService {
 
   async #nodeInfoForTask(task: Task): Promise<NodeInfo> {
     const ref = taskSourceRef(task);
-    return task.kind === "semantic" && task.stage === "trigger"
-      ? this.#arcHost.nodeInfoForRef(ref)
-      : this.#arcHost.nodeInfoForRunRef(task.arcRunId, ref);
+    return this.#arcHost.nodeInfoForRef(ref, task.arcRunId);
   }
 
   /**
@@ -3171,22 +3213,22 @@ export class WorkerHubService {
               updatedAt: now,
             };
       await this.#routineStore.putExecutionControl(control);
+      this.#emitControlEvent(
+        arcRunId,
+        control.status === "pauseRequested"
+          ? "control:pause-requested"
+          : "control:paused",
+        controlRoutineId,
+      );
       return {
         outcome: "requested" as const,
         control: executionControlView(control),
         controlState: control,
-        controlRoutineId,
       };
     });
     if (updated.outcome !== "requested") return updated;
-    const { controlState: control, controlRoutineId } = updated;
-    await this.#emitControlEvent(
-      arcRunId,
-      control.status === "pauseRequested"
-        ? "control:pause-requested"
-        : "control:paused",
-      controlRoutineId,
-    );
+    const { controlState: control } = updated;
+
     this.#logger.info("worker_hub.pause.requested", {
       arcRunId,
       status: control.status,
@@ -3226,8 +3268,7 @@ export class WorkerHubService {
     try {
       return await this.#resumeCurrentRun(arcRunId, auto, continuation);
     } catch (error) {
-      this.#recordLapFailure(arcRunId, error);
-      if (continuation?.scope) await this.#releaseScope(continuation.scope);
+      await this.#recordLapFailure(arcRunId, error, continuation?.scope);
       this.#failContinuation(continuation, error);
       throw error;
     }
@@ -3306,6 +3347,15 @@ export class WorkerHubService {
       this.#lapFailures.delete(arcRunId);
       this.#uncaughtInterruptions.delete(arcRunId);
       this.#runsSinceStart.add(arcRunId);
+      this.#emitControlEvent(
+        arcRunId,
+        "control:resumed",
+        rebuild
+          ? undefined
+          : existing.status === "paused"
+            ? existing.pausedRoutineId
+            : parkedRoutineId(existing),
+      );
       return { outcome: "resumed" as const, existing, running, rebuild };
     });
     if (accepted.outcome !== "resumed") return accepted;
@@ -3337,12 +3387,6 @@ export class WorkerHubService {
         ? existing.pausedRoutineOrigin
         : undefined;
 
-    await this.#emitControlEvent(
-      arcRunId,
-      "control:resume-requested",
-      resumeRoutineId,
-    );
-    await this.#emitControlEvent(arcRunId, "control:resumed", resumeRoutineId);
     this.#logger.info("worker_hub.pause.resumed", { arcRunId });
 
     await this.#run(arcRunId, () => {
@@ -3494,15 +3538,17 @@ export class WorkerHubService {
         routine.status = "paused";
         routine.updatedAt = now;
         await this.#routineStore.putRoutine(routine);
+        if (!scopeCancelled(owned?.scope))
+          this.#emitControlEvent(
+            routine.arcRunId,
+            "control:paused",
+            routine.id,
+          );
         return paused;
       },
     );
     if (!paused || scopeCancelled(owned?.scope)) return;
-    await this.#emitControlEvent(
-      routine.arcRunId,
-      "control:paused",
-      routine.id,
-    );
+
     this.#logger.info("worker_hub.pause.paused", {
       arcRunId: routine.arcRunId,
       status: paused.status,
@@ -3578,10 +3624,10 @@ export class WorkerHubService {
 
   /**
    * Shared park mechanism for both sibling parks. Persists the durable park
-   * control, marks the routine parked, emits the park work event, and — unless
-   * the user had asked to pause — schedules the bounded auto-retry. Callers
-   * differ only in the control they build, the event they emit, and the retry
-   * policy (`retryable`, optional `retryAfterMs`).
+   * control, marks the routine parked, and emits its routine outcome. It then
+   * schedules bounded auto-retry unless the user requested pause, and announces
+   * the readable control park. Callers supply the control, routine event, and
+   * retry policy (`retryable`, optional `retryAfterMs`).
    */
   async #parkRoutine(
     routine: RoutineState,
@@ -3589,7 +3635,7 @@ export class WorkerHubService {
       ExecutionControlState,
       { status: "capacity-limited" | "transport-lost" }
     >,
-    emitEvent: () => Promise<WorkEvent>,
+    emitEvent: () => void,
     retry: { retryable: boolean; retryAfterMs?: number },
     owned?: OwnedRoutine,
   ): Promise<void> {
@@ -3611,11 +3657,27 @@ export class WorkerHubService {
         routine.status = control.status;
         routine.updatedAt = control.updatedAt;
         await this.#routineStore.putRoutine(routine);
+        if (scopeCancelled(owned?.scope)) return undefined;
+        emitEvent();
+        this.#appendWorkEvent(() =>
+          control.status === "capacity-limited"
+            ? {
+                kind: "control:parked",
+                arcRunId: routine.arcRunId,
+                status: control.status,
+                capacityReason: control.capacityReason,
+              }
+            : {
+                kind: "control:parked",
+                arcRunId: routine.arcRunId,
+                status: control.status,
+                transportReason: control.transportReason,
+              },
+        );
         return prior.status === "paused" || prior.status === "pauseRequested";
       },
     );
     if (pauseDesired === undefined || scopeCancelled(owned?.scope)) return;
-    await emitEvent();
     this.#logger.info("worker_hub.routine.park.parked", {
       arcRunId: routine.arcRunId,
       routineId: routine.id,
@@ -3742,8 +3804,11 @@ export class WorkerHubService {
       requireContinuation: wasPark,
       continuation,
     }).catch(async (error: unknown) => {
-      this.#recordLapFailure(routine.arcRunId, error);
-      if (continuation?.scope) await this.#releaseScope(continuation.scope);
+      await this.#recordLapFailure(
+        routine.arcRunId,
+        error,
+        continuation?.scope,
+      );
       this.#failContinuation(continuation, error);
       this.#logger.info("worker_hub.routine.resume.failed", {
         routineId: routine.id,
@@ -3847,10 +3912,10 @@ export class WorkerHubService {
         pausedAt: now,
         updatedAt: now,
       });
+      this.#emitControlEvent(arcRunId, "control:paused");
       return true;
     });
     if (!changed) return;
-    await this.#emitControlEvent(arcRunId, "control:paused");
     this.#logger.info("worker_hub.pause.paused", {
       arcRunId,
       status: "paused",
@@ -3869,7 +3934,7 @@ export class WorkerHubService {
     return this.#workEvents.list(arcRunId);
   }
 
-  async #emitRoutineEvent(
+  #emitRoutineEvent(
     routine: RoutineState,
     backend: BackendName,
     node: NodeInfo,
@@ -3882,8 +3947,8 @@ export class WorkerHubService {
       disposition?: TaskDisposition;
       error?: { code: string; message: string };
     },
-  ): Promise<WorkEvent> {
-    return this.#appendWorkEvent({
+  ): void {
+    this.#appendWorkEvent(() => ({
       arcRunId: routine.arcRunId,
       kind,
       routineId: routine.id,
@@ -3898,16 +3963,16 @@ export class WorkerHubService {
         ? { disposition: opts.disposition }
         : {}),
       ...(opts?.error !== undefined ? { error: opts.error } : {}),
-    });
+    }));
   }
 
-  async #emitRoutineCapacityLimitedEvent(
+  #emitRoutineCapacityLimitedEvent(
     routine: RoutineState,
     backend: BackendName,
     node: NodeInfo,
     capacityReason: CapacityLimit,
-  ): Promise<WorkEvent> {
-    return this.#appendWorkEvent({
+  ): void {
+    this.#appendWorkEvent(() => ({
       arcRunId: routine.arcRunId,
       kind: "routine:capacity-limited",
       routineId: routine.id,
@@ -3918,16 +3983,16 @@ export class WorkerHubService {
         ? { nodeDescription: node.description }
         : {}),
       capacityReason,
-    });
+    }));
   }
 
-  async #emitRoutineTransportLostEvent(
+  #emitRoutineTransportLostEvent(
     routine: RoutineState,
     backend: BackendName,
     node: NodeInfo,
     transportReason: TransportLoss,
-  ): Promise<WorkEvent> {
-    return this.#appendWorkEvent({
+  ): void {
+    this.#appendWorkEvent(() => ({
       arcRunId: routine.arcRunId,
       kind: "routine:transport-lost",
       routineId: routine.id,
@@ -3938,16 +4003,16 @@ export class WorkerHubService {
         ? { nodeDescription: node.description }
         : {}),
       transportReason,
-    });
+    }));
   }
 
-  async #emitBlockedEvent(
+  #emitBlockedEvent(
     routine: RoutineState,
     backend: BackendName,
     node: NodeInfo,
     input: BlockedEventFields,
-  ): Promise<WorkEvent> {
-    return this.#appendWorkEvent({
+  ): void {
+    this.#appendWorkEvent(() => ({
       arcRunId: routine.arcRunId,
       routineId: routine.id,
       role: routine.role,
@@ -3957,28 +4022,57 @@ export class WorkerHubService {
         ? { nodeDescription: node.description }
         : {}),
       ...input,
-    });
+    }));
   }
 
-  async #emitControlEvent(
+  #emitControlEvent(
     arcRunId: ArcRunId,
-    kind: Extract<WorkEvent, { kind: `control:${string}` }>["kind"],
+    kind: Exclude<ControlEvent["kind"], "control:parked">,
     routineId?: string,
-  ): Promise<WorkEvent> {
-    return this.#appendWorkEvent({
+  ): void {
+    this.#appendWorkEvent(() => ({
       arcRunId,
       kind,
       ...(routineId !== undefined ? { routineId } : {}),
-    });
+    }));
   }
 
-  async #appendRoutineToolEvent(
+  /** Check optional park visibility without making it a progression barrier. */
+  #emitParkedControl(
+    event: Extract<CreateWorkEventInput, { kind: "control:parked" }>,
+    ownsCause: () => boolean,
+  ): void {
+    try {
+      const captured = structuredClone(event);
+      this.#workEvents.publishPrepared(captured.arcRunId, async () => {
+        if (this.#lifecycle !== "started" || !ownsCause()) return;
+        const control = await this.getExecutionControlView(captured.arcRunId);
+        if (
+          this.#lifecycle !== "started" ||
+          !ownsCause() ||
+          control.status !== captured.status
+        )
+          return;
+        return captured;
+      });
+    } catch (error) {
+      try {
+        this.#logger.info("worker_hub.work_event.capture_failed", {
+          message: String(error),
+        });
+      } catch {
+        /* Optional diagnostics cannot change handback. */
+      }
+    }
+  }
+
+  #appendRoutineToolEvent(
     routine: RoutineState,
     backend: BackendName,
     node: NodeInfo,
     event: ToolEventInput,
-  ): Promise<WorkEvent> {
-    return this.#appendWorkEvent({
+  ): void {
+    this.#appendWorkEvent(() => ({
       ...event,
       arcRunId: routine.arcRunId,
       routineId: routine.id,
@@ -3988,16 +4082,16 @@ export class WorkerHubService {
       ...(node.description !== undefined
         ? { nodeDescription: node.description }
         : {}),
-    });
+    }));
   }
 
-  async #appendRoutineUsageEvent(
+  #appendRoutineUsageEvent(
     routine: RoutineState,
     backend: BackendName,
     node: NodeInfo,
     tokenUsage: Extract<WorkEvent, { kind: "routine:usage" }>["tokenUsage"],
-  ): Promise<WorkEvent> {
-    return this.#appendWorkEvent({
+  ): void {
+    this.#appendWorkEvent(() => ({
       arcRunId: routine.arcRunId,
       kind: "routine:usage",
       routineId: routine.id,
@@ -4008,17 +4102,14 @@ export class WorkerHubService {
         ? { nodeDescription: node.description }
         : {}),
       tokenUsage,
-    });
+    }));
   }
 
-  /**
-   * Persist node entered/exited work events for the transitions acknowledged
-   * while the host settled each step's frontier. Called once per host
-   * begin/advance call, so a depth-bound reschedule of the same frontier never
-   * re-emits.
-   */
-  async #appendWorkEvent(input: CreateWorkEventInput): Promise<WorkEvent> {
-    return this.#workEvents.append(input);
+  /** Capture optional activity without awaiting storage or delivery. */
+  #appendWorkEvent(
+    input: CreateWorkEventInput | (() => CreateWorkEventInput),
+  ): void {
+    this.#workEvents.publish(input);
   }
 }
 

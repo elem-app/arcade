@@ -23,7 +23,7 @@ function summarize(steps: readonly ReplayStep[]): string[] {
 
 describe("replay recording", () => {
   it("records a position-0 seed, action outputs from 1, and brief/report sharing a position", async () => {
-    const { host, replay } = makeReplayHost();
+    const { host, replay } = await makeReplayHost();
     await host.registerArc("greet", parse(GREET_SOURCE));
     const runId = await runToCompletion(host, "hi");
 
@@ -43,7 +43,7 @@ describe("replay recording", () => {
   });
 
   it("tags worker-driven action reports with the worker origin", async () => {
-    const { host, replay } = makeReplayHost();
+    const { host, replay } = await makeReplayHost();
     await host.registerArc("greet", parse(GREET_SOURCE));
     const runId = await runToCompletion(host, "hi");
 
@@ -55,7 +55,7 @@ describe("replay recording", () => {
   });
 
   it("records a worker interrupt disposition with the worker origin", async () => {
-    const { host, replay } = makeReplayHost();
+    const { host, replay } = await makeReplayHost();
     await host.registerArc("greet", parse(GREET_SOURCE));
     const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
     const driver = await beginActivatedDriver(host, dialog);
@@ -87,7 +87,7 @@ describe("replay recording", () => {
   });
 
   it("records the trigger stream under the activated run id", async () => {
-    const { host, replay } = makeReplayHost();
+    const { host, replay } = await makeReplayHost();
     await host.registerArc("greet", parse(GREET_SOURCE));
     const runId = await runToCompletion(host, "hi");
 
@@ -99,7 +99,7 @@ describe("replay recording", () => {
   });
 
   it("records and verifies terminal root identity, outcome, and returns", async () => {
-    const { host, replay } = makeReplayHost();
+    const { host, replay } = await makeReplayHost();
     await host.registerArc(
       "operation",
       parse(`
@@ -139,7 +139,7 @@ function Operation(returns = { output: Str() }) {
   });
 
   it("records nothing and behaves identically when no replay store is configured", async () => {
-    const host = createTestArcHost({ store: new InMemoryArcHostStore() });
+    const host = await createTestArcHost({ store: new InMemoryArcHostStore() });
     await host.registerArc("greet", parse(GREET_SOURCE));
     const runId = await runToCompletion(host, "hi");
 

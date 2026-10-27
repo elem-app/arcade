@@ -39,6 +39,21 @@ Read-only operations are available in trigger and action evaluation. `$addTimeou
 
 Arguments with the wrong type or unsupported struct fields are rejected before the call executes. The time module validates and prepares every call before installing the batch or publishing effects. Invalid values, such as a negative timeout, an unknown time zone or unit, or an unsupported format pattern, reject submission. During action evaluation, the host records poison and returns the ordinary terminal frontier from its current call. The hub then releases the execution. A rejected trigger submission ends that probe.
 
+## Published activity
+
+The module publishes activity through host-module work events. The call event's `publishedData` describes the operation:
+
+| Operation | Published data | Publication rule |
+| --- | --- | --- |
+| `$sleep` | `{ deadlineMillis }` | The sleep remains unresolved and its timer is installed. |
+| `$addTimeout` | `{ deadlineMillis }` | The timeout remains unconsumed and uncancelled and its timer is installed. |
+| `$removeTimeout` | `{ removedHostCallIds }` | The call has no admitted effects; the data contains its exact retained cancellation selection, including an empty selection. |
+| Read-only operations | None. | No call or effect activity is published. |
+
+Deadlines are absolute Unix milliseconds. Reconstruction republishes outstanding sleeps and timeouts with their original deadlines. The module applies the complete batch's retained removals before choosing deadline publications, so a cancelled historical timeout is not advertised again. A completed historical removal publishes nothing, and later registrations using the same name retain their own deadlines. Failed operations publish no reconstructed activity.
+
+An admitted sleep resolution ends its wait. A timeout's registration resolution completes the authored registration call while its timer remains pending; its later interruption consumes the timeout. A removal's selected IDs identify cancelled timeout occurrences. General event interpretation and run-stop behavior follow [host-module activity semantics](../observability.md#host-module-activity).
+
 ## Timeouts and `catchInterruption`
 
 `$addTimeout(milliseconds, id?)` registers a timeout for the current run. The call completes after registration; the run can continue while the timeout is pending. Each call registers an independent timeout, even when several calls share the same ID. An omitted ID becomes the duration's string representation: `$addTimeout(5000)` has ID `"5000"`. Explicit strings, including the empty string, are preserved.

@@ -80,6 +80,7 @@ export type {
 } from "./types/handshake.js";
 export type {
   HostCall,
+  HostCallAck,
   HostCallRecord,
   HostModuleEffect,
   HostModuleState,
@@ -139,7 +140,12 @@ export type {
   Task,
   TaskDisposition,
 } from "./types/task.js";
-export type { AskEvent, RunEvent, WorkEvent } from "./types/work-event.js";
+export type {
+  AskEvent,
+  HostModuleEvent,
+  RunEvent,
+  WorkEvent,
+} from "./types/work-event.js";
 export {
   BackendNameSchema,
   RawWorkerSlotSchema,

@@ -55,11 +55,11 @@ const occurrences = (events: readonly WorkEvent[]) =>
       event.kind === "run:interruption-occurred",
   );
 
-function fixture(recording = true) {
+async function fixture(recording = true) {
   const store = new InMemoryArcHostStore();
   const replayStore = recording ? new InMemoryReplayStore() : undefined;
   const clock = makeControlledTime();
-  const host = createTestArcHost({ store, replayStore, ...clock });
+  const host = await createTestArcHost({ store, replayStore, ...clock });
   return { host, store, replayStore, clock, events: workEventsFor(host) };
 }
 
@@ -68,7 +68,7 @@ describe("committed control occurrences", () => {
     "control-occurrences.guard records caught and uncaught admission with recording=%s",
     async (recording) => {
       for (const caught of [true, false]) {
-        const { host, store, events } = fixture(recording);
+        const { host, store, events } = await fixture(recording);
         await host.registerArc(
           "control",
           parse(
@@ -92,7 +92,10 @@ describe("committed control occurrences", () => {
         expect(stored.some((e) => e.kind === "run:deflected")).toBe(!caught);
         if (!caught) expect(stored.at(-1)?.kind).toBe("run:deflected");
         else {
-          const restored = createTestArcHost({ store, workEvents: events });
+          const restored = await createTestArcHost({
+            store,
+            workEvents: events,
+          });
           await restored.begin({
             arcRunId: driver.arcRunId,
             projectDialog: projectorFor(dialog),
@@ -107,7 +110,7 @@ describe("committed control occurrences", () => {
 
   it("control-occurrences.application carries an uncaught interruption on the idle frontier", async () => {
     for (const caught of [false, true]) {
-      const { host } = fixture();
+      const { host } = await fixture();
       await host.registerArc(
         "control",
         parse(
@@ -143,7 +146,7 @@ describe("committed control occurrences", () => {
   });
 
   it("control-occurrences.policy orders child transitions and root deflection around one occurrence", async () => {
-    const { host, events, replayStore } = fixture();
+    const { host, events, replayStore } = await fixture();
     await host.registerArc(
       "control",
       parse(
@@ -187,7 +190,7 @@ describe("committed control occurrences", () => {
   });
 
   it("control-occurrences.worker captures ordinary deflection before a terminal output", async () => {
-    const { host, events } = fixture();
+    const { host, events } = await fixture();
     await host.registerArc(
       "control",
       parse(source("if (judge(`work`)) $instruct(`go`);")),
@@ -210,7 +213,7 @@ describe("committed control occurrences", () => {
   it.each(["deflection", "interruption"] as const)(
     "control-occurrences.flush publishes %s during an unresolved activation catch host call",
     async (control) => {
-      const { host, store, events } = fixture();
+      const { host, store, events } = await fixture();
       let resolve!: (value: boolean) => void;
       const held = {
         promise: new Promise<boolean>((done) => {
@@ -219,7 +222,7 @@ describe("committed control occurrences", () => {
         resolve: (value: boolean) => resolve(value),
       };
       let handlerRun: ArcRunId | undefined;
-      host.registerHostModule(
+      await host.registerHostModule(
         "gate",
         hostModule(
           moduleHubFor(host),
@@ -267,7 +270,7 @@ describe("committed control occurrences", () => {
   );
 
   it("control-occurrences.replacement records new interruptions with repeated IDs while retaining the caught deflection", async () => {
-    const { host, events, replayStore, clock } = fixture();
+    const { host, events, replayStore, clock } = await fixture();
     await host.registerArc(
       "control",
       parse(
@@ -320,7 +323,7 @@ describe("committed control occurrences", () => {
   it.each(["deflection", "interruption"] as const)(
     "control-occurrences.failure respects %s same-call rollback",
     async (control) => {
-      const { host, events, clock } = fixture();
+      const { host, events, clock } = await fixture();
       await host.registerArc(
         "control",
         parse(
@@ -356,7 +359,7 @@ describe("committed control occurrences", () => {
   );
 
   it("control-occurrences.commit leaves failed acknowledgements pending and publishes once on reconstruction", async () => {
-    const { host, store, events, replayStore } = fixture();
+    const { host, store, events, replayStore } = await fixture();
     await host.registerArc(
       "control",
       parse(
@@ -386,7 +389,7 @@ describe("committed control occurrences", () => {
         ?.control?.phase,
     ).toBe("requested");
     fail = false;
-    const restored = createTestArcHost({
+    const restored = await createTestArcHost({
       store,
       replayStore,
       workEvents: events,
@@ -405,7 +408,7 @@ describe("committed control occurrences", () => {
 
   it("control-occurrences.hub correlates exact invalidation before catch questions", async () => {
     const clock = makeControlledTime();
-    const host = createTestArcHost({
+    const host = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       ...clock,
     });
@@ -521,7 +524,7 @@ describe("committed control occurrences", () => {
     }
   });
   it("control-occurrences.worker records one occurrence for an interrupt disposition", async () => {
-    const { host, events } = fixture();
+    const { host, events } = await fixture();
     await host.registerArc("control", parse(source("$instruct(`work`);")));
     const driver = await beginActivatedDriver(host, dialog);
     await driver.advance({
@@ -549,7 +552,7 @@ describe("committed control occurrences", () => {
   });
 
   it("control-occurrences.coverage records fresh deflections at the same eligible frontier", async () => {
-    const { host, events } = fixture();
+    const { host, events } = await fixture();
     await host.registerArc(
       "control",
       parse(
@@ -586,7 +589,7 @@ describe("committed control occurrences", () => {
   });
 
   it("control-occurrences.reentry commits a new occurrence under the next activation count", async () => {
-    const { host, events } = fixture();
+    const { host, events } = await fixture();
     await host.registerArc(
       "control",
       parse(
@@ -630,7 +633,7 @@ describe("committed control occurrences", () => {
   it.each(["deflection", "interruption"] as const)(
     "control-occurrences.later-failure preserves committed %s before catch poison",
     async (control) => {
-      const { host, events, clock } = fixture();
+      const { host, events, clock } = await fixture();
       const body = `${control === "interruption" ? 'Time.$addTimeout(100, "failure");' : ""} let n = Num(); n.$set(1);
       this.${control === "deflection" ? "catchDeflection" : "catchInterruption"} = () => {
         if (judge(\`continue catch\`)) n.$set(0 / 0); return true;
@@ -679,8 +682,8 @@ describe("committed control occurrences", () => {
   );
 
   it("control-occurrences.later-commit retains an occurrence when the next catch write fails", async () => {
-    const { host, store, events } = fixture();
-    host.registerHostModule(
+    const { host, store, events } = await fixture();
+    await host.registerHostModule(
       "gate",
       hostModule(
         moduleHubFor(host),
@@ -723,7 +726,7 @@ describe("committed control occurrences", () => {
   it.each(["rewind", "jump"] as const)(
     "control-occurrences.successor publishes only fresh control after %s",
     async (operation) => {
-      const { host, events, replayStore, clock } = fixture();
+      const { host, events, replayStore, clock } = await fixture();
       await host.registerArc(
         "control",
         parse(
@@ -778,7 +781,7 @@ describe("committed control occurrences", () => {
   );
 
   it("control-occurrences.paused defers an elapsed timeout until resume and discards the old report", async () => {
-    const { host, store, events, clock } = fixture();
+    const { host, store, events, clock } = await fixture();
     await host.registerArc(
       "control",
       parse(
@@ -844,7 +847,7 @@ describe("committed control occurrences", () => {
   });
 
   it("control-occurrences.exclusive acknowledges transitions and deflection before an elapsed timeout", async () => {
-    const { host, events, clock } = fixture();
+    const { host, events, clock } = await fixture();
     await host.registerArc(
       "control",
       parse(
@@ -867,9 +870,13 @@ describe("committed control occurrences", () => {
       (await events.list(driver.arcRunId)).map((event) => event.kind),
     ).toEqual([
       "run:started",
+      "host-module:call",
+      "host-module:effect",
       "node:entered",
       "run:deflection-occurred",
       "run:interruption-occurred",
+      "host-module:effect",
+      "run:interrupted",
     ]);
     expect(await host.getRunView(driver.arcRunId)).toMatchObject({
       stage: "actioning",
@@ -878,7 +885,7 @@ describe("committed control occurrences", () => {
   });
 
   it("control-occurrences.subscription isolates listeners and correlates repeated authored timeout IDs", async () => {
-    const { host, events, clock } = fixture();
+    const { host, events, clock } = await fixture();
     await host.registerArc(
       "control",
       parse(
@@ -937,7 +944,7 @@ describe("committed control occurrences", () => {
     async (recording) => {
       const dir = await mkdtemp(join(tmpdir(), "control-occurrence-json-"));
       const clock = makeControlledTime();
-      const open = () => {
+      const open = async () => {
         const store = new JsonFileArcHostStore({ dir: join(dir, "runs") });
         const replayStore = recording
           ? new JsonFileReplayStore({ dir: join(dir, "replay") })
@@ -949,7 +956,7 @@ describe("committed control occurrences", () => {
         return {
           store,
           events,
-          host: createTestArcHost({
+          host: await createTestArcHost({
             store,
             replayStore,
             workEvents: events,
@@ -957,7 +964,7 @@ describe("committed control occurrences", () => {
           }),
         };
       };
-      const initial = open();
+      const initial = await open();
       try {
         await initial.host.registerArc(
           "control",
@@ -982,12 +989,16 @@ describe("committed control occurrences", () => {
           beginActivatedDriver(initial.host, dialog),
         ).rejects.toThrow("commit refused");
         expect(occurrences(await initial.events.list(runId!))).toEqual([]);
-        const resumed = open();
+        const resumed = await open();
         await beginDriver(resumed.host, runId!, dialog);
         await resumed.host.stop();
+        await waitFor(
+          async () =>
+            occurrences(await resumed.events.list(runId!)).length === 1,
+        );
         const committed = occurrences(await resumed.events.list(runId!));
         expect(committed).toHaveLength(1);
-        const reconstructed = open();
+        const reconstructed = await open();
         const resumedStep = expectSoleDriver(
           await reconstructed.host.begin({
             arcRunId: runId!,
@@ -1001,8 +1012,12 @@ describe("committed control occurrences", () => {
         clock.fireDue();
         await drainModuleEffects(reconstructed.host, [resumedStep], dialog);
         await reconstructed.host.stop();
+        await waitFor(
+          async () =>
+            occurrences(await reconstructed.events.list(runId!)).length === 2,
+        );
         expect(
-          occurrences(await open().events.list(runId!)).map(
+          occurrences(await (await open()).events.list(runId!)).map(
             (event) => event.kind,
           ),
         ).toEqual(["run:deflection-occurred", "run:interruption-occurred"]);
@@ -1013,7 +1028,7 @@ describe("committed control occurrences", () => {
   );
 
   it("control-occurrences.driver explicitly delivers an idle timeout", async () => {
-    const { host, events, clock } = fixture();
+    const { host, events, clock } = await fixture();
     await host.registerArc(
       "control",
       parse(
@@ -1038,8 +1053,8 @@ describe("committed control occurrences", () => {
   });
 
   it("control-occurrences.unapplied retires a timeout deferred by closing effects", async () => {
-    const { host, store, events, clock } = fixture();
-    host.registerHostModule(
+    const { host, store, events, clock } = await fixture();
+    await host.registerHostModule(
       "gate",
       hostModule(
         moduleHubFor(host),
@@ -1077,7 +1092,7 @@ describe("committed control occurrences", () => {
   it.each(["accepted", "failed"] as const)(
     "control-occurrences.answer preserves exact invalidation when a claimed answer write is %s",
     async (outcome) => {
-      const { host, events, clock } = fixture();
+      const { host, events, clock } = await fixture();
       await host.registerArc(
         "control",
         parse(

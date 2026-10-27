@@ -8,7 +8,7 @@ Use this reference when integrating Arcade into an application, writing a connec
 
 Before any run exists, the application registers Arc documents with the arc host, usually through `DiscoveryService`.
 
-Each method is described by its behavior. The exported TypeScript types define exact data shapes. Methods used only by tests or internal wiring are omitted.
+Each method explains its purpose and the inputs and results callers need. The exported TypeScript types define exact data shapes. Methods used only by tests or internal wiring are omitted.
 
 ## Composition
 
@@ -28,9 +28,7 @@ A startup failure cleans up services already started and rejects with the startu
 
 An inbound message can activate only Arcs registered with the arc host. Applications usually register through `DiscoveryService`, which finds Arc bundles on disk and passes their parsed documents to the arc host. An embedder holding parsed documents calls the arc host's registration methods directly.
 
-Each registration batch succeeds or fails as a whole. The arc host validates imports and channels across the whole registry, so documents in one batch may import one another in any order. A failed batch rejects with Arc's structured `RuntimeRegistrationError` and leaves the registry unchanged. Registration starts no run and creates no work event, outbound message, or history entry.
-
-Replacing a registered source applies to future activation requests. Existing runs keep the Arc source they started with.
+Registration makes Arcs available for activation without starting a run.
 
 ### Discovery
 
@@ -84,25 +82,28 @@ registerArc(
 ): Promise<void>
 ```
 
-Registers every root Arc in each parsed document. `registerArc` is the one-document form of `registerArcs`; use the batch form when the documents import one another. A duplicate source is rejected unless the registration sets `replace`.
+Registers every root Arc in a parsed document under its source name. `registerArc` handles one document; `registerArcs` applies a batch of source changes.
+
+A batch can add sources, replace existing sources with `replace: true`, and remove sources with `{ source, delete: true }`. Each source appears at most once. Related documents are validated together, regardless of entry order; a rejected batch leaves the live registry unchanged.
 
 Each registration names:
 
 - The `source`, which Arc refs and imports use as the runtime source name.
+- The parsed `document` containing the root Arcs to register.
 - An optional manifest, normally derived from `arcade.json` during discovery. It chooses run-scoped workspaces or an arc-scoped connector workspace, supplies the workspace bundle, and sets the run-wide [managed context isolation](./arcade.md#managed-context-isolation) floor.
 - An optional workspace path for arc-scoped workspace policy.
 
-A fresh activation uses the activating root's manifest policy across imported nodes. Existing runs keep that policy and the node metadata from their original Arc version.
+The activating root's manifest governs workspace policy, bundle mappings, and context isolation throughout the run. Existing runs retain their captured documents and manifest.
 
-Registration validates node metadata. `hostParams.workerRole` must be a non-empty string, `tools` must be an array of strings, and `contextIsolation` must be `"role"` or `"node"`. `workerRole` and `contextIsolation` are node-level declarations; the arc host rejects them on statements, including statements nested in `if`, label, invoke, and `$map` bodies. An instruction may carry its own `tools`. Work for another role or isolation belongs in a child node declaring that metadata. A rejected source can be registered again once fixed.
+Registration also validates the document's worker roles, tool selections, and context-isolation declarations, which control how its work is dispatched.
 
 #### `registerHostModule(module, impl)`
 
 ```ts
-registerHostModule(module: string, impl: HostModule): () => void
+registerHostModule(module: string, impl: HostModule): Promise<() => Promise<void>>
 ```
 
-Registers the Arc-visible declaration and host implementation of one `host:*` module and returns its unregister function. A second registration for the same module throws. Adding or removing a module succeeds only if every registered Arc document remains valid. Existing runs require the declarations captured at activation. See [host module implementation](./host-modules/README.md) for the module contract.
+Registers the Arc-visible declaration and host implementation of one `host:*` module and returns an asynchronous unregister function. Await registration before using the module and await the unregister call when removing it. See [host module implementation](./host-modules/README.md) for the module contract.
 
 #### `knownWorkerRoles()`
 
@@ -112,13 +113,13 @@ knownWorkerRoles(): Set<string>
 
 Returns the worker roles referenced by registered Arc documents, including the default worker role.
 
-#### `nodeInfoForRef(ref)`
+#### `nodeInfoForRef(ref, arcRunId?)`
 
 ```ts
-nodeInfoForRef(ref: NodeRef): { name: string; description?: string }
+nodeInfoForRef(ref: NodeRef, arcRunId?: ArcRunId): Promise<NodeInfo>
 ```
 
-Returns the parsed name and description of a node in the latest registered documents.
+Returns a node's name and description. Supply a run or probe ID to read its captured Arc version; omit it to read the latest registered version.
 
 ## Connector Interface
 
@@ -139,7 +140,7 @@ Submits one inbound message and returns its lifecycle channel. An inbound messag
 
 Any other message is rejected without changing history or dispatching work. This covers an activation request carrying `metadata.askId`, a missing or malformed `askId`, an unknown or already settled ask, and an ask belonging to another run.
 
-Processing is asynchronous: the channel is returned immediately, and processing proceeds whether or not the caller consumes it. An activation request emits branch decisions and per-routine trigger failures, and its channel closes once no trigger evaluation or handshake remains outstanding; an empty channel means no Arc matched. An ask answer emits one terminal `continued` or `rejected` event. An infrastructure failure fails the channel instead of producing an event.
+Processing is asynchronous: the channel is returned immediately, and processing proceeds whether or not the caller consumes it. An activation request emits branch decisions and per-routine trigger failures, and its channel closes once all admission outcomes have been delivered and no trigger evaluation or handshake remains outstanding; an empty channel means no Arc matched. An ask answer emits one terminal `continued` or `rejected` event. An infrastructure failure fails the channel instead of producing an event.
 
 Lifecycle events:
 
@@ -151,6 +152,10 @@ Lifecycle events:
 - `failed`: one trigger routine failed, carrying the run ID, routine ID, and the report message as the reason. Other trigger evaluations continue, so further events may follow. The `routine:failed` work event retains the code and message.
 
 `activated` and `handshake-required` arrive in no guaranteed order. A consumer that needs the full activation set accumulates events until the channel closes.
+
+To follow an admitted activation, retain `(arcRunId, reactivationCount)` from `activated` or `joined` and compare with the same run's actioning view from [`getRunView`](#getrunviewarcrunid). An equal count means its current lifecycle describes that activation. A greater count proves the followed activation deflected, because only deflection permits same-ID reactivation. A missing or preparation view, or a smaller count, is unavailable or inconsistent with the receipt and establishes no activation outcome. This comparison applies to a receipt-established activation, not an arbitrary lower number: successors can start at nonzero counts.
+
+Pause, parks, interruption, resume, and reconstruction preserve the count. Completed and poisoned runs cannot reactivate under the same ID. These service results and views let a caller follow an activation without reading or subscribing to WorkEvents. The identity confers no reservation or precondition for a later control action.
 
 #### Answering Questions And Permission Asks
 
@@ -209,6 +214,8 @@ The receipt reports whether the resolution was accepted:
 
 Fresh activation and deflected re-entry continue with the original inbound. Joining an active run emits `joined` and attaches the originating client session without advancing Arc work or delivering the inbound. Decline emits `rejected` with the Arc ref and diagnostic `"Arc activation declined by client."`; candidate runs remain unchanged. Connectors own presentation of requirements and diagnostics.
 
+Resolutions of the same handshake ID serialize at the host through validation and consumption, and at the hub through lifecycle delivery and branch bookkeeping. The first valid decision consumes it; later resolutions return `missing`, including expiry during validation. Invalid answers retain retryability. Different handshake IDs remain independent.
+
 Each handshake settles only its own activation branch; other outstanding branches and completed activations or joins are unaffected. The submission channel closes when no branch remains outstanding. A submission or lifecycle delivery failure fails the originating channel, after which resolving its handshakes returns `missing`.
 
 ### Execution Control API
@@ -265,7 +272,7 @@ Resumes a paused or parked run. Resume uses the exact continuation when this pro
 
 ### Work Events API
 
-Work events are durable records of run activity. Connectors use them to render activity without exposing backend transcripts or operator diagnostics, and each connector authorizes access for its own audience. The kinds cover run and routine lifecycle, parks, tool activity, question and permission waits, token usage, execution-control transitions, and node entry and exit. See [WorkEvent semantics](./observability.md#workevent).
+Work events are durable records of run activity. Connectors use them to render activity without exposing backend transcripts or operator diagnostics, and each connector authorizes access for its own audience. The kinds cover run and routine lifecycle, uncaught interruptions, parks, host-module calls and admitted outcomes, tool activity, question and permission waits, token usage, execution-control transitions, and node entry and exit. See [WorkEvent semantics](./observability.md#workevent).
 
 #### `registerWorkEventHandler(handler)`
 
@@ -273,7 +280,7 @@ Work events are durable records of run activity. Connectors use them to render a
 registerWorkEventHandler(handler: WorkEventHandler): () => void
 ```
 
-Notifies the handler after each work event is recorded and readable from history, and returns its unregister function. Delivery follows append order within each run. Each handler receives an isolated copy, and a handler failure is logged without failing publication. Handlers may read views and history or enqueue local work, and must return promptly.
+Notifies the handler after a retained work event is recorded and readable from history, and returns its unregister function. Each handler receives an isolated copy. Its retained deliveries follow append order within each run, independently of storage and other subscribers. Pending or failed callbacks cannot hold operational work; bounded queues may drop observations. Unregistering discards queued deliveries, while an already running callback may finish.
 
 #### `listWorkEvents(arcRunId)`
 
@@ -306,9 +313,9 @@ getRunView(arcRunId: ArcRunId): Promise<ArcRunView | undefined>
 - `triggering`: trigger evaluation is in progress. Includes any known Arc ref and workspace.
 - `handshaking`: activation awaits a handshake answer. Includes the Arc ref and handshake ID.
 - `preparing`: activation is being prepared. Includes the Arc ref and any resolved workspace.
-- `actioning`: execution has started, including completed, deflected, and poisoned runs. Includes the Arc ref, lifecycle, timestamps, workspace, and artifact count.
+- `actioning`: execution has started, including completed, deflected, and poisoned runs. Includes the Arc ref, lifecycle, `reactivationCount`, timestamps, workspace, and artifact count. Lifecycle and count come from the same persisted state snapshot.
 
-When `run:started` is published, the run's `actioning` view is readable. A preparation ID becomes unknown if preparation ends without starting execution under that ID.
+A preparation ID becomes unknown if preparation ends without starting execution under that ID. A failed authoritative read rejects; it does not become a missing view.
 
 #### `listRunViews(ownerPrincipal?)`
 
@@ -410,9 +417,9 @@ resolveHandshake(
 Validates the answer to a staged activation handshake and returns:
 
 - `ok` with the next step: a fresh activation's `action` step, a next-round `handshake` step, or a `rejected` step.
-- `joined` with the run ID of the selected active run, and no step.
-- `missing` when the handshake no longer exists.
-- `invalid` when the values failed validation.
+- `joined` with the run ID and captured `reactivationCount` of the selected active run, and no step.
+- `missing` when the handshake is unavailable.
+- `invalid` when the answer can be corrected while the handshake remains pending.
 
 #### `getRunWorkspaceContext(arcRunId)`
 
@@ -424,7 +431,9 @@ getRunWorkspaceContext(arcRunId: ArcRunId): Promise<{
 }>
 ```
 
-Returns the run's workspace path, resolved workspace bundle, and reactivation count. The count starts at zero and increases when a deflected run re-enters; trigger-stage calls report zero.
+Returns the workspace path, resolved workspace bundle, and reactivation count used to prepare work for a run. The count starts at zero and increases when a deflected run re-enters; trigger-stage calls report zero.
+
+The activating root's manifest supplies the bundle, including for imported tasks; an ambiguous trigger probe returns an empty bundle. Each result owns its bundle map. Live action and trigger lookups reuse cached immutable snapshot data without reading run state; other IDs use durable state to select their snapshot. Cache misses load the complete snapshot and validate every referenced manifest. See `arcHost.snapshotRuntimeCacheSize` in [configuration](./configuration.md) for retention limits.
 
 ### Replay API
 
@@ -467,7 +476,7 @@ Checks the candidate using the same rules as `verifyReplay`. A compatible result
 
 The new run continues from the candidate handoff with reused work already completed. For example, if the source completed A and then reached B, and the candidate replaces B with C, the new run keeps A completed and waits at C. Call `begin` to execute its pending work. A completed handoff needs no further work; a deflected handoff requires ordinary re-entry.
 
-The new run uses the candidate Arc version checked by this call and has its own replay history. It can be verified, jumped, or rewound again.
+The last entry of the successful result's `regenerated.checkpoints` is the installed handoff; its position supplies the successor's initial `reactivationCount`. The new run uses the candidate Arc version checked by this call and has its own replay history. It can be verified, jumped, or rewound again.
 
 #### `rewind(sourceArcRunId, atPosition)`
 

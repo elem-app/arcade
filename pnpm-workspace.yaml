@@ -1,7 +1,7 @@
 allowBuilds:
-  esbuild: true
+  '@elem-app/arc': true
   protobufjs: false
   '@google/genai': false
-  '@elem-app/arc': true
+  esbuild: true
   '@elem-app/arc@git+ssh://git@github.com/elem-app/arc.git': true
   '@elem-app/arc@git+https://github.com/elem-app/arc.git': true

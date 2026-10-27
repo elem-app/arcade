@@ -1,9 +1,5 @@
 import { startArcade, type Arcade, type StartArcadeOptions } from "./arcade.js";
 import type { AppConfig } from "./config.js";
-import { McpConnector } from "./connectors/mcp.js";
-import { deliveryRulesToPolicies } from "./connectors/mcp/delivery.js";
-import type { McpOutboundInboxStore } from "./connectors/mcp/types.js";
-import { WebAppConnector } from "./connectors/web-app.js";
 import type { ArcadeLogger } from "./logging.js";
 import type { Connector } from "./types/connector.js";
 
@@ -18,69 +14,10 @@ export type App = {
 /** Options for the internal opinionated executable composition. */
 export type AppOptions = Omit<StartArcadeOptions, "config"> & {
   config: AppConfig;
-  mcpInboxStore?: McpOutboundInboxStore;
   connectorFactory?: (arcade: Arcade) => readonly Connector[];
 };
 
-/** Construct the App-owned connectors without starting them. */
-export function createAppConnectors(
-  options: Pick<AppOptions, "config" | "mcpInboxStore" | "connectorFactory">,
-  arcade: Arcade,
-): Connector[] {
-  const connectors = [...(options.connectorFactory?.(arcade) ?? [])];
-  const { config } = options;
-  const policies = deliveryRulesToPolicies(config.deliveryRules, (arcRunId) =>
-    arcade.workerHub.getRunOwnerPrincipal(arcRunId),
-  );
-  if (policies.length > 0) {
-    arcade.logger.info("arcade.delivery.policies", {
-      ruleCount: config.deliveryRules.length,
-      policyCount: policies.length,
-    });
-  }
-  if (config.connectors.mcp) {
-    if (!options.mcpInboxStore) {
-      throw new Error(
-        "mcpInboxStore is required when the MCP connector is configured.",
-      );
-    }
-    connectors.push(
-      new McpConnector({
-        workerHub: arcade.workerHub,
-        discovery: arcade.discovery,
-        inboxStore: options.mcpInboxStore,
-        policies,
-        transport: {
-          host: config.connectors.mcp.host,
-          port: config.connectors.mcp.port,
-          path: config.connectors.mcp.path,
-        },
-        arcsDir: config.arcsDir,
-        requirePrincipal: config.connectors.mcp.requirePrincipal,
-        logger: arcade.logger,
-      }),
-    );
-  }
-  if (config.connectors.web) {
-    connectors.push(
-      new WebAppConnector({
-        workerHub: arcade.workerHub,
-        discovery: arcade.discovery,
-        arcHost: arcade.arcHost,
-        transport: {
-          host: config.connectors.web.host,
-          port: config.connectors.web.port,
-        },
-        staticDir: "dist/web",
-        arcsDir: config.arcsDir,
-        logger: arcade.logger,
-      }),
-    );
-  }
-  return connectors;
-}
-
-/** Start Arcade followed by the opinionated App connectors. */
+/** Start Arcade followed by the application-supplied connectors. */
 export async function startApp(options: AppOptions): Promise<App> {
   const arcade = await startArcade({
     ...options,
@@ -107,7 +44,7 @@ export async function startApp(options: AppOptions): Promise<App> {
       arcsDir: options.config.arcsDir,
       count,
     });
-    connectors = createAppConnectors(options, arcade);
+    connectors = [...(options.connectorFactory?.(arcade) ?? [])];
     for (const connector of connectors) {
       attemptedConnectors.push(connector);
       await connector.start();

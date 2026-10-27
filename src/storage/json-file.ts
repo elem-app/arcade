@@ -13,13 +13,6 @@ import { dirname, join } from "node:path";
 import type { ArcTraversalSet } from "@elem-app/arc/runtime";
 import type { Document } from "@elem-app/arc/types";
 
-import type {
-  CreateMcpOutboundInboxItemInput,
-  McpOutboundInboxItem,
-  McpOutboundInboxListFilter,
-  McpOutboundInboxStore,
-  McpOutboundInboxUpdate,
-} from "../connectors/mcp/types.js";
 import type { ArcDocumentSnapshotId, ArcRunId } from "../types/core.js";
 import type { ExecutionControlState } from "../types/execution-control.js";
 import {
@@ -34,6 +27,7 @@ import type {
 } from "../types/host.js";
 import type { RoutineState } from "../types/hub.js";
 import { canonicalizeJsonValue, type JsonValue } from "../types/json.js";
+import { parseArcManifest } from "../types/manifest.js";
 import type { HistoryEntry } from "../types/messaging.js";
 import type {
   ActionReplayPosition,
@@ -116,8 +110,11 @@ export class JsonFileArcHostStore implements ArcHostStore {
 
   /** Store one immutable parsed Arc document record. */
   async putArcDocumentRecord(record: ArcDocumentRecord): Promise<void> {
-    await writeJson(this.#documentRecordFile(record.id), record, () =>
-      this.#ensureDir(),
+    const manifest = parseArcManifest(record.manifest);
+    await writeJson(
+      this.#documentRecordFile(record.id),
+      { ...record, manifest },
+      () => this.#ensureDir(),
     );
   }
 
@@ -125,9 +122,13 @@ export class JsonFileArcHostStore implements ArcHostStore {
   async getArcDocumentRecord(
     id: ArcDocumentRecordId,
   ): Promise<ArcDocumentRecord | undefined> {
-    return readJson<ArcDocumentRecord>(this.#documentRecordFile(id), () =>
-      this.#ensureDir(),
+    const record = await readJson<ArcDocumentRecord>(
+      this.#documentRecordFile(id),
+      () => this.#ensureDir(),
     );
+    return record
+      ? { ...record, manifest: parseArcManifest(record.manifest) }
+      : undefined;
   }
 
   /** Store one lightweight document snapshot. */
@@ -785,125 +786,6 @@ export class JsonFileWorkEventStore implements WorkEventStore {
 
   async #runAppend<T>(arcRunId: ArcRunId, task: () => Promise<T>): Promise<T> {
     return this.#appendSerializer.run(arcRunKey(arcRunId), task);
-  }
-}
-
-/**
- * JSON-file outbound inbox store.
- *
- * Each outbound inbox item is stored as one JSON file named by its message id.
- */
-export class JsonFileMcpOutboundInboxStore implements McpOutboundInboxStore {
-  /** Store identifier for diagnostics. */
-  readonly id: string;
-  readonly #dir: string;
-  #initialized = false;
-  #nextMessageSeq = 0;
-  readonly #messageSerializer = new KeyedSerializer<string>();
-
-  /** Create a JSON-file outbound inbox store rooted at `dir`. */
-  constructor(opts: { id?: string; dir: string }) {
-    this.id = opts.id ?? "json-file-outbound-inbox";
-    this.#dir = opts.dir;
-  }
-
-  /** Create and persist one new outbound inbox item. */
-  async createMessage(
-    input: CreateMcpOutboundInboxItemInput,
-  ): Promise<McpOutboundInboxItem> {
-    this.#nextMessageSeq += 1;
-    const now = new Date().toISOString();
-    const item: McpOutboundInboxItem = {
-      id: `outbound:${Date.now()}:${this.#nextMessageSeq}`,
-      situation: input.situation,
-      audience: input.situation.audience,
-      arcRunId: input.arcRunId,
-      content: input.content,
-      metadata: structuredClone(input.metadata),
-      targetPrincipal: input.targetPrincipal,
-      status: input.status ?? "pending",
-      createdAt: now,
-      updatedAt: now,
-    };
-    await this.putMessage(item);
-    return structuredClone(item);
-  }
-
-  /** Insert or replace one outbound inbox item. */
-  async putMessage(item: McpOutboundInboxItem): Promise<void> {
-    await this.#messageSerializer.run(item.id, async () => {
-      await this.#writeMessage(item);
-    });
-  }
-
-  /** Load one outbound inbox item by id. */
-  async getMessage(id: string): Promise<McpOutboundInboxItem | undefined> {
-    return this.#readMessage(id);
-  }
-
-  /** Iterate outbound inbox items, optionally filtered by recipient or status. */
-  async *listMessages(
-    filter: McpOutboundInboxListFilter = {},
-  ): AsyncIterable<McpOutboundInboxItem> {
-    await this.#ensureDir();
-    const statuses = filter.statuses ? new Set(filter.statuses) : undefined;
-    const entries = await readdir(this.#dir).catch((error: unknown) => {
-      if (isNotFound(error)) return [];
-      throw error;
-    });
-    const ids = entries
-      .filter((entry) => entry.endsWith(".json"))
-      .map((entry) => decodeURIComponent(entry.slice(0, -".json".length)));
-    const loaded = await Promise.all(ids.map((id) => this.getMessage(id)));
-    for (const item of loaded) {
-      if (!item) continue;
-      if (
-        filter.targetPrincipal &&
-        item.targetPrincipal !== filter.targetPrincipal
-      ) {
-        continue;
-      }
-      if (statuses && !statuses.has(item.status)) continue;
-      yield item;
-    }
-  }
-
-  /** Mutate status or answer for one outbound inbox item. */
-  async updateMessage(
-    id: string,
-    update: McpOutboundInboxUpdate,
-  ): Promise<McpOutboundInboxItem> {
-    return this.#messageSerializer.run(id, async () => {
-      const item = await this.#readMessage(id);
-      if (!item) throw new Error(`Outbound inbox item not found: ${id}`);
-      const updated: McpOutboundInboxItem = {
-        ...item,
-        ...structuredClone(update),
-        updatedAt: new Date().toISOString(),
-      };
-      await this.#writeMessage(updated);
-      return structuredClone(updated);
-    });
-  }
-
-  async #readMessage(id: string): Promise<McpOutboundInboxItem | undefined> {
-    return readJson<McpOutboundInboxItem>(this.#fileFor(id), () =>
-      this.#ensureDir(),
-    );
-  }
-
-  async #writeMessage(item: McpOutboundInboxItem): Promise<void> {
-    await writeJson(this.#fileFor(item.id), item, () => this.#ensureDir());
-  }
-
-  async #ensureDir(): Promise<void> {
-    if (this.#initialized) return;
-    await mkdir(this.#dir, { recursive: true });
-    this.#initialized = true;
-  }
-
-  #fileFor(id: string): string {
-    return join(this.#dir, `${encodeURIComponent(id)}.json`);
   }
 }
 

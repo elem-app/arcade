@@ -84,6 +84,52 @@ describe("DiscoveryService.registerArcsFromDirectory", () => {
     }
   });
 
+  it("defaults omitted fields in authored Arc manifests", async () => {
+    for (const manifest of [{}, { workspace: {} }]) {
+      const dir = await makeArcsDir();
+      await writeArc(dir, "defaults", { manifest });
+      const { discovery, registerArcs } = makeDiscoveryWithStubHost();
+
+      await expect(discovery.registerArcsFromDirectory(dir)).resolves.toBe(1);
+      expect(registerArcs.mock.calls[0]![0][0].manifest).toEqual({
+        workspaceScope: "run",
+        bundle: {},
+        contextIsolation: "role",
+      });
+    }
+  });
+
+  it("rejects malformed Arc manifest fields before registration", async () => {
+    for (const manifest of [
+      null,
+      [],
+      "manifest",
+      { workspace: null },
+      { workspace: [] },
+      { workspace: "arc" },
+      { workspace: { scope: "invalid" } },
+      { workspace: { scope: null } },
+      { contextIsolation: null },
+      { contextIsolation: false },
+      { bundle: null },
+      { bundle: [] },
+      { bundle: "guide" },
+      { bundle: { guide: false } },
+      { bundle: { guide: "" } },
+      { bundle: { guide: "  " } },
+    ]) {
+      const dir = await makeArcsDir();
+      const arcDir = await writeArc(dir, "invalid");
+      await writeFile(join(arcDir, "arcade.json"), JSON.stringify(manifest));
+      const { discovery, registerArcs } = makeDiscoveryWithStubHost();
+
+      await expect(discovery.registerArcsFromDirectory(dir)).rejects.toThrow(
+        /Invalid arcade.json for invalid:/,
+      );
+      expect(registerArcs).not.toHaveBeenCalled();
+    }
+  });
+
   it("applies manifest policy and resolves bundle paths relative to the arc dir", async () => {
     const dir = await makeArcsDir();
     const arcDir = await writeArc(dir, "stock-research", {
@@ -148,7 +194,7 @@ describe("DiscoveryService.registerArcsFromDirectory", () => {
     const { discovery } = makeDiscoveryWithStubHost();
 
     await expect(discovery.registerArcsFromDirectory(dir)).rejects.toThrow(
-      'Invalid contextIsolation in arcade.json for bad-context-isolation: expected "role" or "node".',
+      /Invalid arcade.json for bad-context-isolation:.*contextIsolation/s,
     );
   });
 
@@ -196,7 +242,9 @@ describe("DiscoveryService.registerArcsFromDirectory", () => {
   it("keeps an existing run pinned to its snapshot across an upsert", async () => {
     const dir = await makeArcsDir();
     await writeArc(dir, "greet");
-    const arcHost = createTestArcHost({ store: new InMemoryArcHostStore() });
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+    });
     const discovery = new DiscoveryService({ arcHost });
     await discovery.registerArcsFromDirectory(dir);
 

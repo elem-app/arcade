@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmod, copyFile, cp, readdir, rm } from "node:fs/promises";
+import { chmod, copyFile, readdir, rm } from "node:fs/promises";
 
 import { build } from "esbuild";
 
@@ -14,9 +14,6 @@ for (const output of outputs) {
   }
 }
 
-await run(process.execPath, ["node_modules/vite/bin/vite.js", "build"], {
-  cwd: "web",
-});
 await run(process.execPath, [
   "node_modules/typescript/bin/tsc",
   "-p",
@@ -38,8 +35,6 @@ const external = [
   "@anthropic-ai/sdk/*",
   "@earendil-works/pi-agent-core",
   "@earendil-works/pi-agent-core/*",
-  "@modelcontextprotocol/sdk",
-  "@modelcontextprotocol/sdk/*",
   "@openai/agents",
   "@openai/agents/*",
   "@openai/agents-core",
@@ -80,8 +75,6 @@ await build({
 
 await chmod("dist/app.js", 0o755);
 await chmod("dist/eval-main.js", 0o755);
-
-await cp("web/dist", "dist/web", { recursive: true });
 
 // Ship the local-machine config template next to the binary so `app.ts`
 // has a concrete config file to load when ARCADE_CONFIG_FILE is not set.

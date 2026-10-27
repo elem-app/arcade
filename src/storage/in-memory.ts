@@ -1,13 +1,6 @@
 import type { ArcTraversalSet } from "@elem-app/arc/runtime";
 import type { Document } from "@elem-app/arc/types";
 
-import type {
-  CreateMcpOutboundInboxItemInput,
-  McpOutboundInboxItem,
-  McpOutboundInboxListFilter,
-  McpOutboundInboxStore,
-  McpOutboundInboxUpdate,
-} from "../connectors/mcp/types.js";
 import type { ArcDocumentSnapshotId, ArcRunId } from "../types/core.js";
 import type { ExecutionControlState } from "../types/execution-control.js";
 import {
@@ -22,6 +15,7 @@ import type {
 } from "../types/host.js";
 import type { RoutineState } from "../types/hub.js";
 import { canonicalizeJsonValue, type JsonValue } from "../types/json.js";
+import { parseArcManifest } from "../types/manifest.js";
 import type { HistoryEntry } from "../types/messaging.js";
 import type {
   ActionReplayPosition,
@@ -88,7 +82,11 @@ export class InMemoryArcHostStore implements ArcHostStore {
 
   /** Store one immutable parsed Arc document record. */
   async putArcDocumentRecord(record: ArcDocumentRecord): Promise<void> {
-    this.#documentRecords.set(record.id, structuredClone(record));
+    const manifest = parseArcManifest(record.manifest);
+    this.#documentRecords.set(
+      record.id,
+      structuredClone({ ...record, manifest }),
+    );
   }
 
   /** Load one immutable parsed Arc document record. */
@@ -449,89 +447,5 @@ export class InMemoryWorkEventStore implements WorkEventStore {
     for (const event of this.#events.get(arcRunId) ?? []) {
       yield structuredClone(event);
     }
-  }
-}
-
-/**
- * In-memory outbound inbox store for tests and demos.
- *
- * Inbox data does not survive process restart. Values are cloned on read and
- * write so callers cannot mutate stored records accidentally.
- */
-export class InMemoryMcpOutboundInboxStore implements McpOutboundInboxStore {
-  /** Store identifier for diagnostics. */
-  readonly id: string;
-  readonly #messages = new Map<string, McpOutboundInboxItem>();
-  #nextMessageSeq = 0;
-
-  /** Create an in-memory outbound inbox store. */
-  constructor(opts: { id?: string } = {}) {
-    this.id = opts.id ?? "in-memory-outbound-inbox";
-  }
-
-  /** Create and persist one new outbound inbox item. */
-  async createMessage(
-    input: CreateMcpOutboundInboxItemInput,
-  ): Promise<McpOutboundInboxItem> {
-    this.#nextMessageSeq += 1;
-    const now = new Date().toISOString();
-    const item: McpOutboundInboxItem = {
-      id: `outbound:${Date.now()}:${this.#nextMessageSeq}`,
-      situation: input.situation,
-      audience: input.situation.audience,
-      arcRunId: input.arcRunId,
-      content: input.content,
-      metadata: structuredClone(input.metadata),
-      targetPrincipal: input.targetPrincipal,
-      status: input.status ?? "pending",
-      createdAt: now,
-      updatedAt: now,
-    };
-    await this.putMessage(item);
-    return structuredClone(item);
-  }
-
-  /** Insert or replace one outbound inbox item. */
-  async putMessage(item: McpOutboundInboxItem): Promise<void> {
-    this.#messages.set(item.id, structuredClone(item));
-  }
-
-  /** Load one outbound inbox item by id. */
-  async getMessage(id: string): Promise<McpOutboundInboxItem | undefined> {
-    const item = this.#messages.get(id);
-    return item ? structuredClone(item) : undefined;
-  }
-
-  /** Iterate outbound inbox items, optionally filtered by recipient or status. */
-  async *listMessages(
-    filter: McpOutboundInboxListFilter = {},
-  ): AsyncIterable<McpOutboundInboxItem> {
-    const statuses = filter.statuses ? new Set(filter.statuses) : undefined;
-    for (const item of this.#messages.values()) {
-      if (
-        filter.targetPrincipal &&
-        item.targetPrincipal !== filter.targetPrincipal
-      ) {
-        continue;
-      }
-      if (statuses && !statuses.has(item.status)) continue;
-      yield structuredClone(item);
-    }
-  }
-
-  /** Mutate status or answer for one outbound inbox item. */
-  async updateMessage(
-    id: string,
-    update: McpOutboundInboxUpdate,
-  ): Promise<McpOutboundInboxItem> {
-    const item = this.#messages.get(id);
-    if (!item) throw new Error(`Outbound inbox item not found: ${id}`);
-    const updated: McpOutboundInboxItem = {
-      ...structuredClone(item),
-      ...structuredClone(update),
-      updatedAt: new Date().toISOString(),
-    };
-    this.#messages.set(id, updated);
-    return structuredClone(updated);
   }
 }

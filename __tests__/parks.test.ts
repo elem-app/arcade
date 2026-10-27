@@ -32,7 +32,7 @@ import {
 describe("Recoverable parks and execution control", () => {
   it("parks and resumes a claude-sdk api-rate-limit instruction", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("watch", parse(WATCH_SOURCE));
     const advanceInputs = recordAdvanceInputs(arcHost);
     let calls = 0;
@@ -114,7 +114,7 @@ describe("Recoverable parks and execution control", () => {
 
   it("parks and resumes an openai-sdk token-usage-limit instruction", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("watch", parse(WATCH_SOURCE));
     const advanceInputs = recordAdvanceInputs(arcHost);
     const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
@@ -167,7 +167,7 @@ describe("Recoverable parks and execution control", () => {
 
   it("blocks a fast-trigger capacity limit failure rather than producing a failed trigger", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "ready",
       parse(`
@@ -245,7 +245,7 @@ function Ready() {
     // hub-level trigger→advanceTrigger→dispatch path the arc host round-trip unit
     // test cannot reach.
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
       "ready",
       parse(`
@@ -302,7 +302,7 @@ function Ready() {
       // The scheduled backoff re-runs the trigger, which settles and fans out —
       // advancing through advanceTrigger (its stage).
       const store = new InMemoryArcHostStore();
-      const arcHost = createTestArcHost({ store });
+      const arcHost = await createTestArcHost({ store });
       await arcHost.registerArc(
         "ready",
         parse(`
@@ -402,7 +402,7 @@ function Ready() {
     "exec.control-inactive cancels automatic retry for %s with a captured park",
     async (lifecycle) => {
       const store = new InMemoryArcHostStore();
-      const arcHost = createTestArcHost({ store });
+      const arcHost = await createTestArcHost({ store });
       await arcHost.registerArc("watch", parse(WATCH_SOURCE));
       const query = vi.fn(() =>
         claudeThrowingQuery(
@@ -659,7 +659,7 @@ function Ready() {
 
   it("parks and resumes a claude-sdk transport loss", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = createTestArcHost({ store });
+    const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc("watch", parse(WATCH_SOURCE));
     const advanceInputs = recordAdvanceInputs(arcHost);
     let calls = 0;

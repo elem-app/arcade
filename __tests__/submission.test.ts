@@ -21,6 +21,7 @@ import {
   BOB_OWNER,
   collectAsync,
   createCapturingLogger,
+  deferred,
   firstActivation,
   GREET_SOURCE,
   makeArcHost,
@@ -69,8 +70,81 @@ async function stageActiveRunChoice(workerHub: WorkerHubService): Promise<{
 }
 
 describe("Inbound submission and messaging", () => {
+  it.each(["join", "workspace", "decline"] as const)(
+    "preserves the winning submission under concurrent %s handshake resolutions",
+    async (kind) => {
+      const arcHost = await makeArcHost();
+      await arcHost.registerArc(
+        "serialized-submission",
+        parse(WATCH_SOURCE),
+        kind === "join"
+          ? undefined
+          : { workspaceScope: "arc", bundle: {}, contextIsolation: "role" },
+      );
+      const release = deferred();
+      const { workerHub } = makeWorkerHub({
+        arcHost,
+        workers: {
+          researcher: async () => {
+            await release.promise;
+            return { outcome: "completed" };
+          },
+        },
+      });
+      try {
+        const staged =
+          kind === "join" ? await stageActiveRunChoice(workerHub) : undefined;
+        const iterator =
+          staged?.channel[Symbol.asyncIterator]() ??
+          workerHub
+            .submitInbound({
+              content: "start",
+              metadata: { principal: ALICE_OWNER },
+            })
+            [Symbol.asyncIterator]();
+        const gate = staged ?? (await iterator.next()).value;
+        if (!gate || !("handshakeId" in gate))
+          throw new Error("Expected handshake");
+        const values =
+          kind === "join"
+            ? {
+                runChoice: {
+                  action: "join" as const,
+                  arcRunId: staged!.arcRunId,
+                },
+              }
+            : kind === "workspace"
+              ? { workspace: "/tmp/serialized-submission" }
+              : { decline: true as const };
+        await expect(
+          Promise.all([
+            workerHub.handshake(gate.handshakeId, values),
+            workerHub.handshake(gate.handshakeId, values),
+          ]),
+        ).resolves.toEqual([{ status: "ok" }, { status: "missing" }]);
+        expect((await iterator.next()).value).toMatchObject({
+          kind:
+            kind === "join"
+              ? "joined"
+              : kind === "workspace"
+                ? "activated"
+                : "rejected",
+          ...(kind === "decline" ? {} : { reactivationCount: 0 }),
+        });
+        await expect(iterator.next()).resolves.toEqual({
+          done: true,
+          value: undefined,
+        });
+      } finally {
+        release.resolve();
+        await workerHub.stop();
+        await arcHost.stop();
+      }
+    },
+  );
+
   it("accepts decline on the original submission and closes its only pending branch once", async () => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc("decline-only", parse(GREET_SOURCE), {
       workspaceScope: "arc",
       bundle: {},
@@ -126,7 +200,7 @@ describe("Inbound submission and messaging", () => {
   });
 
   it("settles a declined branch while activated work and a pending sibling continue", async () => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     const source = `"arc"; function Main() { this.hostParams = { workerRole: "researcher" }; this.trigger = () => true; $instruct("Work"); }`;
     for (const name of ["running", "declined", "pending"]) {
       await arcHost.registerArc(name, parse(source), {
@@ -214,6 +288,280 @@ describe("Inbound submission and messaging", () => {
     } finally {
       release();
       await workerHub.stop();
+    }
+  });
+
+  it("activates each workspace-gated fan-out branch once and closes the submission after the last resolution", async () => {
+    const arcHost = await makeArcHost();
+    for (const source of ["first", "second"]) {
+      await arcHost.registerArc(source, parse(WATCH_SOURCE), {
+        workspaceScope: "arc",
+        bundle: {},
+        contextIsolation: "role",
+      });
+    }
+    const release = deferred();
+    const worker = vi.fn<RoleWorker>(async () => {
+      await release.promise;
+      return { outcome: "completed" };
+    });
+    const { workerHub, historyStore } = makeWorkerHub({
+      arcHost,
+      workers: { researcher: worker },
+    });
+
+    try {
+      const iterator = workerHub
+        .submitInbound({
+          content: "start both workspace branches",
+          metadata: { principal: ALICE_OWNER, activationPolicy: "all" },
+        })
+        [Symbol.asyncIterator]();
+      const gates = [
+        (await iterator.next()).value,
+        (await iterator.next()).value,
+      ];
+      for (const gate of gates) {
+        expect(gate).toMatchObject({
+          kind: "handshake-required",
+          requirement: { kind: "workspace" },
+        });
+      }
+      expect(worker).not.toHaveBeenCalled();
+      const runIds = new Set<string>();
+      for (const [index, gate] of gates.entries()) {
+        if (gate?.kind !== "handshake-required")
+          throw new Error("Expected workspace handshake");
+        const workspace = `/tmp/arcade-fanout-workspace-${index}`;
+        await expect(
+          workerHub.handshake(gate.handshakeId, { workspace }),
+        ).resolves.toEqual({ status: "ok" });
+        const next = await iterator.next();
+        if (next.done || next.value.kind !== "activated")
+          throw new Error("Expected branch activation");
+        const { arcRunId } = next.value;
+        runIds.add(arcRunId);
+        expect(await arcHost.getRunView(arcRunId)).toMatchObject({
+          arcRef: gate.arcRef,
+          ownerPrincipal: ALICE_OWNER,
+          workspacePath: workspace,
+        });
+        expect(await historyStore.listEntries(arcRunId)).toEqual([
+          expect.objectContaining({ content: "start both workspace branches" }),
+        ]);
+        await expect(
+          workerHub.handshake(gate.handshakeId, { workspace }),
+        ).resolves.toEqual({ status: "missing" });
+        await waitFor(() => worker.mock.calls.length === index + 1);
+        if (index === 0) {
+          const pending = gates[1];
+          if (pending?.kind !== "handshake-required")
+            throw new Error("Expected pending sibling");
+          expect(await arcHost.getRunView(pending.arcRunId)).toMatchObject({
+            stage: "handshaking",
+          });
+        }
+      }
+      expect(runIds.size).toBe(2);
+      await expect(iterator.next()).resolves.toEqual({
+        done: true,
+        value: undefined,
+      });
+      expect(worker).toHaveBeenCalledTimes(2);
+    } finally {
+      release.resolve();
+      await workerHub.stop();
+      await arcHost.stop();
+    }
+  });
+
+  it.each(["committed", "failed"] as const)(
+    "retains sibling handshake outcomes through a %s activation history write",
+    async (outcome) => {
+      const arcHost = await makeArcHost();
+      for (const source of ["first", "second"]) {
+        await arcHost.registerArc(source, parse(WATCH_SOURCE), {
+          workspaceScope: "arc",
+          bundle: {},
+          contextIsolation: "role",
+        });
+      }
+      const historyStore = new InMemoryHistoryStore();
+      const historyEntered = deferred();
+      const releaseHistory = deferred();
+      const cleanupEntered = deferred();
+      const releaseCleanup = deferred();
+      const releaseWorkers = deferred();
+      const failure = new Error("Activation history unavailable.");
+      let firstRunId: string | undefined;
+      const append = historyStore.appendEntry.bind(historyStore);
+      vi.spyOn(historyStore, "appendEntry").mockImplementationOnce(
+        async (arcRunId, entry) => {
+          firstRunId = arcRunId;
+          historyEntered.resolve();
+          await releaseHistory.promise;
+          if (outcome === "failed") throw failure;
+          return append(arcRunId, entry);
+        },
+      );
+      const releaseAction = arcHost.releaseAction.bind(arcHost);
+      vi.spyOn(arcHost, "releaseAction").mockImplementation(async (...args) => {
+        if (outcome === "failed" && args[0] === firstRunId) {
+          cleanupEntered.resolve();
+          await releaseCleanup.promise;
+        }
+        return releaseAction(...args);
+      });
+      const worker = vi.fn<RoleWorker>(async () => {
+        await releaseWorkers.promise;
+        return { outcome: "completed" };
+      });
+      const { workerHub } = makeWorkerHub({
+        arcHost,
+        historyStore,
+        workers: { researcher: worker },
+      });
+      let first: Promise<unknown> | undefined;
+      try {
+        const iterator = workerHub
+          .submitInbound({
+            content: "resolve both branches",
+            metadata: { principal: ALICE_OWNER, activationPolicy: "all" },
+          })
+          [Symbol.asyncIterator]();
+        const firstGate = (await iterator.next()).value;
+        const secondGate = (await iterator.next()).value;
+        if (
+          firstGate?.kind !== "handshake-required" ||
+          secondGate?.kind !== "handshake-required"
+        )
+          throw new Error("Expected sibling workspace handshakes");
+        first = workerHub
+          .handshake(firstGate.handshakeId, {
+            workspace: "/tmp/arcade-sibling-first",
+          })
+          .then(
+            (value) => ({ value }),
+            (error: unknown) => ({ error }),
+          );
+        await historyEntered.promise;
+        await expect(
+          workerHub.handshake(secondGate.handshakeId, {
+            workspace: "/tmp/arcade-sibling-second",
+          }),
+        ).resolves.toEqual({ status: "ok" });
+        const second = (await iterator.next()).value;
+        if (second?.kind !== "activated")
+          throw new Error("Expected independent sibling activation");
+        expect(second.arcRunId).not.toBe(firstRunId);
+        const remaining = iterator.next().then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
+        );
+        releaseHistory.resolve();
+        if (outcome === "failed") {
+          await cleanupEntered.promise;
+          // The authoritative error is visible while host cleanup is held.
+          await expect(remaining).resolves.toEqual({ error: failure });
+          releaseCleanup.resolve();
+          await expect(first).resolves.toEqual({ error: failure });
+          await expect(iterator.next()).rejects.toBe(failure);
+        } else {
+          await expect(first).resolves.toEqual({ value: { status: "ok" } });
+          await expect(remaining).resolves.toEqual({
+            value: {
+              done: false,
+              value: {
+                kind: "activated",
+                arcRunId: firstRunId,
+                reactivationCount: 0,
+              },
+            },
+          });
+          await expect(iterator.next()).resolves.toEqual({
+            done: true,
+            value: undefined,
+          });
+        }
+        await waitFor(
+          () => worker.mock.calls.length === (outcome === "failed" ? 1 : 2),
+        );
+        expect(await arcHost.getRunView(second.arcRunId)).toMatchObject({
+          stage: "actioning",
+          lifecycle: "active",
+        });
+      } finally {
+        releaseHistory.resolve();
+        releaseCleanup.resolve();
+        releaseWorkers.resolve();
+        await first;
+        await workerHub.stop();
+        await arcHost.stop();
+      }
+    },
+  );
+
+  it("retains initial fan-out activation while an earlier handshake settles", async () => {
+    const arcHost = await makeArcHost();
+    await arcHost.registerArc("first", parse(WATCH_SOURCE), {
+      workspaceScope: "arc",
+      bundle: {},
+      contextIsolation: "role",
+    });
+    await arcHost.registerArc("second", parse(WATCH_SOURCE));
+    const historyStore = new InMemoryHistoryStore();
+    const historyEntered = deferred();
+    const releaseHistory = deferred();
+    const append = historyStore.appendEntry.bind(historyStore);
+    vi.spyOn(historyStore, "appendEntry").mockImplementationOnce(
+      async (...args) => {
+        historyEntered.resolve();
+        await releaseHistory.promise;
+        return append(...args);
+      },
+    );
+    const worker = vi.fn<RoleWorker>(async () => ({ outcome: "completed" }));
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      historyStore,
+      workers: { researcher: worker },
+    });
+    try {
+      const iterator = workerHub
+        .submitInbound({
+          content: "start both branches",
+          metadata: { principal: ALICE_OWNER, activationPolicy: "all" },
+        })
+        [Symbol.asyncIterator]();
+      const gate = (await iterator.next()).value;
+      if (gate?.kind !== "handshake-required")
+        throw new Error("Expected the first branch's workspace handshake");
+      await historyEntered.promise;
+      await expect(
+        workerHub.handshake(gate.handshakeId, { decline: true }),
+      ).resolves.toEqual({ status: "ok" });
+      expect((await iterator.next()).value).toMatchObject({
+        kind: "rejected",
+        arcRef: gate.arcRef,
+      });
+      releaseHistory.resolve();
+      const activated = (await iterator.next()).value;
+      if (activated?.kind !== "activated")
+        throw new Error("Expected the initial fork's remaining activation");
+      expect(activated.reactivationCount).toBe(0);
+      await expect(iterator.next()).resolves.toEqual({
+        done: true,
+        value: undefined,
+      });
+      await waitFor(async () => {
+        const view = await arcHost.getRunView(activated.arcRunId);
+        return view?.stage === "actioning" && view.lifecycle === "completed";
+      });
+      expect(worker).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseHistory.resolve();
+      await workerHub.stop();
+      await arcHost.stop();
     }
   });
 
@@ -590,7 +938,7 @@ function Main() {
   it("records inbound history, advances Arc work, and dispatches instructions", async () => {
     const store = new InMemoryArcHostStore();
     const { logger, records } = createCapturingLogger("info");
-    const arcHost = createTestArcHost({ store, logger });
+    const arcHost = await createTestArcHost({ store, logger });
     await arcHost.registerArc("greet", parse(GREET_SOURCE));
     const historyStore = new InMemoryHistoryStore();
     const calls: string[] = [];
@@ -1113,12 +1461,13 @@ function Main() {
     ).resolves.toEqual({ status: "ok" });
     await expect(reader.next()).resolves.toEqual({
       kind: "activated",
+      reactivationCount: 1,
       arcRunId: firstRunId,
     });
   });
 
   it("converts missing and invalid handshakes to connector receipts", async () => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc("stock-research", parse(GREET_SOURCE), {
       workspaceScope: "arc",
       bundle: {},
@@ -1159,7 +1508,7 @@ function Main() {
   });
 
   it("releases a pending hold when its correlated handshake expires", async () => {
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       handshakes: new HandshakeStore({ ttlMs: 0 }),
     });
@@ -1200,7 +1549,7 @@ function Main() {
   });
 
   it("returns a workspace handshake after semantic trigger resolution selects a scoped arc", async () => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc(
       "scratchpad",
       parse(`
@@ -1288,7 +1637,7 @@ function Stock() {
   });
 
   it("does not offer the pending semantic activation as a run-choice candidate", async () => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc(
       "semantic-eval",
       parse(`
@@ -1449,7 +1798,7 @@ function Main() {
   it("records the inbound history entry and emits no outbound when no handler emits", async () => {
     const store = new InMemoryArcHostStore();
     const { logger, records } = createCapturingLogger("info");
-    const arcHost = createTestArcHost({ store, logger });
+    const arcHost = await createTestArcHost({ store, logger });
     await arcHost.registerArc("greet", parse(GREET_SOURCE));
     const historyStore = new InMemoryHistoryStore();
     const emitted: OutboundMessage[] = [];
@@ -1491,5 +1840,335 @@ function Main() {
         .filter((record) => record.arcRunId === arcRunId)
         .map((record) => record.event),
     ).toEqual(["arc_host.run.begun", "arc_host.run.committed"]);
+  });
+});
+
+describe("source deletion during admission", () => {
+  const source = parse(
+    '"arc"; function Main() { this.trigger = () => true; $instruct("Work"); }',
+  );
+  const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+
+  it.each(["workspace", "arc-choice", "run-choice"] as const)(
+    "retires a deleted %s fresh selection without reviving it on re-registration",
+    async (kind) => {
+      const host = await makeArcHost();
+      await host.registerArc("removed", source, {
+        workspaceScope: kind === "workspace" ? "arc" : "run",
+        contextIsolation: "role",
+        bundle: {},
+      });
+      if (kind === "run-choice")
+        await host.begin({
+          dialog,
+          inbound: { content: "start" },
+          principal: ALICE_OWNER,
+          projectDialog: async () => dialog,
+        });
+      if (kind === "arc-choice") await host.registerArc("sibling", source);
+      const { workerHub } = makeWorkerHub({ arcHost: host });
+      try {
+        const iterator = workerHub
+          .submitInbound({
+            content: "start",
+            metadata: {
+              principal: ALICE_OWNER,
+              activationPolicy: kind === "arc-choice" ? "choose" : "first",
+            },
+          })
+          [Symbol.asyncIterator]();
+        const first = await iterator.next();
+        if (first.done || first.value.kind !== "handshake-required")
+          throw new Error("Expected handshake");
+        const gate = first.value;
+        let sibling:
+          | Extract<InboundLifecycleEvent, { kind: "handshake-required" }>
+          | undefined;
+        if (kind === "arc-choice") {
+          const next = await iterator.next();
+          if (next.done || next.value.kind !== "handshake-required")
+            throw new Error("Expected sibling handshake");
+          sibling = next.value;
+        }
+        await host.registerArcs([{ source: "removed", delete: true }]);
+        await host.registerArc("removed", source);
+        const answer =
+          kind === "workspace"
+            ? { workspace: "/tmp/deleted-workspace" }
+            : kind === "run-choice"
+              ? { runChoice: { action: "fresh" as const } }
+              : { arcChoice: { activate: true } };
+        await expect(
+          workerHub.handshake(gate.handshakeId, answer),
+        ).resolves.toEqual({ status: "missing" });
+        await expect(
+          workerHub.handshake(gate.handshakeId, answer),
+        ).resolves.toEqual({ status: "missing" });
+        if (sibling) {
+          await expect(
+            workerHub.handshake(sibling.handshakeId, { decline: true }),
+          ).resolves.toEqual({ status: "ok" });
+          expect((await iterator.next()).value).toMatchObject({
+            kind: "rejected",
+            arcRef: sibling.arcRef,
+          });
+        }
+        expect((await iterator.next()).done).toBe(true);
+        expect(
+          (await host.listRunViews()).filter(
+            (view) => view.stage !== "actioning",
+          ),
+        ).toEqual([]);
+      } finally {
+        await workerHub.stop();
+      }
+    },
+  );
+
+  it("keeps an existing-run join usable when deletion invalidates a sibling fresh choice", async () => {
+    const host = await makeArcHost();
+    await host.registerArc("removed", source);
+    const [started] = await host.begin({
+      dialog,
+      inbound: { content: "start" },
+      principal: ALICE_OWNER,
+      projectDialog: async () => dialog,
+    });
+    if (started?.kind !== "action") throw new Error("Expected action");
+    const { workerHub } = makeWorkerHub({ arcHost: host });
+    try {
+      const first = lifecycleReader(
+        workerHub.submitInbound({
+          content: "fresh",
+          metadata: { principal: ALICE_OWNER },
+        }),
+      );
+      const second = lifecycleReader(
+        workerHub.submitInbound({
+          content: "join",
+          metadata: { principal: ALICE_OWNER },
+        }),
+      );
+      const fresh = await first.next();
+      const join = await second.next();
+      if (
+        fresh.kind !== "handshake-required" ||
+        join.kind !== "handshake-required"
+      )
+        throw new Error("Expected run choices");
+      await host.registerArcs([{ source: "removed", delete: true }]);
+      await expect(
+        workerHub.handshake(fresh.handshakeId, {
+          runChoice: { action: "fresh" },
+        }),
+      ).resolves.toEqual({ status: "missing" });
+      await expect(
+        workerHub.handshake(join.handshakeId, {
+          runChoice: { action: "join", arcRunId: started.arcRunId },
+        }),
+      ).resolves.toEqual({ status: "ok" });
+      expect(await second.next()).toEqual({
+        kind: "joined",
+        reactivationCount: 0,
+        arcRef: "arc:removed:Main",
+        arcRunId: started.arcRunId,
+      });
+      expect(await host.getRunView(started.arcRunId)).toMatchObject({
+        stage: "actioning",
+        lifecycle: "active",
+      });
+    } finally {
+      await workerHub.stop();
+    }
+  });
+
+  it("settles deletion during consumed handshake resolution as missing", async () => {
+    const hostStore = new InMemoryArcHostStore();
+    const host = await createTestArcHost({ store: hostStore });
+    await host.registerArc("removed", source, {
+      workspaceScope: "arc",
+      contextIsolation: "role",
+      bundle: {},
+    });
+    const { workerHub } = makeWorkerHub({ arcHost: host });
+    const consumed = deferred();
+    const release = deferred();
+    const runStore = hostStore;
+    const getState = runStore.getState.bind(runStore);
+    let holdActivation = false;
+    vi.spyOn(runStore, "getState").mockImplementation(async (key) => {
+      if (holdActivation) {
+        holdActivation = false;
+        consumed.resolve();
+        await release.promise;
+      }
+      return getState(key);
+    });
+    try {
+      const iterator = workerHub
+        .submitInbound({
+          content: "start",
+          metadata: { principal: ALICE_OWNER },
+        })
+        [Symbol.asyncIterator]();
+      const first = await iterator.next();
+      if (first.done || first.value.kind !== "handshake-required")
+        throw new Error("Expected handshake");
+      holdActivation = true;
+      const resolving = workerHub.handshake(first.value.handshakeId, {
+        workspace: "/tmp/removed-during-resolve",
+      });
+      await consumed.promise;
+      await host.registerArcs([{ source: "removed", delete: true }]);
+      release.resolve();
+      await expect(resolving).resolves.toEqual({ status: "missing" });
+      expect((await iterator.next()).done).toBe(true);
+      expect(await host.listRunViews()).toEqual([]);
+    } finally {
+      release.resolve();
+      await workerHub.stop();
+    }
+  });
+
+  it.each(["workspace", "run-choice"] as const)(
+    "settles source deletion after staging a follow-up %s handshake",
+    async (kind) => {
+      const handshakes = new HandshakeStore();
+      const host = await createTestArcHost({
+        store: new InMemoryArcHostStore(),
+        handshakes,
+      });
+      await host.registerArc("removed", source, {
+        workspaceScope: kind === "workspace" ? "arc" : "run",
+        contextIsolation: "role",
+        bundle: {},
+      });
+      const existing =
+        kind === "run-choice"
+          ? (
+              await host.begin({
+                dialog,
+                principal: ALICE_OWNER,
+                inbound: { content: "start" },
+                projectDialog: async () => dialog,
+              })
+            )[0]
+          : undefined;
+      await host.registerArc("sibling", source);
+      const { workerHub } = makeWorkerHub({ arcHost: host });
+      try {
+        const iterator = workerHub
+          .submitInbound({
+            content: "choose",
+            metadata: { principal: ALICE_OWNER, activationPolicy: "choose" },
+          })
+          [Symbol.asyncIterator]();
+        const first = await iterator.next();
+        const second = await iterator.next();
+        if (
+          first.done ||
+          first.value.kind !== "handshake-required" ||
+          second.done ||
+          second.value.kind !== "handshake-required"
+        )
+          throw new Error("Expected arc choices");
+        await expect(
+          workerHub.handshake(first.value.handshakeId, {
+            arcChoice: { activate: true },
+          }),
+        ).resolves.toEqual({ status: "ok" });
+        const followup = await iterator.next();
+        if (followup.done || followup.value.kind !== "handshake-required")
+          throw new Error("Expected follow-up handshake");
+        await host.registerArcs([{ source: "removed", delete: true }]);
+        if (kind === "run-choice") {
+          if (existing?.kind !== "action")
+            throw new Error("Expected existing run");
+          await expect(
+            workerHub.handshake(followup.value.handshakeId, {
+              runChoice: { action: "join", arcRunId: existing.arcRunId },
+            }),
+          ).resolves.toEqual({ status: "ok" });
+          expect((await iterator.next()).value).toMatchObject({
+            kind: "joined",
+            arcRunId: existing.arcRunId,
+          });
+        } else {
+          await expect(
+            workerHub.handshake(followup.value.handshakeId, {
+              workspace: "/tmp/removed-followup-workspace",
+            }),
+          ).resolves.toEqual({ status: "missing" });
+        }
+        await workerHub.handshake(second.value.handshakeId, { decline: true });
+        expect((await iterator.next()).value).toMatchObject({
+          kind: "rejected",
+          arcRef: second.value.arcRef,
+        });
+        expect((await iterator.next()).done).toBe(true);
+        expect(handshakes.listPending()).toEqual([]);
+      } finally {
+        await workerHub.stop();
+      }
+    },
+  );
+
+  it("orders source deletion after an in-flight first durable run commit", async () => {
+    const store = new InMemoryArcHostStore();
+    const host = await createTestArcHost({ store });
+    await host.registerArc("removed", source, {
+      workspaceScope: "arc",
+      contextIsolation: "role",
+      bundle: {},
+    });
+    const { workerHub } = makeWorkerHub({ arcHost: host });
+    const entered = deferred();
+    const release = deferred();
+    const put = store.putState.bind(store);
+    vi.spyOn(store, "putState").mockImplementationOnce(async (key, state) => {
+      entered.resolve();
+      await release.promise;
+      return put(key, state);
+    });
+    try {
+      const iterator = workerHub
+        .submitInbound({
+          content: "start",
+          metadata: { principal: ALICE_OWNER },
+        })
+        [Symbol.asyncIterator]();
+      const first = await iterator.next();
+      if (first.done || first.value.kind !== "handshake-required")
+        throw new Error("Expected workspace handshake");
+      const resolving = workerHub.handshake(first.value.handshakeId, {
+        workspace: "/tmp/committed-before-deletion",
+      });
+      await entered.promise;
+      let deleted = false;
+      const deleting = host
+        .registerArcs([{ source: "removed", delete: true }])
+        .then(() => {
+          deleted = true;
+        });
+      await Promise.resolve();
+      expect(deleted).toBe(false);
+      release.resolve();
+      await expect(resolving).resolves.toEqual({ status: "ok" });
+      await deleting;
+      const activated = await iterator.next();
+      if (activated.done || activated.value.kind !== "activated")
+        throw new Error("Expected committed run");
+      expect(await host.getRunView(activated.value.arcRunId)).toMatchObject({
+        stage: "actioning",
+        lifecycle: "active",
+      });
+      expect(
+        (await host.getRunWorkspaceContext(activated.value.arcRunId))
+          .workspacePath,
+      ).toBe("/tmp/committed-before-deletion");
+    } finally {
+      release.resolve();
+      await workerHub.stop();
+    }
   });
 });

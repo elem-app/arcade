@@ -7,11 +7,13 @@ import {
 } from "./work-event-fixtures.js";
 
 import { parse } from "@elem-app/arc/parser";
+import { toNodeRef } from "@elem-app/arc/runtime";
 import { describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_WORKER_ROLE,
   InMemoryArcHostStore,
+  JsonFileArcHostStore,
   taskId,
   taskSourceRef,
   workerContextKey,
@@ -29,6 +31,7 @@ import {
   type RunFrontier,
   type Task,
 } from "../src/testing.js";
+import { observeSnapshotReads } from "./arc-host-helpers.js";
 import { callOpenAiTool } from "./backend-helpers.js";
 import { makeControlledTime } from "./controlled-time.js";
 import {
@@ -53,6 +56,110 @@ import {
 } from "./worker-hub-helpers.js";
 
 describe("Worker hub dispatch and worker-slot routing", () => {
+  it.each(["action", "fresh trigger"] as const)(
+    "measures snapshot reads across repeated %s dispatch",
+    async (stage) => {
+      const store = new InMemoryArcHostStore();
+      const arcHost = await createTestArcHost({ store });
+      await arcHost.registerArc(
+        "read-counts",
+        parse(`"arc";
+function Main() {
+  this.description = "Pinned label";
+  this.trigger = () => ${stage === "action" ? "true" : 'judge("First?") && judge("Second?")'};
+  $instruct("First work");
+  $instruct("Second work");
+}`),
+      );
+      const reads = observeSnapshotReads(store);
+      const windows: ReturnType<typeof reads.counts>[] = [];
+      const workspace = arcHost.getRunWorkspaceContext.bind(arcHost);
+      vi.spyOn(arcHost, "getRunWorkspaceContext").mockImplementation(
+        async (id) => {
+          const before = reads.counts();
+          const value = await workspace(id);
+          const after = reads.counts();
+          windows.push({
+            state: after.state - before.state,
+            snapshot: after.snapshot - before.snapshot,
+            record: after.record - before.record,
+          });
+          return value;
+        },
+      );
+      const node = arcHost.nodeInfoForRef.bind(arcHost);
+      vi.spyOn(arcHost, "nodeInfoForRef").mockImplementation(
+        async (ref, id) => {
+          const before = reads.counts();
+          const value = await node(ref, id);
+          const after = reads.counts();
+          windows.push({
+            state: after.state - before.state,
+            snapshot: after.snapshot - before.snapshot,
+            record: after.record - before.record,
+          });
+          return value;
+        },
+      );
+      const worker = vi.fn<RoleWorker>(async (task) =>
+        task.kind === "semantic" ? answerAll(task) : { outcome: "completed" },
+      );
+      const { workerHub } = makeWorkerHub({
+        arcHost,
+        workers: { [DEFAULT_WORKER_ROLE]: worker },
+      });
+      try {
+        const arcRunId = await submitActivation(workerHub, "start");
+        await waitFor(async () =>
+          (await workerHub.listWorkEvents(arcRunId)).some(
+            (event) => event.kind === "run:completed",
+          ),
+        );
+        const expectedTasks = stage === "action" ? 2 : 4;
+        expect(worker).toHaveBeenCalledTimes(expectedTasks);
+        expect(windows).toEqual(
+          stage === "action"
+            ? Array.from({ length: 4 }, () => ({
+                state: 0,
+                snapshot: 0,
+                record: 0,
+              }))
+            : [
+                { state: 0, snapshot: 1, record: 1 },
+                { state: 0, snapshot: 0, record: 0 },
+                { state: 0, snapshot: 1, record: 1 },
+                { state: 0, snapshot: 0, record: 0 },
+                ...Array.from({ length: 4 }, () => ({
+                  state: 0,
+                  snapshot: 0,
+                  record: 0,
+                })),
+              ],
+        );
+        expect(new Set(reads.snapshot.mock.calls.map(([id]) => id)).size).toBe(
+          stage === "action" ? 1 : 3,
+        );
+        expect(
+          (await workerHub.listWorkEvents(arcRunId)).filter(
+            (event) => event.kind === "routine:started",
+          ),
+        ).toEqual([
+          expect.objectContaining({
+            nodeName: "Main",
+            nodeDescription: "Pinned label",
+          }),
+          expect.objectContaining({
+            nodeName: "Main",
+            nodeDescription: "Pinned label",
+          }),
+        ]);
+      } finally {
+        await workerHub.stop();
+        await arcHost.stop();
+      }
+    },
+  );
+
   it.each([
     ["first matching reply", ["SQUAWK"]],
     ["nonmatching reply then matching reply", ["hello", "SQUAWK"]],
@@ -164,8 +271,8 @@ function Main() {
     },
   );
 
-  it("rejects duplicate role workers", () => {
-    const arcHost = makeArcHost();
+  it("rejects duplicate role workers", async () => {
+    const arcHost = await makeArcHost();
     const { workerHub } = makeWorkerHub({
       arcHost,
       workers: {
@@ -212,7 +319,7 @@ function Watch() {
   $instruct(\`Report the updates.\`);
 }`,
     );
-    const nodeInfoForRunRef = vi.spyOn(arcHost, "nodeInfoForRunRef");
+    const nodeInfoForRef = vi.spyOn(arcHost, "nodeInfoForRef");
     // The first routine replaces the source; the second resolves its node from
     // the run's pinned snapshot.
     const worker = vi.fn<RoleWorker>(async (task, _context, effects) => {
@@ -229,7 +336,9 @@ function Replacement() {
           { workspaceScope: "run", bundle: {}, contextIsolation: "role" },
           { replace: true },
         );
-        expect(() => arcHost.nodeInfoForRef(taskSourceRef(task))).toThrow(
+        await expect(
+          arcHost.nodeInfoForRef(taskSourceRef(task)),
+        ).rejects.toThrow(
           `No registered Arc node for source ref ${taskSourceRef(task)}.`,
         );
         return { outcome: "completed" };
@@ -258,7 +367,9 @@ function Replacement() {
       ),
     );
     expect(worker).toHaveBeenCalledTimes(2);
-    expect(nodeInfoForRunRef).toHaveBeenCalledTimes(2);
+    expect(
+      nodeInfoForRef.mock.calls.filter(([, runId]) => runId === arcRunId),
+    ).toHaveLength(2);
     expect(
       (await workerHub.listWorkEvents(arcRunId)).filter(
         (event) => event.kind === "routine:started",
@@ -269,7 +380,7 @@ function Replacement() {
     ]);
   });
 
-  it("resolves trigger task node metadata from the latest runtime", async () => {
+  it("resolves trigger task node metadata from its captured snapshot", async () => {
     const arcHost = await makeArcHostWithSource("watch", TRIGGER_JUDGE_SOURCE);
     await arcHost.registerArc(
       "watch",
@@ -284,6 +395,19 @@ function Watch() {
       { workspaceScope: "run", bundle: {}, contextIsolation: "role" },
       { replace: true },
     );
+    const begin = arcHost.begin.bind(arcHost);
+    vi.spyOn(arcHost, "begin").mockImplementation(async (input) => {
+      const steps = await begin(input);
+      await arcHost.registerArc(
+        "watch",
+        parse(
+          '"arc"; function Watch() { this.description = "Later trigger metadata."; this.trigger = () => true; }',
+        ),
+        undefined,
+        { replace: true },
+      );
+      return steps;
+    });
     const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workers: {
@@ -540,7 +664,7 @@ function Watch() {
   });
 
   it("starts fast-trigger warmup from hub context without delaying dispatch", async () => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc(
       "semantic-eval",
       parse(`
@@ -909,7 +1033,7 @@ function Watch() {
     ],
   ] as const)("%s", async (_name, backend, override) => {
     const artifactRoot = await mkdtemp(join(tmpdir(), "arcade-trigger-root-"));
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       artifactRoot,
     });
@@ -987,7 +1111,7 @@ function Watch() {
     ["preserves the process cwd after trigger failure", "failed"],
   ] as const)("%s", async (_name, matches) => {
     const artifactRoot = await mkdtemp(join(tmpdir(), "arcade-probe-ws-"));
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       artifactRoot,
     });
@@ -1078,7 +1202,7 @@ function Ready() {
       false,
     ],
   ] as const)("%s", async (_name, resume) => {
-    const arcHost = makeArcHost();
+    const arcHost = await makeArcHost();
     await arcHost.registerArc(
       "ready",
       parse(`
@@ -1154,7 +1278,7 @@ function Ready() {
 
   it("serializes routines sharing one worker run and context", async () => {
     const time = makeControlledTime();
-    const arcHost = createTestArcHost({
+    const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       ...time,
     });
@@ -1263,6 +1387,7 @@ function Main() {
         advanceInputs.push(report);
         return {
           kind: "action",
+          reactivationCount: 0,
           arcRunId,
           frontier: {
             ...syntheticFrontier,
@@ -1468,3 +1593,137 @@ function claudeSemanticQuery(
   generator.close = () => undefined;
   return generator as ReturnType<ClaudeSdkQueryFn>;
 }
+
+it.each(["live", "reconstructed"] as const)(
+  "dispatches retained semantic reentry after source deletion with %s state",
+  async (mode) => {
+    const dir = await mkdtemp(join(tmpdir(), "arcade-deleted-reentry-"));
+    const store = new JsonFileArcHostStore({ dir });
+    let host = await createTestArcHost({ store });
+    await host.registerArcs([
+      {
+        source: "retained",
+        document: parse(
+          '"arc"; import { Wait } from "imported"; function Main() { this.description = "Retained trigger description."; this.trigger = () => judge("Start?"); $enter(Wait); }',
+        ),
+        manifest: {
+          workspaceScope: "run",
+          contextIsolation: "role",
+          bundle: { "guide/": "/tmp/retained-bundle" },
+        },
+      },
+      {
+        source: "imported",
+        document: parse(
+          '"arc"; function Wait() { this.guard = () => State.DEFLECTED; }',
+        ),
+        manifest: {
+          workspaceScope: "run",
+          contextIsolation: "role",
+          bundle: { "guide/": "/tmp/imported-bundle" },
+        },
+      },
+    ]);
+    const dialog = {
+      cursor: { user: 1, self: 0 },
+      lastTurns: [{ role: "user" as const, message: "start" }],
+    };
+    const projectDialog = async () => dialog;
+    const [probe] = await host.begin({
+      dialog,
+      inbound: { content: "start" },
+      principal: ALICE_OWNER,
+      projectDialog,
+    });
+    if (probe?.kind !== "trigger") throw new Error("Expected semantic trigger");
+    await expect(
+      host.nodeInfoForRef(toNodeRef("retained", ["Absent"]), probe.arcRunId),
+    ).rejects.toThrow("has no node");
+    const [initial] = await host.advanceTrigger(probe.arcRunId, dialog, {
+      projectDialog,
+      instructionCoverage: {},
+      reports: [
+        {
+          outcome: "completed",
+          semantic: {
+            judgments: { [probe.frontier.briefs.judgments[0]!.id]: true },
+          },
+        },
+      ],
+    });
+    if (initial?.kind !== "action") throw new Error("Expected deflected run");
+    expect(await host.getRunView(initial.arcRunId)).toMatchObject({
+      stage: "actioning",
+      reactivationCount: 0,
+      lifecycle: "deflected",
+    });
+    await host.registerArcs([
+      { source: "retained", delete: true },
+      { source: "imported", delete: true },
+    ]);
+    if (mode === "reconstructed") {
+      await host.stop();
+      host = await createTestArcHost({
+        store: new JsonFileArcHostStore({ dir }),
+      });
+    }
+    await expect(
+      host.nodeInfoForRef(toNodeRef("retained", ["Main"])),
+    ).rejects.toThrow();
+    await expect(
+      host.nodeInfoForRef(toNodeRef("retained", ["Main"]), "unknown-probe"),
+    ).rejects.toThrow("Unknown Arc run");
+    const worker = vi.fn<RoleWorker>(async (task) => {
+      expect(
+        (await host.getRunWorkspaceContext(task.arcRunId)).workspaceBundle,
+      ).toEqual({ "guide/": "/tmp/retained-bundle" });
+      return answerAll(task);
+    });
+    const { workerHub, routineStore } = makeWorkerHub({
+      arcHost: host,
+      workers: { [DEFAULT_WORKER_ROLE]: worker },
+    });
+    try {
+      const iterator = workerHub
+        .submitInbound({
+          content: "again",
+          metadata: { principal: ALICE_OWNER },
+        })
+        [Symbol.asyncIterator]();
+      const pending = await iterator.next();
+      if (pending.done || pending.value.kind !== "handshake-required")
+        throw new Error("Expected retained run choice");
+      await expect(
+        workerHub.handshake(pending.value.handshakeId, {
+          runChoice: { action: "join", arcRunId: initial.arcRunId },
+        }),
+      ).resolves.toEqual({ status: "ok" });
+      expect((await iterator.next()).value).toEqual({
+        kind: "activated",
+        reactivationCount: 1,
+        arcRunId: initial.arcRunId,
+      });
+      expect((await iterator.next()).done).toBe(true);
+      expect(worker).toHaveBeenCalledTimes(1);
+      const routines = await collectAsync(routineStore.listRoutines());
+      const trigger = routines.find(
+        (routine) =>
+          routine.task.kind === "semantic" && routine.task.stage === "trigger",
+      )!;
+      expect(await workerHub.listWorkEvents(trigger.arcRunId)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "routine:started",
+            nodeName: "Main",
+            nodeDescription: "Retained trigger description.",
+          }),
+        ]),
+      );
+      expect(
+        (await host.getRunWorkspaceContext(initial.arcRunId)).workspaceBundle,
+      ).toEqual({ "guide/": "/tmp/retained-bundle" });
+    } finally {
+      await workerHub.stop();
+    }
+  },
+);
