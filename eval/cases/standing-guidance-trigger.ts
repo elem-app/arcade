@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { ownedSubmissionEvents } from "../submission-events.js";
 
 import { parse } from "@elem-app/arc/parser";
 import { toArcRef } from "@elem-app/arc/runtime";
@@ -98,7 +99,7 @@ function ${name}() {
       // must stay outside both fast-trigger backends' prompts.
       for (const [name, token] of Object.entries(tokens)) {
         const events = await collectLifecycle(
-          workerHub.submitInbound({
+          ownedSubmissionEvents(workerHub, {
             content: `Please process this request. Clearance token: ${token}.`,
             metadata: { principal: `eval-${name}` },
           }),

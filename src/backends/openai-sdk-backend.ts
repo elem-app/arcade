@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { cp, rm } from "node:fs/promises";
 import { join, relative } from "node:path";
+import type { PermissionGrants } from "./managed-worker-tools.js";
+import { PermissionGrantCache } from "./permission-grant-cache.js";
 
 import {
   Agent,
@@ -75,6 +77,12 @@ import {
   createWorkerSlotSchema,
   parseWorkerSlotSchema,
 } from "../types/worker-slot.js";
+import { KeyedSerializer } from "../utils/keyed-serializer.js";
+import {
+  readRetention,
+  registerRetentionProbe,
+  type PermissionGrantCacheRetention,
+} from "../utils/retention-registry.js";
 import {
   backendRoutine,
   providerFailureReport,
@@ -82,7 +90,9 @@ import {
   type BackendRoutine,
 } from "./backend-support.js";
 import {
-  createContinuityController,
+  createContinuityPreparation,
+  type InvocationContinuity,
+  type PrepareContinuity,
   type ResolveOpenAiContinuityIdentity,
 } from "./continuity.js";
 import {
@@ -105,7 +115,6 @@ import {
   ToolFailure,
   WORKER_INTERACTION_SYSTEM_PROMPT,
   type ManagedWorkerToolContext,
-  type PermissionGrant,
 } from "./managed-worker-tools.js";
 import { resolveOpenAiApiKey } from "./openai-auth.js";
 
@@ -615,11 +624,25 @@ function openAiToolParameters(schema: unknown): OpenAiNonStrictToolParameters {
   return schema as OpenAiNonStrictToolParameters;
 }
 
+// Bundle copies are shared by owning routines, including routines on other slots.
+// Serializing claim/release with materialization prevents old cleanup deleting a
+// successor's files. Entries disappear with the last actual owner.
+const bundleOwners = new Map<string, Set<symbol>>();
+const bundleOperations = new KeyedSerializer<string>();
+
+async function releaseOpenAiBundle(root: string, owner: symbol): Promise<void> {
+  await bundleOperations.run(root, async () => {
+    const owners = bundleOwners.get(root);
+    if (!owners?.delete(owner) || owners.size) return;
+    bundleOwners.delete(root);
+    await rm(root, { recursive: true, force: true });
+  });
+}
+
 /** Materialize workspace bundles inside the OpenAI sandbox root. */
 async function materializeOpenAiWorkspaceBundles(
   cwd: string,
   bundle: Readonly<Record<string, string>>,
-  touched: Set<string>,
 ): Promise<void> {
   const sandboxToHost = (sandboxPath: string): string =>
     join(cwd, relative(WORKSPACE_SANDBOX_ROOT, sandboxPath));
@@ -627,7 +650,6 @@ async function materializeOpenAiWorkspaceBundles(
   await rm(bundleRoot, { recursive: true, force: true });
   const prefixes = Object.keys(bundle);
   if (prefixes.length === 0) return;
-  touched.add(bundleRoot);
   for (const prefix of prefixes) {
     await cp(bundle[prefix]!, sandboxToHost(sandboxBundleRoot(prefix)), {
       recursive: true,
@@ -729,26 +751,7 @@ export function createOpenAiSdkBackendForTesting(
     workerSlotSchema: OpenAiWorkerSlotSchema,
     createWorker(host, slot) {
       const config = slot;
-      let continuity!: ReturnType<typeof createContinuityController>;
-      const worker = new OpenAiSdkWorker({
-        ...options,
-        logger: host.logger,
-        model: config.model ?? options.model,
-        timeoutMs: config.timeoutMs ?? options.timeoutMs,
-        cwd: config.cwd ?? options.cwd,
-        baseUrl: config.baseUrl ?? options.baseUrl,
-        apiKeySecret: config.apiKeySecret ?? options.apiKeySecret,
-        onResponseObserved: async (observed) => {
-          await options.onResponseObserved?.(observed);
-          await continuity.persistObserved(
-            observed.routine,
-            observed.sessionKey,
-            observed.responseId,
-            observed.cwd,
-          );
-        },
-      });
-      continuity = createContinuityController({
+      const prepare = createContinuityPreparation({
         backend: "openai-sdk",
         host,
         slot,
@@ -757,40 +760,30 @@ export function createOpenAiSdkBackendForTesting(
           options.resolveContinuityIdentity ??
           defaultOpenAiContinuityIdentity(options),
         continuityField: "responseId",
-        seed: (contextKey, responseId, cwd) =>
-          worker.seedSession(contextKey, responseId, cwd),
-        clear: (contextKey) => worker.clearSession(contextKey),
       });
+      const worker = new OpenAiSdkWorker(
+        {
+          ...options,
+          logger: host.logger,
+          model: config.model ?? options.model,
+          timeoutMs: config.timeoutMs ?? options.timeoutMs,
+          cwd: config.cwd ?? options.cwd,
+          baseUrl: config.baseUrl ?? options.baseUrl,
+          apiKeySecret: config.apiKeySecret ?? options.apiKeySecret,
+        },
+        prepare,
+      );
       return {
-        warm: (input) => continuity.warm(input),
         async run(input) {
-          const nativeResume = openAiNativeResume(input);
           try {
-            await continuity.prepareRun(input, {
-              preserveLiveContinuation:
-                nativeResume !== undefined ||
-                worker.hasRetryState(input.routine.id),
-            });
-            const report = await worker.run(input, nativeResume);
-            continuity.finish(
-              input.routine.id,
-              report.suspension !== undefined,
-            );
-            return report;
+            return await worker.run(input, openAiNativeResume(input));
           } catch (error) {
-            continuity.fail(input.routine.id);
             const report = providerFailureReport(error, "openai-sdk");
             if (report) return report;
             throw error;
           }
         },
-        async disposeRoutine(input) {
-          try {
-            await worker.disposeRoutine(input);
-          } finally {
-            continuity.disposeRoutine(input.routineId);
-          }
-        },
+        disposeRoutine: (input) => worker.disposeRoutine(input),
         stop: () => worker.stop(),
       };
     },
@@ -828,11 +821,6 @@ function openAiNativeResume(
     : undefined;
 }
 
-type StoredOpenAiSession = {
-  responseId: string;
-  cwd: string;
-};
-
 /** Tool-capable backend backed by OpenAI Agents SDK SandboxAgent. */
 export class OpenAiSdkWorker implements Worker {
   readonly #options: Required<
@@ -841,7 +829,6 @@ export class OpenAiSdkWorker implements Worker {
     Omit<OpenAiSdkBackendTestOptions, "model" | "timeoutMs">;
   readonly #run: OpenAiSdkRunFn;
   readonly #logger: ArcadeLogger;
-  readonly #sessions = new Map<string, StoredOpenAiSession>();
   readonly #retryStates = new Map<
     string,
     {
@@ -850,6 +837,7 @@ export class OpenAiSdkWorker implements Worker {
       cwd: string;
       model: string;
       report?: RoutineReport;
+      continuity?: InvocationContinuity;
     }
   >();
 
@@ -863,17 +851,21 @@ export class OpenAiSdkWorker implements Worker {
       cwd: string;
       model: string;
       owner: Parameters<Worker["disposeRoutine"]>[0];
+      continuity?: InvocationContinuity;
     }
   >();
   /**
-   * Remembered `allow_this_run` grants per session key, so an approval persists
-   * across routines in the same session (mirrors the Claude SDK backend).
+   * Temporary `allow_this_run` grants shared by matching routine contexts.
    */
-  readonly #grants = new Map<string, PermissionGrant[]>();
-  /** Workspace bundle roots materialized this process, removed on stop(). */
-  readonly #touchedBundleDirs = new Set<string>();
+  readonly #grants = new PermissionGrantCache();
+  readonly #bundleRoutines = new Map<string, Map<string, symbol>>();
+  #stopped = false;
+  readonly #activeControllers = new Set<AbortController>();
 
-  constructor(options: OpenAiSdkBackendTestOptions) {
+  constructor(
+    options: OpenAiSdkBackendTestOptions,
+    private readonly prepareContinuity?: PrepareContinuity,
+  ) {
     this.#options = {
       ...options,
       model: options.model ?? DEFAULT_OPENAI_SDK_MODEL,
@@ -881,56 +873,122 @@ export class OpenAiSdkWorker implements Worker {
     };
     this.#run = options.run ?? defaultOpenAiSdkRun;
     this.#logger = options.logger ?? createArcadeLogger();
-  }
-
-  seedSession(sessionKey: string, responseId: string, cwd: string): void {
-    if (!this.#sessions.has(sessionKey)) {
-      this.#sessions.set(sessionKey, { responseId, cwd });
-    }
-  }
-
-  clearSession(sessionKey: string): void {
-    this.#sessions.delete(sessionKey);
-    this.#parkedStates.delete(sessionKey);
-    this.#grants.delete(sessionKey);
+    registerRetentionProbe(this, () => {
+      const grants = readRetention<PermissionGrantCacheRetention>(this.#grants);
+      return {
+        grantContexts: grants.contexts,
+        grants: grants.grants,
+        bundleRoutines: this.#bundleRoutines.size,
+        parkedRoutines: this.#parkedStates.size,
+        retryRoutines: this.#retryStates.size,
+      };
+    });
   }
 
   async disposeRoutine(
     input: Parameters<Worker["disposeRoutine"]>[0],
   ): Promise<void> {
-    if (this.#retryStates.get(input.routineId)?.arcRunId === input.arcRunId)
+    const preparations = new Set<InvocationContinuity>();
+    const retry = this.#retryStates.get(input.routineId);
+    if (retry?.arcRunId === input.arcRunId) {
+      if (retry.continuity) preparations.add(retry.continuity);
       this.#retryStates.delete(input.routineId);
+    }
     for (const [key, parked] of this.#parkedStates) {
       if (
         parked.owner.routineId === input.routineId &&
         parked.owner.arcRunId === input.arcRunId
-      )
+      ) {
+        if (parked.continuity) preparations.add(parked.continuity);
         this.#parkedStates.delete(key);
+      }
     }
+    const key = JSON.stringify([input.arcRunId, input.routineId]);
+    const roots = this.#bundleRoutines.get(key);
+    this.#bundleRoutines.delete(key);
+    const results = await Promise.allSettled([
+      ...[...preparations].map((entry) => entry.close()),
+      ...[...(roots ?? [])].map(([root, owner]) =>
+        releaseOpenAiBundle(root, owner),
+      ),
+    ]);
+    const errors = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (errors.length)
+      throw new AggregateError(errors, "OpenAI routine cleanup failed.");
   }
 
   async stop(): Promise<void> {
+    this.#stopped = true;
+    for (const controller of this.#activeControllers) controller.abort();
+    const preparations = new Set<InvocationContinuity>();
+    for (const entry of [
+      ...this.#retryStates.values(),
+      ...this.#parkedStates.values(),
+    ])
+      if (entry.continuity) preparations.add(entry.continuity);
     this.#retryStates.clear();
     this.#parkedStates.clear();
-    // The OpenAI SDK backend owns no long-lived transport. Best-effort removal
-    // of materialized bundle copies; reset-on-entry is the real guarantee, so a
-    // missed cleanup (e.g. crash) self-heals on the next run.
-    for (const dir of this.#touchedBundleDirs) {
-      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
-    }
-    this.#touchedBundleDirs.clear();
+    this.#grants.stop();
+    const routines = [...this.#bundleRoutines.values()];
+    this.#bundleRoutines.clear();
+    const results = await Promise.allSettled([
+      ...routines.flatMap((roots) =>
+        [...roots].map(([root, owner]) => releaseOpenAiBundle(root, owner)),
+      ),
+      ...[...preparations].map((entry) => entry.close()),
+    ]);
+    const errors = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (errors.length)
+      throw new AggregateError(errors, "OpenAI worker cleanup failed.");
   }
 
   async run(
     input: RoutineInput,
     nativeResume?: OpenAiSdkResumeContext,
   ): Promise<RoutineReport> {
+    if (this.#stopped) throw new Error("OpenAI SDK worker is stopped.");
+    const ownerKey = JSON.stringify([input.routine.arcRunId, input.routine.id]);
+    const preparation =
+      this.#retryStates.get(input.routine.id)?.continuity ??
+      this.#parkedStates.get(ownerKey)?.continuity ??
+      (await this.prepareContinuity?.(input));
+    try {
+      if (
+        this.#stopped ||
+        (await input.effects.checkSignal())?.kind === "cancel"
+      ) {
+        await this.disposeRoutine({
+          arcRunId: input.routine.arcRunId,
+          routineId: input.routine.id,
+        });
+        return { cancellation: "superseded" };
+      }
+      return await this.#runRoutine(input, nativeResume, preparation);
+    } finally {
+      const retained =
+        this.#retryStates.get(input.routine.id)?.continuity === preparation ||
+        this.#parkedStates.get(ownerKey)?.continuity === preparation;
+      if (retained && !this.#stopped) await preparation?.drain();
+      else await preparation?.close();
+    }
+  }
+
+  async #runRoutine(
+    input: RoutineInput,
+    nativeResume: OpenAiSdkResumeContext | undefined,
+    preparation: InvocationContinuity | undefined,
+  ): Promise<RoutineReport> {
     const { context, effects, diagnostics } = input;
     const routine = backendRoutine(input);
     const sessionKey = routine.contextKey;
     const currentCwd = this.#options.cwd ?? context.workspacePath;
     const resume = nativeResume ?? context.routineResume;
-    const nativeState = this.#parkedStates.get(sessionKey);
+    const ownerKey = JSON.stringify([routine.arcRunId, routine.id]);
+    const nativeState = this.#parkedStates.get(ownerKey);
     const parked =
       this.#retryStates.get(routine.id) ??
       (resume?.delivery === "native" &&
@@ -943,6 +1001,19 @@ export class OpenAiSdkWorker implements Worker {
         `OpenAI SDK routine ${routine.id} has no parked RunState to resume.`,
       );
     }
+    if (parked && parked === nativeState) {
+      // A setup failure can change a paused routine into a provider retry. The
+      // hub then invokes it without a native-resume hint, so retain the selected
+      // continuation on the retry path until provider execution actually starts.
+      this.#retryStates.set(routine.id, {
+        arcRunId: routine.arcRunId,
+        state: parked.state,
+        cwd: parked.cwd,
+        model: parked.model,
+        continuity: parked.continuity,
+      });
+      this.#parkedStates.delete(ownerKey);
+    }
     const cwd = parked?.cwd ?? currentCwd;
     const renderContext =
       this.#options.cwd !== undefined || parked !== undefined
@@ -952,17 +1023,7 @@ export class OpenAiSdkWorker implements Worker {
     const currentModel = selected?.model ?? this.#options.model;
     const model = parked?.model ?? currentModel;
     const timeoutMs = selected?.timeoutMs ?? this.#options.timeoutMs;
-    const seeded = this.#sessions.get(sessionKey);
-    const previousResponseId =
-      seeded && seeded.cwd === cwd ? seeded.responseId : undefined;
-    if (seeded && seeded.cwd !== cwd) {
-      this.#logger.info("backend.openai_sdk.resume_skipped", {
-        sessionKey,
-        routineId: routine.id,
-        storedCwd: seeded.cwd,
-        cwd,
-      });
-    }
+    const previousResponseId = preparation?.prior;
 
     // A threaded run (previousResponseId set) continues a server-side response
     // chain that already holds the dialog; prime it only on a fresh thread.
@@ -977,17 +1038,35 @@ export class OpenAiSdkWorker implements Worker {
     // worker reads them via masked `/.arcade-bundles/<prefix>` paths rather than
     // an out-of-workspace mount. Runs on every entry, including recovery and
     // resume (resume is a fresh run(): #parkedStates is in-memory only).
-    await materializeOpenAiWorkspaceBundles(
+    const bundleRoot = join(
       cwd,
-      renderContext.workspaceBundle,
-      this.#touchedBundleDirs,
+      relative(WORKSPACE_SANDBOX_ROOT, SANDBOX_BUNDLE_ROOT),
     );
+    await bundleOperations.run(bundleRoot, async () => {
+      if (this.#stopped) return;
+      if (Object.keys(renderContext.workspaceBundle).length) {
+        const key = JSON.stringify([routine.arcRunId, routine.id]);
+        let roots = this.#bundleRoutines.get(key);
+        if (!roots) this.#bundleRoutines.set(key, (roots = new Map()));
+        if (!roots.has(bundleRoot)) {
+          const owner = Symbol();
+          roots.set(bundleRoot, owner);
+          let owners = bundleOwners.get(bundleRoot);
+          if (!owners) bundleOwners.set(bundleRoot, (owners = new Set()));
+          owners.add(owner);
+        }
+      }
+      await materializeOpenAiWorkspaceBundles(
+        cwd,
+        renderContext.workspaceBundle,
+      );
+    });
     await diagnostics.writeText("prompt", prompt);
+    if (this.#stopped) return { cancellation: "superseded" };
     const startedAt = Date.now();
 
-    let report: RoutineReport | undefined = this.#retryStates.get(
-      routine.id,
-    )?.report;
+    let report: RoutineReport | undefined =
+      parked && "report" in parked ? parked.report : undefined;
     const onReport = (value: RoutineReport) => {
       report ??= value;
     };
@@ -1004,11 +1083,11 @@ export class OpenAiSdkWorker implements Worker {
       tools,
     });
 
-    let grants = this.#grants.get(sessionKey);
-    if (!grants) {
-      grants = [];
-      this.#grants.set(sessionKey, grants);
-    }
+    const grants = this.#grants.forContext(
+      routine.arcRunId,
+      routine.contextKey,
+    );
+
     const workerCtx = this.#workerContext({
       routine,
       context: renderContext,
@@ -1032,6 +1111,7 @@ export class OpenAiSdkWorker implements Worker {
         this.#logger,
       );
     const abortController = new AbortController();
+    this.#activeControllers.add(abortController);
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -1061,10 +1141,14 @@ export class OpenAiSdkWorker implements Worker {
 
     let result: OpenAiSdkRunResult | undefined;
     try {
+      const apiKey = await this.#apiKey();
+      if (this.#stopped) return { cancellation: "superseded" };
+      const sandboxClient = this.#sandboxClient(cwd);
+      this.#retryStates.delete(routine.id);
       result = await this.#run({
         agent,
         prompt: parked ? undefined : prompt,
-        apiKey: await this.#apiKey(),
+        apiKey,
         baseUrl: this.#options.baseUrl,
         abortController,
         maxTurns: 24,
@@ -1073,9 +1157,9 @@ export class OpenAiSdkWorker implements Worker {
         checkSignal: effects.checkSignal,
         resolveApproval,
         diagnostics,
-        sandboxClient: this.#sandboxClient(cwd),
+        sandboxClient,
       });
-      if (result.signal?.kind === "cancel") {
+      if (this.#stopped || result.signal?.kind === "cancel") {
         await this.disposeRoutine({
           arcRunId: routine.arcRunId,
           routineId: routine.id,
@@ -1088,6 +1172,7 @@ export class OpenAiSdkWorker implements Worker {
       if (result.failureReport) {
         if (result.state)
           this.#retryStates.set(routine.id, {
+            continuity: preparation,
             arcRunId: routine.arcRunId,
             state: result.state,
             cwd,
@@ -1099,7 +1184,8 @@ export class OpenAiSdkWorker implements Worker {
       }
       this.#retryStates.delete(routine.id);
       if (result.signal?.kind === "pause" && result.state) {
-        this.#parkedStates.set(sessionKey, {
+        this.#parkedStates.set(ownerKey, {
+          continuity: preparation,
           state: result.state,
           cwd,
           model,
@@ -1121,6 +1207,7 @@ export class OpenAiSdkWorker implements Worker {
       if (primaryUsage) await effects.recordTokenUsage(primaryUsage);
       await diagnostics.writeJson("sdk-result", summarizeRun(result));
       if (result.lastResponseId) {
+        await preparation?.observe(result.lastResponseId);
         await this.#options.onResponseObserved?.({
           routine,
           sessionKey,
@@ -1150,7 +1237,7 @@ export class OpenAiSdkWorker implements Worker {
           diagnostics,
           sandboxClient: this.#sandboxClient(cwd),
         });
-        if (recovery.signal?.kind === "cancel") {
+        if (this.#stopped || recovery.signal?.kind === "cancel") {
           await this.disposeRoutine({
             arcRunId: routine.arcRunId,
             routineId: routine.id,
@@ -1163,6 +1250,7 @@ export class OpenAiSdkWorker implements Worker {
         if (recovery.failureReport) {
           if (recovery.state)
             this.#retryStates.set(routine.id, {
+              continuity: preparation,
               arcRunId: routine.arcRunId,
               state: recovery.state,
               cwd,
@@ -1172,7 +1260,8 @@ export class OpenAiSdkWorker implements Worker {
           return withBackendDetails(recovery.failureReport, backendDetails);
         }
         if (recovery.signal?.kind === "pause" && recovery.state) {
-          this.#parkedStates.set(sessionKey, {
+          this.#parkedStates.set(ownerKey, {
+            continuity: preparation,
             state: recovery.state,
             cwd,
             model,
@@ -1182,6 +1271,7 @@ export class OpenAiSdkWorker implements Worker {
         }
         result = recovery;
         if (recovery.lastResponseId) {
+          await preparation?.observe(recovery.lastResponseId);
           await this.#options.onResponseObserved?.({
             routine,
             sessionKey,
@@ -1209,14 +1299,8 @@ export class OpenAiSdkWorker implements Worker {
           "OpenAI SDK worker did not call the required report tool before exiting.",
         );
       }
-      if (result.lastResponseId) {
-        this.#sessions.set(sessionKey, {
-          responseId: result.lastResponseId,
-          cwd,
-        });
-      }
       if (resume?.delivery === "native") {
-        this.#parkedStates.delete(sessionKey);
+        this.#parkedStates.delete(ownerKey);
       }
       backendDetails = {
         backend: "openai-sdk",
@@ -1237,7 +1321,6 @@ export class OpenAiSdkWorker implements Worker {
       });
       return withBackendDetails(report, backendDetails);
     } catch (error) {
-      this.#retryStates.delete(routine.id);
       if ((await effects.checkSignal())?.kind === "cancel") {
         await this.disposeRoutine({
           arcRunId: routine.arcRunId,
@@ -1263,6 +1346,7 @@ export class OpenAiSdkWorker implements Worker {
       });
       throw error;
     } finally {
+      this.#activeControllers.delete(abortController);
       clearTimeout(timeout);
     }
   }
@@ -1302,7 +1386,7 @@ export class OpenAiSdkWorker implements Worker {
     cwd: string;
     sessionKey: string;
     diagnostics: RoutineDiagnostics;
-    grants: PermissionGrant[];
+    grants: PermissionGrants;
     onReport: (report: RoutineReport) => void;
   }): ManagedWorkerToolContext {
     const { routine, context, effects, cwd, sessionKey, diagnostics, grants } =

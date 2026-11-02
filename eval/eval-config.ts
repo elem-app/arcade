@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
+import { ownedSubmissionEvents } from "./submission-events.js";
 
-import { createClaudeSdkBackend } from "../src/backends/claude-sdk-backend.js";
+import {
+  createClaudeSdkBackend,
+  createClaudeSdkBackendForTesting,
+  type ClaudeSdkStartupFn,
+} from "../src/backends/claude-sdk-backend.js";
 import type { ClaudeSdkTstBackendOptions } from "../src/backends/claude-sdk-tst-backend.js";
-import { createClaudeSdkTstBackend } from "../src/backends/claude-sdk-tst-backend.js";
+import {
+  createClaudeSdkTstBackend,
+  createClaudeSdkTstBackendForTesting,
+} from "../src/backends/claude-sdk-tst-backend.js";
 import type { OpenAiSdkBackendOptions } from "../src/backends/openai-sdk-backend.js";
 import { createOpenAiSdkBackend } from "../src/backends/openai-sdk-backend.js";
 import type { OpenAiSdkTstBackendOptions } from "../src/backends/openai-sdk-tst-backend.js";
@@ -31,6 +39,9 @@ type EvalWorkerHubOptions = WorkerHubServiceOptions & {
   fastTriggerBackend?: string | null;
   claudeSdkOptions?: Parameters<typeof createClaudeSdkBackend>[0];
   claudeSdkTstOptions?: ClaudeSdkTstBackendOptions;
+  /** Preparation evals wrap real SDK startup to observe readiness and use. */
+  claudeSdkStartup?: ClaudeSdkStartupFn;
+  claudeSdkTstStartup?: ClaudeSdkStartupFn;
   openAiSdkOptions?: OpenAiSdkBackendOptions;
   openAiSdkTstOptions?: OpenAiSdkTstBackendOptions;
   roleWorkers?: Record<string, RoleWorker>;
@@ -46,6 +57,8 @@ export async function createWorkerHubEvalRuntime(
     fastTriggerBackend,
     claudeSdkOptions,
     claudeSdkTstOptions,
+    claudeSdkStartup,
+    claudeSdkTstStartup,
     openAiSdkOptions,
     openAiSdkTstOptions,
     roleWorkers,
@@ -59,7 +72,9 @@ export async function createWorkerHubEvalRuntime(
   workerHub.addBackend("pi-agent", createPiAgentBackend(piAgentOptions));
   workerHub.addBackend(
     "claude-sdk",
-    createClaudeSdkBackend({
+    (claudeSdkStartup
+      ? createClaudeSdkBackendForTesting
+      : createClaudeSdkBackend)({
       resolveContinuityIdentity: async () => ({
         schema: 1,
         provider: "anthropic",
@@ -67,11 +82,17 @@ export async function createWorkerHubEvalRuntime(
         credentialScope: claudeEvalCredentialScope,
       }),
       ...claudeSdkOptions,
+      ...(claudeSdkStartup ? { startup: claudeSdkStartup } : {}),
     }),
   );
   workerHub.addBackend(
     "claude-sdk-tst",
-    createClaudeSdkTstBackend(claudeSdkTstOptions),
+    claudeSdkTstStartup
+      ? createClaudeSdkTstBackendForTesting({
+          ...claudeSdkTstOptions,
+          startup: claudeSdkTstStartup,
+        })
+      : createClaudeSdkTstBackend(claudeSdkTstOptions),
   );
   workerHub.addBackend("openai-sdk", createOpenAiSdkBackend(openAiSdkOptions));
   workerHub.addBackend(
@@ -226,7 +247,7 @@ export async function submitCorrelatedAnswer(
     throw new Error("Answerable outbound is missing askId.");
   }
   let settled = false;
-  for await (const event of workerHub.submitInbound({
+  for await (const event of ownedSubmissionEvents(workerHub, {
     arcRunId: message.arcRunId,
     content,
     metadata: { askId, ...metadata },

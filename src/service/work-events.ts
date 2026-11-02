@@ -3,6 +3,7 @@ import type { CreateWorkEventInput, WorkEventStore } from "../storage/base.js";
 import type { ArcRunId } from "../types/core.js";
 import type { WorkEventHandler } from "../types/hub.js";
 import type { WorkEvent } from "../types/work-event.js";
+import { registerRetentionProbe } from "../utils/retention-registry.js";
 
 type ObservationJob = () => Promise<void>;
 
@@ -13,6 +14,11 @@ class ObservationQueue {
   #closed = false;
 
   constructor(readonly limit: number) {}
+
+  /** Jobs admitted and not yet finished, including the running job per lane. */
+  get size(): number {
+    return this.#size;
+  }
 
   offer(arcRunId: ArcRunId, job: ObservationJob): boolean {
     if (this.#closed || this.#size >= this.limit) return false;
@@ -83,6 +89,14 @@ export class WorkEventService {
   ) {
     this.#publications = new ObservationQueue(limits.publications ?? 1024);
     this.#deliveryLimit = limits.deliveriesPerSubscriber ?? 256;
+    registerRetentionProbe(this, () => ({
+      publications: this.#publications.size,
+      subscribers: this.#handlers.size,
+      deliveries: [...this.#handlers.values()].reduce(
+        (n, subscriber) => n + subscriber.queue.size,
+        0,
+      ),
+    }));
   }
 
   registerWorkEventHandler(handler: WorkEventHandler): () => void {

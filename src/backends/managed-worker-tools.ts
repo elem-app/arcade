@@ -171,11 +171,10 @@ export type ManagedWorkerToolContext = {
   /** Escalate a permission request through the routine-owned hub effect. */
   requestPermission: RoutineEffects["requestPermission"];
   /**
-   * Remembered grants for this `(arcRunId, sessionKey)` pair. Backends share
-   * the same array across routines so an `allow_this_run` verdict on one
-   * routine satisfies later routines.
+   * Temporary grants for this `(arcRunId, sessionKey)` pair. Every lookup
+   * checks expiry; forgetting a grant simply requires another approval.
    */
-  grants: PermissionGrant[];
+  grants: PermissionGrants;
 };
 
 /**
@@ -189,6 +188,14 @@ export type ExecScope = {
   shell?: string;
   login?: boolean;
   tty?: boolean;
+};
+
+/** A routine's view of temporary grants; each lookup rechecks expiry. */
+export type PermissionGrants = {
+  find(
+    matches: (grant: PermissionGrant) => boolean,
+  ): PermissionGrant | undefined;
+  push(grant: PermissionGrant): void;
 };
 
 /** Remembered permission grant for the run. */
@@ -510,16 +517,6 @@ function grantMatches(
  * `exec_command`.
  */
 const COMMAND_SCOPED_TOOLS = new Set(["Bash", "exec_command"]);
-
-/**
- * True for tools whose grants are scoped to the exact command. Backends use this
- * to keep Arcade's command-scoped grant authoritative — a backend must not let
- * its SDK remember a blanket per-tool permission for these, or the per-command
- * grant would be bypassed.
- */
-export function isCommandScopedPermissionTool(toolName: string): boolean {
-  return COMMAND_SCOPED_TOOLS.has(toolName);
-}
 
 /**
  * Gated tools that carry no safe grant discriminator, so `allow_this_run`
@@ -878,7 +875,11 @@ export async function resolveWorkerPermission(
       }
       const verdict = await escalate(ctx, toolCallId, toolName, input, logger);
       if (verdict.decision === "allow_this_run") {
-        const grant = buildPermissionGrant(toolName, input, ctx);
+        const grant = buildPermissionGrant(
+          toolName,
+          verdict.updatedInput ?? input,
+          ctx,
+        );
         if (grant) ctx.grants.push(grant);
       }
       await appendManagedWorkerToolDiagnostic(ctx, {

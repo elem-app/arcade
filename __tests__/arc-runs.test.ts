@@ -29,7 +29,6 @@ import {
   expectSoleDriver,
   expectSoleHandshake,
   expectSoleTrigger,
-  inboundFromDialog,
   projectorFor,
   type TriggerStep,
 } from "./arc-host-helpers.js";
@@ -109,6 +108,11 @@ describe("Arc runs", () => {
             kind: "activated",
             arcRunId: runId,
             reactivationCount: count,
+          });
+          expect((await channel.next()).value).toEqual({
+            kind: "handshake-settled",
+            handshakeId: gate.handshakeId,
+            outcome: "proceeded",
           });
           expect((await channel.next()).done).toBe(true);
           expect(await host.getRunView(runId)).toMatchObject({
@@ -335,11 +339,15 @@ describe("Arc runs", () => {
             entry.begin({ arcRunId: id, projectDialog }),
           ).resolves.toEqual([]);
           await expect(
-            entry.advanceTrigger(id, dialog, {
-              reports: [],
-              instructionCoverage: {},
-              projectDialog,
-            }),
+            entry.advanceTrigger(
+              {
+                kind: "trigger",
+                arcRunId: id,
+                frontier: terminal,
+                signal: new AbortController().signal,
+              }.arcRunId,
+              { reports: [], projectDialog },
+            ),
           ).resolves.toEqual([]);
           expect(await store.getState(arcRunKey(id))).toEqual(state);
           expect(await replayStore.listSteps(id)).toEqual(replay);
@@ -542,9 +550,7 @@ describe("Arc runs", () => {
     );
     const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
     const [step] = await host.begin({
-      dialog,
       principal: ALICE_OWNER,
-      inbound: { content: "go" },
       projectDialog: projectorFor(dialog),
     });
     if (step?.kind !== "trigger") throw new Error("Expected trigger");
@@ -577,7 +583,6 @@ describe("Arc runs", () => {
     };
 
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -607,7 +612,6 @@ describe("Arc runs", () => {
     };
 
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -633,7 +637,6 @@ describe("Arc runs", () => {
       lastTurns: [{ role: "user", message: "research FIX" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -695,7 +698,6 @@ describe("Arc runs", () => {
       lastTurns: [{ role: "user", message: "research FIX" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -750,7 +752,6 @@ function Stock() {
       lastTurns: [{ role: "user", message: "start stock research" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "start stock research" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -788,7 +789,6 @@ function Stock() {
       lastTurns: [{ role: "user", message: "research FIX" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -942,7 +942,6 @@ function Stock() {
     };
 
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: inboundFromDialog(dialog),
       principal: ALICE_OWNER,
     });
     const driver = new StepDriver(arcHost, expectSoleDriver(begun));
@@ -1021,7 +1020,6 @@ function CheckReady() {
     };
 
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "hi" },
       principal: ALICE_OWNER,
     });
 
@@ -1687,7 +1685,6 @@ function Stock() {
       lastTurns: [{ role: "user", message: "start stock research" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "start stock research" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -1737,8 +1734,6 @@ function Beta() {
       lastTurns: [{ role: "user", message: "go" }],
     };
     const begun = await arcHost.begin({
-      dialog,
-      inbound: { content: "go" },
       principal: ALICE_OWNER,
       clientId: "client-1",
       activationPolicy: "all",
@@ -1746,8 +1741,7 @@ function Beta() {
     });
     const trig = expectSoleTrigger(begun);
 
-    const advanced = await arcHost.advanceTrigger(trig.arcRunId, dialog, {
-      instructionCoverage: {},
+    const advanced = await arcHost.advanceTrigger(trig.arcRunId, {
       projectDialog: projectorFor(dialog),
       reports: [
         {
@@ -1809,8 +1803,6 @@ function Gated() {
       lastTurns: [{ role: "user", message: "go" }],
     };
     const begun = await arcHost.begin({
-      dialog,
-      inbound: { content: "go" },
       principal: ALICE_OWNER,
       activationPolicy: "all",
       projectDialog: projectorFor(dialog),
@@ -1870,13 +1862,11 @@ function Stock() {
       lastTurns: [{ role: "user", message: "start stock research" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "start stock research" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
     const trig = expectSoleTrigger(begun);
-    const advanced = await arcHost.advanceTrigger(trig.arcRunId, dialog, {
-      instructionCoverage: {},
+    const advanced = await arcHost.advanceTrigger(trig.arcRunId, {
       projectDialog: projectorFor(dialog),
       reports: [
         {
@@ -1904,13 +1894,11 @@ function Stock() {
     );
 
     const again = await beginActivation(arcHost, dialog, {
-      inbound: { content: "start stock research" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
     const againTrig = expectSoleTrigger(again);
-    const repeated = await arcHost.advanceTrigger(againTrig.arcRunId, dialog, {
-      instructionCoverage: {},
+    const repeated = await arcHost.advanceTrigger(againTrig.arcRunId, {
       projectDialog: projectorFor(dialog),
       reports: [
         {
@@ -1968,15 +1956,13 @@ function Stock() {
       lastTurns: [{ role: "user", message: "start stock research" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "start stock research" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
     const trig = expectSoleTrigger(begun);
 
     await expect(
-      arcHost.advanceTrigger(trig.arcRunId, dialog, {
-        instructionCoverage: {},
+      arcHost.advanceTrigger(trig.arcRunId, {
         projectDialog: projectorFor(dialog),
         reports: trig.frontier.briefs.judgments.map((judgment) => ({
           error: "failed" as const,
@@ -2025,7 +2011,6 @@ function Main() {
       lastTurns: [{ role: "user", message: "second event" }],
     };
     const second = await beginActivation(arcHost, secondDialog, {
-      inbound: inboundFromDialog(secondDialog),
       principal: ALICE_OWNER,
     });
     const handshake = expectSoleHandshake(second);
@@ -2105,7 +2090,6 @@ function Main() {
     const first = await beginActivatedDriver(arcHost, dialog);
     const failedChoice = expectSoleHandshake(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -2149,7 +2133,6 @@ function Main() {
 
     const retryChoice = expectSoleHandshake(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -2193,7 +2176,6 @@ function Main() {
       [0, 1].map(async () =>
         expectSoleHandshake(
           await beginActivation(arcHost, dialog, {
-            inbound: inboundFromDialog(dialog),
             principal: ALICE_OWNER,
           }),
         ),
@@ -2249,7 +2231,6 @@ function Main() {
     );
 
     const planned = await beginActivation(arcHost, oldDialog, {
-      inbound: inboundFromDialog(oldDialog),
       principal: ALICE_OWNER,
     });
     const handshake = expectSoleHandshake(planned);
@@ -2307,7 +2288,6 @@ function Main() {
 
     const handshake = expectSoleHandshake(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -2355,7 +2335,6 @@ function Main() {
 
     const fresh = expectSoleDriver(
       await beginActivation(arcHost, newDialog, {
-        inbound: inboundFromDialog(newDialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -2397,8 +2376,6 @@ function Fresh() {
     );
     const probe = expectSoleTrigger(
       await arcHost.begin({
-        dialog,
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
         activationPolicy: "first",
         projectDialog: projectorFor(dialog),
@@ -2406,8 +2383,7 @@ function Fresh() {
     );
 
     const settled = expectSoleDriver(
-      await arcHost.advanceTrigger(probe.arcRunId, dialog, {
-        instructionCoverage: {},
+      await arcHost.advanceTrigger(probe.arcRunId, {
         projectDialog: projectorFor(dialog),
         reports: [
           {
@@ -2442,13 +2418,11 @@ function Main() {
     };
     const firstProbe = expectSoleTrigger(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
     const first = expectSoleDriver(
-      await arcHost.advanceTrigger(firstProbe.arcRunId, dialog, {
-        instructionCoverage: {},
+      await arcHost.advanceTrigger(firstProbe.arcRunId, {
         projectDialog: projectorFor(dialog),
         reports: [
           {
@@ -2463,15 +2437,13 @@ function Main() {
       }),
     );
     const probes = (await beginActivation(arcHost, dialog, {
-      inbound: inboundFromDialog(dialog),
       principal: ALICE_OWNER,
     })) as TriggerStep[];
     expect(probes).toHaveLength(2);
 
     const results = await Promise.all(
       probes.map((probe) =>
-        arcHost.advanceTrigger(probe.arcRunId, dialog, {
-          instructionCoverage: {},
+        arcHost.advanceTrigger(probe.arcRunId, {
           projectDialog: projectorFor(dialog),
           reports: [
             {
@@ -2522,12 +2494,10 @@ function Main() {
         };
         const begin = () =>
           beginActivation(arcHost, dialog, {
-            inbound: inboundFromDialog(dialog),
             principal: ALICE_OWNER,
           });
         const match = (probe: TriggerStep) =>
-          arcHost.advanceTrigger(probe.arcRunId, dialog, {
-            instructionCoverage: {},
+          arcHost.advanceTrigger(probe.arcRunId, {
             projectDialog: projectorFor(dialog),
             reports: [
               {
@@ -2547,15 +2517,10 @@ function Main() {
         expect(probes).toHaveLength(2);
         if (!retiringFirst)
           await expect(match(probes[1]!)).resolves.toEqual([]);
-        const retiredSteps = await arcHost.advanceTrigger(
-          probes[0]!.arcRunId,
-          dialog,
-          {
-            instructionCoverage: {},
-            projectDialog: projectorFor(dialog),
-            reports: [retiringReport],
-          },
-        );
+        const retiredSteps = await arcHost.advanceTrigger(probes[0]!.arcRunId, {
+          projectDialog: projectorFor(dialog),
+          reports: [retiringReport],
+        });
         if (retiringFirst) expect(retiredSteps).toEqual([]);
         const settled = retiringFirst ? await match(probes[1]!) : retiredSteps;
         expect(expectSoleHandshake(settled).requirement).toMatchObject({
@@ -2594,7 +2559,6 @@ function Main() {
     };
     const probe = expectSoleTrigger(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -2606,8 +2570,7 @@ function Main() {
     );
 
     const activated = expectSoleDriver(
-      await arcHost.advanceTrigger(probe.arcRunId, dialog, {
-        instructionCoverage: {},
+      await arcHost.advanceTrigger(probe.arcRunId, {
         projectDialog: projectorFor(dialog),
         reports: [
           {
@@ -2642,14 +2605,12 @@ function Main() {
     };
     const probe = expectSoleTrigger(
       await beginActivation(host, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
     await host.registerArcs([{ source: "deleted-probe", delete: true }]);
     await host.registerArc("deleted-probe", document);
-    const steps = await host.advanceTrigger(probe.arcRunId, dialog, {
-      instructionCoverage: {},
+    const steps = await host.advanceTrigger(probe.arcRunId, {
       projectDialog: projectorFor(dialog),
       reports: [
         {
@@ -2671,10 +2632,9 @@ function Main() {
     await host.stop();
   });
 
-  it("expires unresolved activation probes without later activating them", async () => {
+  it("abandons unresolved activation probes without later activating them", async () => {
     const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
-      activationBatchTtlMs: 5,
     });
     await arcHost.registerArc(
       "expiring-probe",
@@ -2688,15 +2648,13 @@ function Main() { this.trigger = () => judge("event matches"); }
     };
     const probe = expectSoleTrigger(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await arcHost.releaseTrigger(probe.arcRunId);
 
     await expect(
-      arcHost.advanceTrigger(probe.arcRunId, dialog, {
-        instructionCoverage: {},
+      arcHost.advanceTrigger(probe.arcRunId, {
         projectDialog: projectorFor(dialog),
         reports: [
           {
@@ -2816,7 +2774,6 @@ function Main() {
     );
     const probe = expectSoleTrigger(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -3017,7 +2974,6 @@ function Main() {
       {
         reports: [interrupt("external")],
         instructionCoverage: { [first.briefIds.join("+")]: "ignored" },
-        intent: "agent-work",
       },
     ]);
     await waitFor(async () =>
@@ -3185,8 +3141,6 @@ describe("pinned source manifests", () => {
     ]);
     const fresh = expectSoleDriver(
       await host.begin({
-        dialog,
-        inbound: { content: "start" },
         principal: "another-owner",
         projectDialog: projectorFor(dialog),
       }),
@@ -3229,8 +3183,6 @@ describe("pinned source manifests", () => {
         bundle: { "guide/": "/tmp/original-manifest" },
       });
       const [gate] = await host.begin({
-        dialog,
-        inbound: { content: "start" },
         principal: ALICE_OWNER,
         projectDialog: projectorFor(dialog),
       });
@@ -3252,9 +3204,8 @@ describe("pinned source manifests", () => {
           (await host.getRunWorkspaceContext(gate.arcRunId)).workspaceBundle,
         ).toEqual({ "guide/": "/tmp/original-manifest" });
         activated = expectSoleDriver(
-          await host.advanceTrigger(gate.arcRunId, dialog, {
+          await host.advanceTrigger(gate.arcRunId, {
             projectDialog: projectorFor(dialog),
-            instructionCoverage: {},
             reports: [
               {
                 outcome: "completed",

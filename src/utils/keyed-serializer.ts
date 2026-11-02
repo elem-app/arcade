@@ -1,6 +1,12 @@
+import { registerRetentionProbe } from "./retention-registry.js";
+
 /** Serializes async tasks independently per key. */
 export class KeyedSerializer<Key> {
   readonly #chains = new Map<Key, { tail: Promise<void>; refCount: number }>();
+
+  constructor() {
+    registerRetentionProbe(this, () => ({ keys: this.#chains.size }));
+  }
 
   /** Run `task` after all earlier tasks for `key` have settled. */
   async run<T>(key: Key, task: () => Promise<T>): Promise<T> {

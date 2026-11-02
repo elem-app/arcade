@@ -1,6 +1,6 @@
 {
   "name": "@elem-app/arcade",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "files": [
@@ -31,6 +31,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run --project unit",
     "eval": "pnpm build && node --env-file-if-exists=.env dist/eval-main.js",
+    "test:leak": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run --project leak",
     "prepare": "pnpm build"
   },
   "dependencies": {

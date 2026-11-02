@@ -1,6 +1,6 @@
 import { parse } from "@elem-app/arc/parser";
 import { describe, expect, it, vi } from "vitest";
-import { createTestArcHost } from "./work-event-fixtures.js";
+import { createTestArcHost, workEventsFor } from "./work-event-fixtures.js";
 
 import {
   ArcHostService,
@@ -8,6 +8,7 @@ import {
   HandshakeStore,
   InMemoryArcHostStore,
   InMemoryHistoryStore,
+  probeRetention,
   projectDialog,
   type InboundLifecycleEvent,
   type OutboundMessage,
@@ -70,6 +71,218 @@ async function stageActiveRunChoice(workerHub: WorkerHubService): Promise<{
 }
 
 describe("Inbound submission and messaging", () => {
+  it("gives a successor handshake a fresh deadline while its sibling expires independently", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+    });
+    for (const name of ["first-decision", "second-decision"])
+      await arcHost.registerArc(name, parse(WATCH_SOURCE), {
+        workspaceScope: "arc",
+        bundle: {},
+        contextIsolation: "role",
+      });
+    const { workerHub } = makeWorkerHub({ arcHost });
+    const inbound = {
+      content: "choose",
+      metadata: { principal: ALICE_OWNER, activationPolicy: "choose" },
+    };
+    try {
+      const reader = lifecycleReader(workerHub.submitInbound(inbound));
+      const first = await reader.next();
+      const sibling = await reader.next();
+      if (
+        first.kind !== "handshake-required" ||
+        sibling.kind !== "handshake-required"
+      )
+        throw new Error("Expected choices.");
+      await vi.advanceTimersByTimeAsync(43_200_000);
+      await expect(
+        workerHub.handshake(first.handshakeId, {
+          arcChoice: { activate: true },
+        }),
+      ).resolves.toEqual({ status: "ok" });
+      const next = await reader.next();
+      if (next.kind !== "handshake-required")
+        throw new Error("Expected workspace.");
+      expect(next.arcRunId).toBe(first.arcRunId);
+      expect(next.handshakeId).not.toBe(first.handshakeId);
+      expect(Date.parse(next.expiresAt)).toBe(Date.now() + 86_400_000);
+      await expect(reader.next()).resolves.toMatchObject({
+        kind: "handshake-settled",
+        handshakeId: first.handshakeId,
+        outcome: "proceeded",
+      });
+      await vi.advanceTimersByTimeAsync(43_200_000);
+      await expect(reader.next()).resolves.toMatchObject({
+        kind: "handshake-settled",
+        handshakeId: sibling.handshakeId,
+        outcome: "expired",
+      });
+      expect(probeRetention(workerHub).transient.handshakeCorrelations).toBe(1);
+      await vi.advanceTimersByTimeAsync(43_199_999);
+      expect(probeRetention(arcHost).transient.pendingHandshakes).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(reader.next()).resolves.toMatchObject({
+        kind: "handshake-settled",
+        handshakeId: next.handshakeId,
+        outcome: "expired",
+      });
+      await expect(reader.next()).rejects.toThrow("submission channel closed");
+      expect(vi.getTimerCount()).toBe(0);
+      const recovery = lifecycleReader(workerHub.submitInbound(inbound));
+      const fresh = await recovery.next();
+      if (fresh.kind !== "handshake-required")
+        throw new Error("Expected fresh caller decision.");
+      expect([
+        first.handshakeId,
+        sibling.handshakeId,
+        next.handshakeId,
+      ]).not.toContain(fresh.handshakeId);
+    } finally {
+      await workerHub.stop();
+      await arcHost.stop();
+      expect(vi.getTimerCount()).toBe(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it("expires a handshake during join validation without settling before owned cleanup", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const store = new InMemoryArcHostStore();
+    const arcHost = await createTestArcHost({ store });
+    await arcHost.registerArc("expiry-validation", parse(WATCH_SOURCE));
+    const workerRelease = deferred();
+    const { workerHub } = makeWorkerHub({
+      arcHost,
+      workers: {
+        researcher: async () => {
+          await workerRelease.promise;
+          return { outcome: "completed" };
+        },
+      },
+    });
+    const release = deferred();
+    try {
+      const staged = await stageActiveRunChoice(workerHub);
+      const entered = deferred();
+      const getState = store.getState.bind(store);
+      vi.spyOn(store, "getState").mockImplementationOnce(async (key) => {
+        entered.resolve();
+        await release.promise;
+        return getState(key);
+      });
+      const resolution = workerHub.handshake(staged.handshakeId, {
+        runChoice: { action: "join", arcRunId: staged.arcRunId },
+      });
+      await entered.promise;
+      let settled = false;
+      const outcome = staged.reader.next().then((event) => {
+        settled = true;
+        return event;
+      });
+      await vi.advanceTimersByTimeAsync(86_400_000);
+      expect(settled).toBe(false);
+      expect(probeRetention(workerHub).transient.submissions).toBe(1);
+      release.resolve();
+      await expect(resolution).resolves.toEqual({ status: "missing" });
+      await expect(outcome).resolves.toEqual({
+        kind: "handshake-settled",
+        handshakeId: staged.handshakeId,
+        outcome: "expired",
+      });
+      await expect(staged.reader.next()).rejects.toThrow(
+        "submission channel closed",
+      );
+      expect(await arcHost.getRunView(staged.arcRunId)).toMatchObject({
+        lifecycle: "active",
+      });
+      expect(probeRetention(workerHub).transient.handshakeCorrelations).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      release.resolve();
+      workerRelease.resolve();
+      await workerHub.stop();
+      await arcHost.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports an accepted handshake action after expiry during its history handoff", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+    });
+    await arcHost.registerArc("expiry-accepted", parse(WATCH_SOURCE), {
+      workspaceScope: "arc",
+      bundle: {},
+      contextIsolation: "role",
+    });
+    const ran = deferred();
+    const { workerHub, historyStore } = makeWorkerHub({
+      arcHost,
+      workers: {
+        researcher: async () => {
+          ran.resolve();
+          return { outcome: "completed" };
+        },
+      },
+    });
+    const release = deferred();
+    try {
+      const reader = lifecycleReader(
+        workerHub.submitInbound({
+          content: "start",
+          metadata: { principal: ALICE_OWNER },
+        }),
+      );
+      const gate = await reader.next();
+      if (gate.kind !== "handshake-required")
+        throw new Error("Expected handshake.");
+      const entered = deferred();
+      const append = historyStore.appendEntry.bind(historyStore);
+      vi.spyOn(historyStore, "appendEntry").mockImplementationOnce(
+        async (...args) => {
+          entered.resolve();
+          await release.promise;
+          await append(...args);
+        },
+      );
+      const resolution = workerHub.handshake(gate.handshakeId, {
+        workspace: "/tmp/expiry-accepted",
+      });
+      await entered.promise;
+      let delivered = false;
+      const outcome = reader.next().then((event) => {
+        delivered = true;
+        return event;
+      });
+      await vi.advanceTimersByTimeAsync(86_400_000);
+      expect(delivered).toBe(false);
+      expect(probeRetention(arcHost).transient.actioning).toBe(1);
+      release.resolve();
+      await expect(resolution).resolves.toEqual({ status: "ok" });
+      await expect(outcome).resolves.toMatchObject({
+        kind: "activated",
+        arcRunId: gate.arcRunId,
+      });
+      await expect(reader.next()).resolves.toEqual({
+        kind: "handshake-settled",
+        handshakeId: gate.handshakeId,
+        outcome: "proceeded",
+      });
+      await expect(reader.next()).rejects.toThrow("submission channel closed");
+      await ran.promise;
+      expect(probeRetention(workerHub).transient.handshakeCorrelations).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      release.resolve();
+      await workerHub.stop();
+      await arcHost.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["join", "workspace", "decline"] as const)(
     "preserves the winning submission under concurrent %s handshake resolutions",
     async (kind) => {
@@ -131,6 +344,16 @@ describe("Inbound submission and messaging", () => {
                 : "rejected",
           ...(kind === "decline" ? {} : { reactivationCount: 0 }),
         });
+        expect((await iterator.next()).value).toEqual({
+          kind: "handshake-settled",
+          handshakeId: gate.handshakeId,
+          outcome:
+            kind === "decline"
+              ? "declined"
+              : kind === "join"
+                ? "joined"
+                : "proceeded",
+        });
         await expect(iterator.next()).resolves.toEqual({
           done: true,
           value: undefined,
@@ -171,6 +394,11 @@ describe("Inbound submission and messaging", () => {
           arcRef: gate.arcRef,
           reason: "Arc activation declined by client.",
         },
+      });
+      expect((await iterator.next()).value).toEqual({
+        kind: "handshake-settled",
+        handshakeId: gate.handshakeId,
+        outcome: "declined",
       });
       await expect(iterator.next()).resolves.toEqual({
         done: true,
@@ -260,6 +488,11 @@ describe("Inbound submission and messaging", () => {
         done: false,
         value: { kind: "rejected", arcRef: declined.arcRef },
       });
+      expect((await iterator.next()).value).toEqual({
+        kind: "handshake-settled",
+        handshakeId: declined.handshakeId,
+        outcome: "declined",
+      });
       expect(await arcHost.getRunView(activated.arcRunId)).toEqual(
         runningBefore,
       );
@@ -275,6 +508,11 @@ describe("Inbound submission and messaging", () => {
       await expect(next).resolves.toMatchObject({
         done: false,
         value: { kind: "activated" },
+      });
+      expect((await iterator.next()).value).toEqual({
+        kind: "handshake-settled",
+        handshakeId: pending.handshakeId,
+        outcome: "proceeded",
       });
       await expect(iterator.next()).resolves.toEqual({
         done: true,
@@ -340,6 +578,11 @@ describe("Inbound submission and messaging", () => {
         if (next.done || next.value.kind !== "activated")
           throw new Error("Expected branch activation");
         const { arcRunId } = next.value;
+        expect((await iterator.next()).value).toEqual({
+          kind: "handshake-settled",
+          handshakeId: gate.handshakeId,
+          outcome: "proceeded",
+        });
         runIds.add(arcRunId);
         expect(await arcHost.getRunView(arcRunId)).toMatchObject({
           arcRef: gate.arcRef,
@@ -454,6 +697,11 @@ describe("Inbound submission and messaging", () => {
         if (second?.kind !== "activated")
           throw new Error("Expected independent sibling activation");
         expect(second.arcRunId).not.toBe(firstRunId);
+        expect((await iterator.next()).value).toEqual({
+          kind: "handshake-settled",
+          handshakeId: secondGate.handshakeId,
+          outcome: "proceeded",
+        });
         const remaining = iterator.next().then(
           (value) => ({ value }),
           (error: unknown) => ({ error }),
@@ -461,9 +709,14 @@ describe("Inbound submission and messaging", () => {
         releaseHistory.resolve();
         if (outcome === "failed") {
           await cleanupEntered.promise;
-          // The authoritative error is visible while host cleanup is held.
-          await expect(remaining).resolves.toEqual({ error: failure });
+          let terminated = false;
+          void remaining.then(() => {
+            terminated = true;
+          });
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(terminated).toBe(false);
           releaseCleanup.resolve();
+          await expect(remaining).resolves.toEqual({ error: failure });
           await expect(first).resolves.toEqual({ error: failure });
           await expect(iterator.next()).rejects.toBe(failure);
         } else {
@@ -477,6 +730,11 @@ describe("Inbound submission and messaging", () => {
                 reactivationCount: 0,
               },
             },
+          });
+          expect((await iterator.next()).value).toEqual({
+            kind: "handshake-settled",
+            handshakeId: firstGate.handshakeId,
+            outcome: "proceeded",
           });
           await expect(iterator.next()).resolves.toEqual({
             done: true,
@@ -543,6 +801,11 @@ describe("Inbound submission and messaging", () => {
       expect((await iterator.next()).value).toMatchObject({
         kind: "rejected",
         arcRef: gate.arcRef,
+      });
+      expect((await iterator.next()).value).toEqual({
+        kind: "handshake-settled",
+        handshakeId: gate.handshakeId,
+        outcome: "declined",
       });
       releaseHistory.resolve();
       const activated = (await iterator.next()).value;
@@ -1150,6 +1413,11 @@ function Main() {
       kind: "joined",
       arcRunId: staged.arcRunId,
     });
+    expect(await staged.reader.next()).toEqual({
+      kind: "handshake-settled",
+      handshakeId: staged.handshakeId,
+      outcome: "joined",
+    });
     await expect(staged.reader.next()).rejects.toThrow(
       "submission channel closed before an expected event",
     );
@@ -1175,25 +1443,36 @@ function Main() {
     });
     const staged = await stageActiveRunChoice(workerHub);
     const beginCalls = begin.mock.calls.length;
-    if (!(staged.channel instanceof HotAsyncQueue)) {
-      throw new Error("expected worker hub submission channel");
+    const failure = new Error("Join lifecycle publication failed.");
+    const push = HotAsyncQueue.prototype.push;
+    const publication = vi
+      .spyOn(HotAsyncQueue.prototype, "push")
+      .mockImplementation(function (this: HotAsyncQueue<unknown>, value) {
+        if ((value as { kind?: string }).kind === "joined") throw failure;
+        return push.call(this, value);
+      });
+    try {
+      await expect(
+        workerHub.handshake(staged.handshakeId, {
+          runChoice: { action: "join", arcRunId: staged.arcRunId },
+        }),
+      ).rejects.toBe(failure);
+      await expect(staged.reader.next()).rejects.toBe(failure);
+      expect(begin).toHaveBeenCalledTimes(beginCalls);
+      expect(probeRetention(workerHub).transient).toMatchObject({
+        submissions: 0,
+        handshakeCorrelations: 0,
+      });
+      await expect(
+        workerHub.handshake(staged.handshakeId, {
+          runChoice: { action: "join", arcRunId: staged.arcRunId },
+        }),
+      ).resolves.toEqual({ status: "missing" });
+    } finally {
+      publication.mockRestore();
+      await workerHub.stop();
+      await arcHost.stop();
     }
-    staged.channel.close();
-
-    await expect(
-      workerHub.handshake(staged.handshakeId, {
-        runChoice: { action: "join", arcRunId: staged.arcRunId },
-      }),
-    ).rejects.toThrow("Cannot push to a closed channel.");
-    await expect(staged.reader.next()).rejects.toThrow(
-      "submission channel closed before an expected event",
-    );
-    expect(begin).toHaveBeenCalledTimes(beginCalls);
-    await expect(
-      workerHub.handshake(staged.handshakeId, {
-        runChoice: { action: "join", arcRunId: staged.arcRunId },
-      }),
-    ).resolves.toEqual({ status: "missing" });
   });
 
   it("scopes concurrent run-choice handshakes to their originating submissions", async () => {
@@ -1243,9 +1522,19 @@ function Main() {
       kind: "joined",
       arcRunId: surfaceB.arcRunId,
     });
+    expect(await surfaceB.reader.next()).toEqual({
+      kind: "handshake-settled",
+      handshakeId: surfaceB.handshakeId,
+      outcome: "joined",
+    });
     await expect(surfaceB.reader.next()).rejects.toThrow(
       "submission channel closed before an expected event",
     );
+    expect(await surfaceC.next()).toEqual({
+      kind: "handshake-settled",
+      handshakeId: surfaceCGate.handshakeId,
+      outcome: "joined",
+    });
     await expect(surfaceC.next()).rejects.toThrow(
       "submission channel closed before an expected event",
     );
@@ -1291,6 +1580,11 @@ function Main() {
     await expect(staged.reader.next()).resolves.toMatchObject({
       kind: "joined",
       arcRunId: staged.arcRunId,
+    });
+    expect(await staged.reader.next()).toEqual({
+      kind: "handshake-settled",
+      handshakeId: staged.handshakeId,
+      outcome: "joined",
     });
     expect(worker).toHaveBeenCalledTimes(1);
 
@@ -1388,6 +1682,11 @@ function Sibling() {
       kind: "joined",
       arcRunId: existingRunId,
     });
+    expect(await reader.next()).toEqual({
+      kind: "handshake-settled",
+      handshakeId: runChoice.handshakeId,
+      outcome: "joined",
+    });
 
     await expect(
       workerHub.handshake(
@@ -1400,6 +1699,11 @@ function Sibling() {
     expect(activated).toMatchObject({ kind: "activated" });
     if (activated.kind !== "activated") return;
     expect(activated.arcRunId).not.toBe(existingRunId);
+    expect(await reader.next()).toEqual({
+      kind: "handshake-settled",
+      handshakeId: workspace.handshakeId,
+      outcome: "proceeded",
+    });
     await expect(reader.next()).rejects.toThrow(
       "submission channel closed before an expected event",
     );
@@ -1507,10 +1811,101 @@ function Main() {
     await expect(reader.next()).resolves.toMatchObject({ kind: "activated" });
   });
 
-  it("releases a pending hold when its correlated handshake expires", async () => {
+  it("expires unread submissions and their handshake ownership while WorkEvents are closed", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const arcHost = await createTestArcHost({
       store: new InMemoryArcHostStore(),
-      handshakes: new HandshakeStore({ ttlMs: 0 }),
+    });
+    await arcHost.registerArc("idle-expiry", parse(GREET_SOURCE), {
+      workspaceScope: "arc",
+      bundle: {},
+      contextIsolation: "role",
+    });
+    const { workerHub } = makeWorkerHub({ arcHost });
+    try {
+      for (let round = 0; round < 3; round++) {
+        for (let index = 0; index < 20; index++)
+          workerHub.submitInbound({
+            content: "unread",
+            metadata: { principal: ALICE_OWNER },
+          });
+        await vi.waitFor(() =>
+          expect(
+            probeRetention(workerHub).transient.handshakeCorrelations,
+          ).toBe(20),
+        );
+        expect(probeRetention(arcHost).transient.pendingHandshakes).toBe(20);
+        workEventsFor(arcHost).close();
+        await vi.advanceTimersByTimeAsync(86_400_000);
+        expect(probeRetention(arcHost).transient.pendingHandshakes).toBe(0);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(probeRetention(workerHub).transient).toMatchObject({
+          submissions: 0,
+          handshakeCorrelations: 0,
+        });
+      }
+    } finally {
+      await workerHub.stop();
+      await arcHost.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts a handshake deadline at hub adoption after delayed host delivery", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+    });
+    await arcHost.registerArc("delayed-adoption", parse(GREET_SOURCE), {
+      workspaceScope: "arc",
+      bundle: {},
+      contextIsolation: "role",
+    });
+    const begin = arcHost.begin.bind(arcHost);
+    vi.spyOn(arcHost, "begin").mockImplementationOnce(async (input) => {
+      const steps = await begin(input);
+      vi.setSystemTime(Date.now() + 2 * 86_400_000);
+      return steps;
+    });
+    const { workerHub } = makeWorkerHub({ arcHost });
+    try {
+      const reader = lifecycleReader(
+        workerHub.submitInbound({
+          content: "delayed",
+          metadata: { principal: ALICE_OWNER },
+        }),
+      );
+      const gate = await reader.next();
+      if (gate.kind !== "handshake-required")
+        throw new Error("Expected handshake.");
+      expect(Date.parse(gate.expiresAt)).toBe(Date.now() + 86_400_000);
+      await vi.advanceTimersByTimeAsync(86_399_999);
+      expect(probeRetention(workerHub).transient.handshakeCorrelations).toBe(1);
+      await expect(
+        workerHub.handshake(gate.handshakeId, {}),
+      ).resolves.toMatchObject({ status: "invalid" });
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(reader.next()).resolves.toEqual({
+        kind: "handshake-settled",
+        handshakeId: gate.handshakeId,
+        outcome: "expired",
+      });
+      expect(probeRetention(workerHub).transient).toMatchObject({
+        submissions: 0,
+        handshakeCorrelations: 0,
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await workerHub.stop();
+      await arcHost.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases a pending hold when its correlated handshake expires", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
     });
     await arcHost.registerArc("stock-research", parse(GREET_SOURCE), {
       workspaceScope: "arc",
@@ -1518,34 +1913,42 @@ function Main() {
       contextIsolation: "role",
     });
     const { workerHub } = makeWorkerHub({ arcHost });
-    const reader = lifecycleReader(
-      workerHub.submitInbound({
-        content: "expiring research request",
-        metadata: { clientId: "client-1", principal: ALICE_OWNER },
-      }),
-    );
-    const gate = await reader.next();
-    expect(gate.kind).toBe("handshake-required");
-    if (gate.kind !== "handshake-required") return;
-
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    await expect(
-      workerHub.handshake(
-        gate.handshakeId,
-        { workspace: "/tmp/expired-workspace" },
-        "client-1",
-      ),
-    ).resolves.toEqual({ status: "missing" });
-    await expect(reader.next()).rejects.toThrow(
-      "submission channel closed before an expected event",
-    );
-    await expect(
-      workerHub.handshake(
-        gate.handshakeId,
-        { workspace: "/tmp/expired-workspace" },
-        "client-1",
-      ),
-    ).resolves.toEqual({ status: "missing" });
+    try {
+      const reader = lifecycleReader(
+        workerHub.submitInbound({
+          content: "expiring request",
+          metadata: { clientId: "client-1", principal: ALICE_OWNER },
+        }),
+      );
+      const gate = await reader.next();
+      if (gate.kind !== "handshake-required")
+        throw new Error("Expected handshake.");
+      // Delay timer delivery: answer admission still enforces the original deadline.
+      vi.setSystemTime(Date.parse(gate.expiresAt));
+      await expect(
+        workerHub.handshake(gate.handshakeId, {
+          workspace: "/tmp/expired-workspace",
+        }),
+      ).resolves.toEqual({ status: "missing" });
+      expect(await reader.next()).toEqual({
+        kind: "handshake-settled",
+        handshakeId: gate.handshakeId,
+        outcome: "expired",
+      });
+      await expect(reader.next()).rejects.toThrow(
+        "submission channel closed before an expected event",
+      );
+      await expect(
+        workerHub.handshake(gate.handshakeId, {
+          workspace: "/tmp/expired-workspace",
+        }),
+      ).resolves.toEqual({ status: "missing" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await workerHub.stop();
+      await arcHost.stop();
+      vi.useRealTimers();
+    }
   });
 
   it("returns a workspace handshake after semantic trigger resolution selects a scoped arc", async () => {
@@ -1860,8 +2263,6 @@ describe("source deletion during admission", () => {
       });
       if (kind === "run-choice")
         await host.begin({
-          dialog,
-          inbound: { content: "start" },
           principal: ALICE_OWNER,
           projectDialog: async () => dialog,
         });
@@ -1904,6 +2305,11 @@ describe("source deletion during admission", () => {
         await expect(
           workerHub.handshake(gate.handshakeId, answer),
         ).resolves.toEqual({ status: "missing" });
+        expect((await iterator.next()).value).toEqual({
+          kind: "handshake-settled",
+          handshakeId: gate.handshakeId,
+          outcome: "unavailable",
+        });
         if (sibling) {
           await expect(
             workerHub.handshake(sibling.handshakeId, { decline: true }),
@@ -1911,6 +2317,11 @@ describe("source deletion during admission", () => {
           expect((await iterator.next()).value).toMatchObject({
             kind: "rejected",
             arcRef: sibling.arcRef,
+          });
+          expect((await iterator.next()).value).toEqual({
+            kind: "handshake-settled",
+            handshakeId: sibling.handshakeId,
+            outcome: "declined",
           });
         }
         expect((await iterator.next()).done).toBe(true);
@@ -1929,8 +2340,6 @@ describe("source deletion during admission", () => {
     const host = await makeArcHost();
     await host.registerArc("removed", source);
     const [started] = await host.begin({
-      dialog,
-      inbound: { content: "start" },
       principal: ALICE_OWNER,
       projectDialog: async () => dialog,
     });
@@ -2022,6 +2431,11 @@ describe("source deletion during admission", () => {
       await host.registerArcs([{ source: "removed", delete: true }]);
       release.resolve();
       await expect(resolving).resolves.toEqual({ status: "missing" });
+      expect((await iterator.next()).value).toEqual({
+        kind: "handshake-settled",
+        handshakeId: first.value.handshakeId,
+        outcome: "unavailable",
+      });
       expect((await iterator.next()).done).toBe(true);
       expect(await host.listRunViews()).toEqual([]);
     } finally {
@@ -2047,9 +2461,7 @@ describe("source deletion during admission", () => {
         kind === "run-choice"
           ? (
               await host.begin({
-                dialog,
                 principal: ALICE_OWNER,
-                inbound: { content: "start" },
                 projectDialog: async () => dialog,
               })
             )[0]
@@ -2080,6 +2492,11 @@ describe("source deletion during admission", () => {
         const followup = await iterator.next();
         if (followup.done || followup.value.kind !== "handshake-required")
           throw new Error("Expected follow-up handshake");
+        expect((await iterator.next()).value).toEqual({
+          kind: "handshake-settled",
+          handshakeId: first.value.handshakeId,
+          outcome: "proceeded",
+        });
         await host.registerArcs([{ source: "removed", delete: true }]);
         if (kind === "run-choice") {
           if (existing?.kind !== "action")
@@ -2100,10 +2517,20 @@ describe("source deletion during admission", () => {
             }),
           ).resolves.toEqual({ status: "missing" });
         }
+        expect((await iterator.next()).value).toEqual({
+          kind: "handshake-settled",
+          handshakeId: followup.value.handshakeId,
+          outcome: kind === "run-choice" ? "joined" : "unavailable",
+        });
         await workerHub.handshake(second.value.handshakeId, { decline: true });
         expect((await iterator.next()).value).toMatchObject({
           kind: "rejected",
           arcRef: second.value.arcRef,
+        });
+        expect((await iterator.next()).value).toEqual({
+          kind: "handshake-settled",
+          handshakeId: second.value.handshakeId,
+          outcome: "declined",
         });
         expect((await iterator.next()).done).toBe(true);
         expect(handshakes.listPending()).toEqual([]);

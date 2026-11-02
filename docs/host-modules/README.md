@@ -17,7 +17,7 @@ The module calls the hub's internal `enqueueModuleEffect(arcRunId, effect, signa
 
 ## Contract
 
-`HostCall` describes a submitted occurrence. `HostModuleEffect` describes an outcome that the hub supplies through the host-call variant of `AdvanceInput`. The primary advancement contract belongs to the arc host.
+`HostCall` describes a submitted occurrence. `HostModuleEffect` describes an outcome that the hub supplies through the host-call variant of `AdvanceTriggerInput` and `AdvanceActionInput`. The primary advancement contract belongs to the arc host.
 
 ```ts
 /** Per-interaction context handed to a host-module implementer. */

@@ -291,6 +291,7 @@ export function makeWorkerHub(opts: {
   openAiSdk?: OpenAiSdkBackendTestOptions;
   logger?: ArcadeLogger;
   capacityRetry?: CapacityRetryOptions;
+  submissionQueue?: { maxEvents?: number; maxBytes?: number };
 }): {
   workerHub: WorkerHubService;
   historyStore: HistoryStore;
@@ -315,6 +316,7 @@ export function makeWorkerHub(opts: {
     logger: opts.logger,
     // Default auto-resume off so tests drive resume explicitly; opt in per test.
     capacityRetry: opts.capacityRetry ?? { enabled: false },
+    submissionQueue: opts.submissionQueue,
   });
   bindModuleEffects(opts.arcHost, workerHub);
   workerHub.addBackend(
@@ -399,8 +401,6 @@ export async function firstTaskWithArcHost(): Promise<{
     lastTurns: [],
   };
   const [step] = await arcHost.begin({
-    dialog,
-    inbound: { content: "" },
     principal: ALICE_OWNER,
     projectDialog: async () => dialog,
   });
@@ -471,6 +471,7 @@ function stubLifecycleEvents(
       return [
         {
           kind: "handshake-required",
+          expiresAt: "2099-01-01T00:00:00.000Z",
           arcRunId: receipt.arcRunId ?? "run:selection",
           handshakeId: receipt.handshakeId ?? "handshake:stub",
           requirement,
@@ -634,4 +635,32 @@ export async function firstActivation(
     }
   }
   throw new Error("Submission produced no activation.");
+}
+
+/** Manual absolute clock whose deadline callbacks run without service reads. */
+export function manualDeadlineClock() {
+  let now = Date.now();
+  const timers = new Set<{ at: number; callback: () => void }>();
+  return {
+    now: () => now,
+    schedule(callback: () => void, delayMs: number) {
+      const timer = { at: now + delayMs, callback };
+      timers.add(timer);
+      return () => {
+        timers.delete(timer);
+      };
+    },
+    advanceTo(at: number) {
+      now = at;
+      for (;;) {
+        const due = [...timers].find((timer) => timer.at <= now);
+        if (!due) break;
+        timers.delete(due);
+        due.callback();
+      }
+    },
+    get pending() {
+      return timers.size;
+    },
+  };
 }

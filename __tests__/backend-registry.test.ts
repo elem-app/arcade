@@ -496,120 +496,52 @@ describe("backend registry", () => {
     }
   });
 
-  it("warms the selected worker before non-trigger dispatch with resolved identity", async () => {
+  it("admits preparation inside the selected worker invocation with resolved identity", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
-    const routineStore = executionControlFor(arcHost);
     const workerHub = await createWorkerHub(arcHost);
-    const calls: string[] = [];
-    const warm = vi.fn(async () => {
-      calls.push("warm");
-    });
-    const run = vi.fn(async () => {
-      calls.push("run");
-      return { outcome: "completed" } as const;
-    });
-    workerHub.addBackend(
-      "custom-agent",
-      backend(["role"], () => ({ disposeRoutine: async () => {}, warm, run })),
+    const run = vi.fn(
+      async (_input: RoutineInput) => ({ outcome: "completed" }) as const,
     );
-    await workerHub.start({
-      workers: { roles: { researcher: { backend: "custom-agent" } } },
-    });
-
-    const { arcRunId, routine } = await settleFirstRoutine(
-      workerHub,
-      routineStore,
-    );
-
-    expect(calls).toEqual(["warm", "run"]);
-    expect(warm).toHaveBeenCalledWith({
-      arcRunId,
-      role: "researcher",
-      contextKey: workerContextKey(routine.task, 0),
-      workspacePath: (await arcHost.getRunWorkspaceContext(arcRunId))
-        .workspacePath,
-    });
-  });
-
-  it("continues cold worker execution when warm state is absent or warm fails", async () => {
-    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
-    const routineStore = executionControlFor(arcHost);
-    const workerHub = await createWorkerHub(arcHost);
-    const run = vi.fn(async () => ({ outcome: "completed" }) as const);
     workerHub.addBackend(
       "custom-agent",
       backend(["role"], () => ({
         disposeRoutine: async () => {},
-        warm: () => {
-          throw new Error("no warm state");
-        },
         run,
       })),
     );
     await workerHub.start({
       workers: { roles: { researcher: { backend: "custom-agent" } } },
     });
-
-    const { routine } = await settleFirstRoutine(workerHub, routineStore);
-    expect(routine).toMatchObject({ status: "finished" });
-    expect(routine.error).toBeUndefined();
-    expect(run).toHaveBeenCalledOnce();
-  });
-
-  it("continues cold worker execution when asynchronous warm fails", async () => {
-    const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
-    const routineStore = executionControlFor(arcHost);
-    const { logger, records } = createCapturingLogger();
-    const workerHub = await createWorkerHub(arcHost, logger);
-    const run = vi.fn(async () => ({ outcome: "completed" }) as const);
-    workerHub.addBackend(
-      "custom-agent",
-      backend(["role"], () => ({
-        disposeRoutine: async () => {},
-        warm: async () => {
-          throw new Error("async warm failed");
-        },
-        run,
-      })),
-    );
-    await workerHub.start({
-      workers: { roles: { researcher: { backend: "custom-agent" } } },
-    });
-
     const { arcRunId, routine } = await settleFirstRoutine(
       workerHub,
-      routineStore,
+      executionControlFor(arcHost),
     );
-    expect(routine).toMatchObject({ status: "finished" });
-    expect(routine.error).toBeUndefined();
     expect(run).toHaveBeenCalledOnce();
-    expect(records).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          event: "worker_hub.worker.warm_failed",
-          backend: "custom-agent",
-          role: "researcher",
-          arcRunId,
-        }),
-      ]),
-    );
+    expect(run.mock.calls[0]![0]).toMatchObject({
+      routine: { arcRunId, contextKey: workerContextKey(routine.task, 0) },
+      context: {
+        workspacePath: (await arcHost.getRunWorkspaceContext(arcRunId))
+          .workspacePath,
+      },
+    });
+    await workerHub.stop();
   });
 
-  it("warms the fast-trigger worker with the supplied process workspace", async () => {
+  it("admits the fast-trigger invocation with the supplied process workspace", async () => {
     const arcHost = await makeArcHostWithSource(
       "fast",
       '"arc"; function Main() { this.trigger = () => judge("fast?"); }',
     );
     const workerHub = await createWorkerHub(arcHost);
-    const warm = vi.fn();
+    let workspacePath: string | undefined;
     let captured: RoutineInput["routine"] | undefined;
     workerHub.addBackend(
       "custom-agent",
       backend(["fast-trigger"], () => ({
         disposeRoutine: async () => {},
-        warm,
         run: async (input) => {
           captured = input.routine;
+          workspacePath = input.context.workspacePath;
           const task = input.routine.task;
           return {
             outcome: "completed",
@@ -633,12 +565,8 @@ describe("backend registry", () => {
       kind: "semantic",
       stage: "trigger",
     });
-    expect(warm).toHaveBeenCalledExactlyOnceWith({
-      arcRunId: captured!.arcRunId,
-      role: captured!.task.role,
-      contextKey: workerContextKey(captured!.task, 0),
-      workspacePath: process.cwd(),
-    });
+    expect(workspacePath).toBe(process.cwd());
+    await workerHub.stop();
   });
 
   it("detaches and recursively freezes the routine descriptor at dispatch", async () => {

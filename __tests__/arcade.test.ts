@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { hmd } from "@elem-app/arc/host-utils";
 import { parse } from "@elem-app/arc/parser";
 import { describe, expect, it, vi } from "vitest";
 
@@ -18,10 +19,11 @@ import {
   InMemoryReplayStore,
   InMemoryWorkerHubStore,
   InMemoryWorkEventStore,
+  probeRetention,
   WorkEventService,
 } from "../src/testing.js";
 import type { Connector } from "../src/types/connector.js";
-import { deferred, waitFor, WATCH_SOURCE } from "./helpers.js";
+import { deferred, hostModule, waitFor, WATCH_SOURCE } from "./helpers.js";
 import { createTestArcHost } from "./work-event-fixtures.js";
 import { submitActivation } from "./worker-hub-helpers.js";
 
@@ -62,8 +64,6 @@ describe("Arcade and internal App lifecycle", () => {
       const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
       const [step] = await seed.begin({
         principal: "owner",
-        dialog,
-        inbound: { content: "start" },
         projectDialog: async () => dialog,
       });
       if (step?.kind !== "action") throw new Error("Expected active seed");
@@ -470,6 +470,128 @@ describe("Arcade and internal App lifecycle", () => {
       "worker.stop",
     ]);
   });
+
+  it.each([
+    { timing: "during shutdown", workerFails: false },
+    { timing: "before shutdown", workerFails: false },
+    { timing: "before shutdown", workerFails: true },
+  ])(
+    "reports host release failure started $timing with worker failure=$workerFails",
+    async ({ timing, workerFails }) => {
+      const root = await arcadeRoot();
+      const running = deferred();
+      const finishWork = deferred();
+      const releasing = deferred();
+      const finishRelease = deferred();
+      const releaseFailure = new Error("host module release failed");
+      const workerFailure = new Error(
+        "worker stop failed alongside host release",
+      );
+      const workerStop = vi.fn(async () => {
+        finishWork.resolve();
+        if (workerFails) throw workerFailure;
+      });
+      const startup = await options(
+        root,
+        {
+          supportedSlotKinds: new Set(["default"]),
+          createWorker: () => ({
+            disposeRoutine: async () => {},
+            run: async () => {
+              running.resolve();
+              await finishWork.promise;
+              return { outcome: "completed" };
+            },
+            stop: workerStop,
+          }),
+        },
+        { backend: "custom" },
+      );
+      const arcade = await startArcade(startup);
+      const releaseRun = vi.fn(async () => {
+        releasing.resolve();
+        await finishRelease.promise;
+        throw releaseFailure;
+      });
+      await arcade.arcHost.registerHostModule("release-test", {
+        ...hostModule(
+          arcade.workerHub,
+          hmd.define({ watch: () => {} }),
+          () => undefined,
+        ),
+        releaseRun,
+      });
+      await arcade.arcHost.registerArc(
+        "release-test",
+        parse(`"arc";
+        import Watch from "host:release-test";
+        function Main() {
+          this.trigger = () => true;
+          Watch.$watch();
+          $instruct("work");
+        }
+      `),
+      );
+      const hostStop = vi.spyOn(arcade.arcHost, "stop").mockClear();
+      try {
+        await submitActivation(arcade.workerHub, "start");
+        await running.promise;
+        if (timing === "before shutdown") {
+          vi.spyOn(arcade.arcHost, "advanceAction").mockRejectedValueOnce(
+            new Error("action advancement failed"),
+          );
+          finishWork.resolve();
+          await releasing.promise;
+        }
+        let done = false;
+        void arcade.done.then(() => {
+          done = true;
+        });
+        const stopping = arcade.stop();
+        const reported = stopping.then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        await releasing.promise;
+        await waitFor(() => workerStop.mock.calls.length === 1);
+        expect(done).toBe(false);
+        expect(hostStop).not.toHaveBeenCalled();
+        expect(probeRetention(arcade.workerHub).transient.scopeReleases).toBe(
+          1,
+        );
+        finishRelease.resolve();
+        const error = await reported;
+        expect(error).toBeInstanceOf(AggregateError);
+        if (!(error instanceof AggregateError))
+          throw new Error("Expected shutdown failure");
+        expect(error.errors).toEqual(
+          workerFails ? [workerFailure, releaseFailure] : [releaseFailure],
+        );
+        expect(done).toBe(true);
+        expect(hostStop).toHaveBeenCalledTimes(1);
+        expect(releaseRun).toHaveBeenCalledTimes(1);
+        expect(probeRetention(arcade.arcHost).transient).toMatchObject({
+          actioning: 0,
+          moduleExecutions: 0,
+          actionReleases: 0,
+        });
+        expect(probeRetention(arcade.workerHub).transient).toMatchObject({
+          scopes: 0,
+          scopeReleases: 0,
+          retiringRoutines: 0,
+          taskInvocations: 0,
+        });
+        await expect(arcade.stop()).rejects.toMatchObject({
+          errors: error.errors,
+        });
+        expect(releaseRun).toHaveBeenCalledTimes(1);
+      } finally {
+        finishWork.resolve();
+        finishRelease.resolve();
+        await arcade.stop().catch(() => {});
+      }
+    },
+  );
 
   it("settles done before normal stop reports aggregated connector and worker failures", async () => {
     const root = await arcadeRoot();

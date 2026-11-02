@@ -23,6 +23,36 @@ import {
 } from "./backend-helpers.js";
 
 describe("OpenAiSdkTstWorker", () => {
+  it("aborts active OpenAI TST execution on stop and fences later provider entry", async () => {
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const run = vi.fn(async (input: Parameters<OpenAiSdkTstRunFn>[0]) => {
+      await new Promise<void>((resolve, reject) => {
+        input.signal.addEventListener(
+          "abort",
+          () => reject(new Error("run aborted")),
+          { once: true },
+        );
+        entered();
+      });
+      return {};
+    });
+    const worker = new OpenAiSdkTstWorker({ apiKey: "mock", run });
+    const running = runSemantic(worker, judgmentTask());
+    const rejected = expect(running).resolves.toMatchObject({
+      cancellation: "superseded",
+    });
+    await started;
+    await worker.stop();
+    await rejected;
+    await expect(runSemantic(worker, judgmentTask())).rejects.toThrow(
+      "stopped",
+    );
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
   it("resolves judgment-only semantic reports through the OpenAI tst backend", async () => {
     const backend = new OpenAiSdkTstWorker({
       apiKey: "sk-test",

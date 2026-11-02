@@ -127,31 +127,39 @@ Connectors call `WorkerHubService` for every operation that affects a run: submi
 
 ### Messaging API
 
-#### `submitInbound(message)`
+#### `submitInbound(message, options?)`
 
 ```ts
-submitInbound(message: InboundMessage): AsyncIterable<InboundLifecycleEvent>
+submitInbound(
+  message: InboundMessage,
+  options?: { signal?: AbortSignal },
+): AsyncIterable<InboundLifecycleEvent>
 ```
 
-Submits one inbound message and returns its lifecycle channel. An inbound message carries content, an optional run ID, an optional logical audience, and connector metadata. The worker hub accepts two forms:
+Submits one inbound message and returns its lifecycle event stream. An inbound message carries content, an optional run ID, an optional logical audience, and connector metadata. The worker hub accepts two forms:
 
 - An **activation request** has no run ID and no `metadata.askId`. It enters Arc trigger evaluation and may settle idle, activate a fresh run, re-enter a deflected run, or stage an activation handshake. If activation commits the message to run history, the message's audience is its logical author.
 - An **ask answer** has a run ID and a hub-generated `metadata.askId`. It settles only the live ask identified by that exact pair. The ask, rather than the connector, supplies the logical audience and asking role recorded in history.
 
 Any other message is rejected without changing history or dispatching work. This covers an activation request carrying `metadata.askId`, a missing or malformed `askId`, an unknown or already settled ask, and an ask belonging to another run.
 
-Processing is asynchronous: the channel is returned immediately, and processing proceeds whether or not the caller consumes it. An activation request emits branch decisions and per-routine trigger failures, and its channel closes once all admission outcomes have been delivered and no trigger evaluation or handshake remains outstanding; an empty channel means no Arc matched. An ask answer emits one terminal `continued` or `rejected` event. An infrastructure failure fails the channel instead of producing an event.
+Processing starts immediately and proceeds independently of event consumption. Consume the returned stream for activation decisions and trigger failures, or one `continued` or `rejected` answer outcome. A request with no match produces no events. The stream ends, or throws an infrastructure error, after admission or answer delivery and owned cleanup finish. Activated runs continue independently.
 
 Lifecycle events:
 
 - `activated`: a fresh activation or deflected re-entry produced a run and scheduled Arc work.
 - `joined`: an active run was attached to the originating client session without Arc actioning.
 - `continued`: an ask answer settled its ask.
-- `handshake-required`: activation is gated on a handshake. Resolving it pushes the follow-on events onto the same channel.
+- `handshake-required`: activation awaits a handshake until its absolute ISO `expiresAt` deadline. Resolution or expiry produces follow-on events on the same stream.
+- `handshake-settled`: the named `handshakeId` has ended; remove its pending decision. Its outcome is `proceeded`, `joined`, `declined`, `expired`, `cancelled`, or `unavailable`. It follows any resulting branch event.
 - `rejected`: a match was refused, or the inbound violated a routing or authorization invariant.
 - `failed`: one trigger routine failed, carrying the run ID, routine ID, and the report message as the reason. Other trigger evaluations continue, so further events may follow. The `routine:failed` work event retains the code and message.
 
 `activated` and `handshake-required` arrive in no guaranteed order. A consumer that needs the full activation set accumulates events until the channel closes.
+
+To abandon a submission, abort the supplied signal and consume through stream termination. An already-aborted signal prevents admission. Cancellation stops unclaimed work; claimed operations finish with their actual outcomes. Exiting the iterator alone leaves the submission active.
+
+`WorkerHubServiceOptions.submissionQueue` sets the buffer limits, defaulting to 256 events and 1 MiB of UTF-8 JSON. Overflow cancels uncommitted admission and fails the stream. Stream failure discards buffered events; connectors also discard their pending handshake entries.
 
 To follow an admitted activation, retain `(arcRunId, reactivationCount)` from `activated` or `joined` and compare with the same run's actioning view from [`getRunView`](#getrunviewarcrunid). An equal count means its current lifecycle describes that activation. A greater count proves the followed activation deflected, because only deflection permits same-ID reactivation. A missing or preparation view, or a smaller count, is unavailable or inconsistent with the receipt and establishes no activation outcome. This comparison applies to a receipt-established activation, not an arbitrary lower number: successors can start at nonzero counts.
 
@@ -161,7 +169,7 @@ Pause, parks, interruption, resume, and reconstruction preserve the count. Compl
 
 A worker asks by emitting an outbound message with cause `question` or by calling the permission effect. The outbound message carries an Arcade-generated `metadata.askId`, which is the answer-routing identity, and is ready to accept an answer when it reaches the registered handlers. A provider-local tool-call ID may appear as `metadata.toolCallId` as correlation evidence.
 
-The connector answers through `submitInbound` with the ask's `askId` and run ID. The first valid answer settles the ask. A connector that may hold stale asks, for example after joining a run or after Arcade restarts, reads the asks still live through [`listAsks`](#listasksarcrunid-situation).
+The connector answers through `submitInbound` with the ask's `askId` and run ID. The first valid answer claims the ask; cancellation before that claim leaves it available. A connector that may hold stale asks, for example after joining a run or after Arcade restarts, reads the asks still live through [`listAsks`](#listasksarcrunid-situation).
 
 - A question answer appends one role-private history entry under the ask's audience and role before the worker receives it. If that append fails, the submission fails and the connector can retry while the routine remains live.
 - A permission answer carries its verdict in `metadata.decision` as `allow`, `deny`, or `allow_this_run`, optionally with `metadata.updatedInput`, and uses `content` as an optional human-readable message. A missing or unknown decision is rejected and leaves the ask live. Permission answers write no dialog history.
@@ -214,7 +222,7 @@ The receipt reports whether the resolution was accepted:
 
 Fresh activation and deflected re-entry continue with the original inbound. Joining an active run emits `joined` and attaches the originating client session without advancing Arc work or delivering the inbound. Decline emits `rejected` with the Arc ref and diagnostic `"Arc activation declined by client."`; candidate runs remain unchanged. Connectors own presentation of requirements and diagnostics.
 
-Resolutions of the same handshake ID serialize at the host through validation and consumption, and at the hub through lifecycle delivery and branch bookkeeping. The first valid decision consumes it; later resolutions return `missing`, including expiry during validation. Invalid answers retain retryability. Different handshake IDs remain independent.
+The first accepted decision consumes the handshake; later resolutions return `missing`. The hub expires unanswered decisions 24 hours after adoption. Invalid answers preserve that deadline, expiry during validation returns `missing`, and a claim accepted before expiry completes with its actual outcome.
 
 Each handshake settles only its own activation branch; other outstanding branches and completed activations or joins are unaffected. The submission channel closes when no branch remains outstanding. A submission or lifecycle delivery failure fails the originating channel, after which resolving its handshakes returns `missing`.
 
@@ -232,7 +240,7 @@ Execution control pauses, parks, and resumes a run. A run's execution-control st
   - `hub-restarted`: the run was executing when Arcade restarted.
 - `inactive`: the run is completed, deflected, or poisoned.
 
-See [execution control](./arcade.md#execution-control---pause-and-resume) for pause boundaries and park retry policy.
+See [execution control](./arcade.md#execution-control---pause-park-and-resume) for pause boundaries and park retry policy.
 
 #### `getExecutionControlView(arcRunId)`
 
@@ -339,9 +347,11 @@ To drive a run:
    - `rejected`: the match was refused.
 3. Deliver host module outcomes through advancement as they arrive. Host operations can leave a frontier `blocked` with no worker tasks; this frontier remains live while waiting for an outcome. Frontiers expose worker tasks, but no host-call briefs.
 4. Stop the current lap when the frontier reports `canProgress: false`. Read `frontier.status` for its outcome.
-5. Call `releaseAction` when finished with the execution.
+5. Call `releaseTrigger(arcRunId)` to abandon pending trigger or handshake work, or `releaseAction(arcRunId, frontierId)` when finished with an action execution.
 
-Advancement input is either worker feedback or one host module outcome. Worker feedback carries the routine reports and the per-instruction coverage for the frontier's tasks; a disposition among the reports decides the move and leaves the other results unacknowledged. A host module outcome carries one host call's resolution, interruption, or failure.
+Advancement accepts worker feedback or one host module outcome; trigger advancement also accepts an explicit step skip. Worker feedback carries the routine reports and, for action advancement, the per-instruction coverage for the frontier's tasks; a disposition among the reports decides the move and leaves the other results unacknowledged. A host module outcome carries one host call's resolution, interruption, or failure.
+
+Both release methods abort the identified work immediately and resolve after cleanup, preserving durable progress and history. Repeated calls join ongoing cleanup and are harmless after retirement. Release returns no successor steps.
 
 Supply a dialog projector with every `begin` and advancement call. The arc host requests the dialog view for the worker role at the run's current position, and a new view whenever the position changes during the call. Projection is scoped to the call. A projector failure poisons the run with `dialog-projection-failed`, and exceeding the per-call transition limit poisons it with `transition-limit-exceeded`.
 
@@ -357,23 +367,34 @@ Opens execution and returns the step worklist. The input either targets a run or
 
 A **targeted** begin names an active run and continues it, returning its `action` step. It returns `[]` when the run is inactive or has no frontier to hand off. It carries only the run ID and the dialog projector; history delivery and connector identity stay with the worker hub. Concurrent begins for the same run are serialized. When resuming saved work, `begin` returns the frontier before delivering overdue host module outcomes; continue handling those outcomes through advancement.
 
-An **activation** begin carries the inbound, its principal, and the trigger-stage dialog, whose history must include the activating inbound. It considers fresh runs under the latest registered documents and eligible deflected runs belonging to the same principal. Deflected runs use their existing Arc version and progress, so they can remain eligible after their source is replaced, even when the latest document no longer matches. Activation choices become available after all trigger evaluations settle.
+An **activation** begin carries the principal of the activating inbound, and its projector's views must include that inbound. It considers fresh runs under the latest registered documents and eligible deflected runs belonging to the same principal. Deflected runs use their existing Arc version and progress, so they can remain eligible after their source is replaced, even when the latest document no longer matches. Fresh and deflected evaluations keep separate run IDs, each with one current frontier. Activation choices become available when their trigger evaluations settle, including through explicit step skips.
+
+Activation input accepts a cancellation `signal` that aborts unclaimed admission, including module setup before run IDs are returned. The call settles after cleanup; accepted actions complete independently. Returned pending work remains available until advancement or release, with the worker hub applying its waiting policy.
 
 An empty result means the call handed off no execution. If the call returns no step for an execution, or rejects, that execution is closed and its resources released. Previously saved run progress is preserved.
 
-#### `advanceTrigger(arcRunId, dialog, input)`
+#### `advanceTrigger(arcRunId, input)`
 
 ```ts
 advanceTrigger(
   arcRunId: ArcRunId,
-  dialog: Dialog,
-  input: AdvanceInput,
+  input: AdvanceTriggerInput,
 ): Promise<ArcHostStep[]>
 ```
 
-Advances trigger evaluation with semantic feedback or a host module outcome. `dialog` is the trigger-stage view; the input's projector supplies role-specific dialog when matched runs begin actioning.
+Advances the named run's current trigger step with semantic feedback, a host module outcome, or `{ skip: { frontierId }, projectDialog }`. A skip relinquishes that step's unanswered work and preserves established matches. A stale skip returns `[]` without effects. Skip cannot be mixed with reports or module outcomes.
 
-Returns another `trigger` step for the next round, the resulting activation steps, or `[]` when there is nothing to hand off yet. A failed or deflected report ends only that trigger evaluation; other matches can still activate. The call returns `[]` while other trigger evaluations remain pending, or returns the successful matches when the last evaluation settles. Keep the submitted report if you need its failure details. Existing deflected runs change only after successful re-entry.
+The call returns another `trigger` step, resulting handshake/action steps, or `[]` while other evaluations remain pending or no result is available. Process every returned step as part of the originating request.
+
+A failed or deflected report ends only that trigger evaluation; successful siblings can still activate when the last evaluation settles. Keep the submitted report if you need its failure details. Existing deflected runs change only after successful re-entry.
+
+#### `releaseTrigger(arcRunId)`
+
+```ts
+releaseTrigger(arcRunId: ArcRunId): Promise<void>
+```
+
+Abandons the named run's pending trigger, handshake, or unclaimed activation preparation. Already claimed actions continue independently. Other pending evaluations can still advance their established matches; releasing the last pending evaluation discards unused collected matches. Use a step skip for best-effort continuation.
 
 #### `advanceAction(arcRunId, frontierId, input)`
 
@@ -381,11 +402,11 @@ Returns another `trigger` step for the next round, the resulting activation step
 advanceAction(
   arcRunId: ArcRunId,
   frontierId: string,
-  input: AdvanceInput,
+  input: AdvanceActionInput,
 ): Promise<ArcHostStep>
 ```
 
-Applies worker feedback or one host module outcome, serialized per run. Worker feedback names the frontier its routine was dispatched from; a host module outcome names the current frontier.
+Applies worker feedback or one host module outcome, serialized per run. A skip input throws `TypeError` before mutation. Worker feedback names the frontier its routine was dispatched from; a host module outcome names the current frontier.
 
 - Worker feedback from a superseded frontier is discarded, and the call returns the current frontier.
 - A duplicate or temporarily inapplicable host module outcome leaves the frontier unchanged and records nothing.
@@ -398,11 +419,9 @@ Returns one `action` step for the same run. Its `frontier.transitions` lists the
 releaseAction(arcRunId: ArcRunId, frontierId: string): Promise<void>
 ```
 
-Releases an execution and its resources after its final result, or when a failure prevents continuation. Further results from that execution can no longer advance the run. The worker hub calls this automatically; keep paused and parked executions open so they can resume.
+Releases an action execution after its final result or when a failure prevents continuation. Further results from that execution cannot advance the run. The worker hub calls this automatically; keep paused and parked executions open so they can resume.
 
-Use any frontier returned by the execution you want to release, including a trigger step's frontier. Releasing twice, or releasing with an older execution's frontier, has no effect. A later `begin` waits for this cleanup before opening a replacement execution.
-
-Release preserves saved run progress and history. Call `begin` to open another execution before further advancement.
+Use any frontier returned by the execution you want to release; an older execution's frontier cannot release a replacement. Call `begin` before further advancement. It waits for cleanup before opening the new execution.
 
 #### `resolveHandshake(id, values, opts)`
 
@@ -410,7 +429,7 @@ Release preserves saved run progress and history. Call `begin` to open another e
 resolveHandshake(
   id: string,
   values: HandshakeResolution,
-  opts: { clientId?: string; projectDialog: DialogProjector },
+  opts: { clientId?: string; projectDialog: DialogProjector; signal?: AbortSignal },
 ): Promise<ResolveHandshakeResult>
 ```
 
@@ -433,7 +452,7 @@ getRunWorkspaceContext(arcRunId: ArcRunId): Promise<{
 
 Returns the workspace path, resolved workspace bundle, and reactivation count used to prepare work for a run. The count starts at zero and increases when a deflected run re-enters; trigger-stage calls report zero.
 
-The activating root's manifest supplies the bundle, including for imported tasks; an ambiguous trigger probe returns an empty bundle. Each result owns its bundle map. Live action and trigger lookups reuse cached immutable snapshot data without reading run state; other IDs use durable state to select their snapshot. Cache misses load the complete snapshot and validate every referenced manifest. See `arcHost.snapshotRuntimeCacheSize` in [configuration](./configuration.md) for retention limits.
+The activating root's manifest in the captured snapshot supplies the bundle, including for imported tasks; an ambiguous trigger probe returns an empty bundle. Each result owns its bundle map.
 
 ### Replay API
 
@@ -519,13 +538,13 @@ Routing sends trigger-stage semantic work to the fast-trigger slot, and other wo
 
 ### Routine Execution
 
-Implement `Worker.run(input)` to handle the supplied task using its routine context, effects, and diagnostics, and return one routine report. Treat the task descriptor as immutable. A throw signals an unexpected worker failure.
+Implement `Worker.run(input)` to prepare and execute the supplied task using its routine context, effects, and diagnostics, and return one routine report. Treat the task descriptor as immutable. A throw signals an unexpected worker failure.
 
-The hub serializes warmup, invocation, and continuity updates by worker instance, run, and context key. Distinct contexts may call `warm` and `run` concurrently, so keep effects, diagnostics, and retained state associated with their routine. Supplied workspaces may be shared; deployments provide filesystem isolation when required.
+The hub serializes invocation preparation, execution, and continuity updates by worker instance, run, and context key. Distinct contexts may call `run` concurrently, so keep effects, diagnostics, and retained state associated with their routine. Supplied workspaces may be shared; deployments provide filesystem isolation when required.
 
 Follow the routine context's resume instruction: `fresh-start` reruns work that paused before its worker began; `continue` asks the worker to continue retained work through its own mechanism. Neither carries text; which turn, if any, continues a provider session is the backend's choice.
 
-`disposeRoutine` releases the routine's resources after its invocation settles. It must be idempotent and preserve other invocations, including a successor using the same context. Worker shutdown releases the remaining resources.
+`disposeRoutine` releases the routine's ownership after its invocation settles. It must be idempotent and preserve other invocations, including a successor using the same context. Backends may retain reusable resources in bounded idle caches after detaching the routine's handlers and payloads. Worker shutdown releases the remaining resources.
 
 ### Routine Reports
 

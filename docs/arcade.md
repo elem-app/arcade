@@ -71,7 +71,7 @@ The three interfaces:
 - **Host interface** (worker hub <-> Arc host):
   - Arc registration and run-state reads.
   - Activation and re-entry through `begin(...)`.
-  - Worker feedback and host module outcomes through `advanceTrigger(...)` / `advanceAction(...)`, and process-local cleanup through `releaseAction(...)`.
+  - Trigger and action advancement from worker feedback and host module outcomes, with explicit step skipping and run release.
   - Activation-handshake staging and resolution.
   - Artifact and workspace context reads.
   - Traversal and lifecycle persistence, owned by the host.
@@ -121,7 +121,7 @@ Applications own the source catalog and register it with the arc host. One `regi
 
 Each source revision stores its parsed document and normalized manifest in one immutable document record. A snapshot references those records and captures the imported host-module declarations. Fresh probes capture the latest revisions when probing starts; runs and deflected re-entry retain their snapshots. The worker hub resolves task metadata through the corresponding run or probe snapshot. The activating root's bundle map governs imported work and survives source replacement, deletion, and reconstruction. Rewind retains the original map; jump uses the candidate snapshot's map. Workspace paths and captured context isolation retain their run-owned lifecycle.
 
-The arc host shares immutable snapshot-data loads between workspace and runtime lookup. Concurrent reads of one snapshot share a load; completed data and compiled runtimes each have a bounded LRU cache controlled by `snapshotRuntimeCacheSize`. Live action and trigger lookups capture snapshot identity before awaiting and perform no snapshot, document-record, or run-state reads while their required entries are resident. Host-module registry changes clear compiled runtimes while retaining immutable data for validation and reconstruction. Fresh trigger rounds can pin different snapshot IDs, so each new ID has its own cold load. The worker hub continues to resolve workspace and node metadata before dispatch and reuses that metadata in Work events.
+The arc host reuses immutable snapshot data and compiled runtimes through bounded caches controlled by [`snapshotRuntimeCacheSize`](./configuration.md#app-config). Workspace and node metadata remain tied to the run or probe's captured snapshot, including after source replacement or deletion.
 
 Source deletion removes fresh discovery and invalidates pending fresh selections for the removed roots. Those handshakes resolve as `missing`, including after the source is registered again. Existing runs and their snapshots remain available. The application retains the referenced bundle directories and keeps their contents stable while runs use them. Source-name diagnostic storage records the last written document; the application rebuilds live catalog membership when starting Arcade. Immutable document records require valid manifest metadata.
 
@@ -145,11 +145,11 @@ See [host module implementation](./host-modules/README.md) for wiring, submissio
 
 An Arc run is one durable execution of one Arc.
 
-A run begins when an inbound message from a connector activates an Arc trigger. From that point on, Arcade records the run's history, traversal state, artifacts, pending handshakes, emitted outbound messages, and completed agent work.
+A run begins when trigger evaluation and any required handshake admit an Arc. From that point on, Arcade records its history, traversal state, artifacts, emitted outbound messages, and completed agent work.
 
 Arcade does not require every inbound message to create a run. If no Arc matches, the submission is idle. If an Arc needs more information before it can start, such as a workspace or a run-choice decision, Arcade returns a handshake instead of inventing a guess. Arcs discovered from connector working roots carry the discovered workspace path into fresh activation; packaged arcs remain workspace-less and still use a workspace handshake when their policy requires one.
 
-The Arc host advances a run one step at a time: the caller reports where the run stands, the host returns the next work, the caller carries it out and comes back.
+The Arc host advances a run one step at a time: the caller reports where the run stands, the host returns the next work, the caller carries it out and comes back. The worker hub gives each trigger step 24 hours, then skips its unanswered work and continues with established matches or successor steps. Each successor receives a fresh deadline. This policy is internal; action execution has no corresponding hub timeout.
 
 Every run is addressed by id, and its traversal progress lives in durable state. The host also retains process-local coordination state, including pending handshakes, live execution capabilities, and action frontier identities.
 
@@ -159,11 +159,11 @@ Existing runs can be joined through two activation paths. Selecting an active ru
 
 Interruptions and deflections redirect a run's traversal. Arc handles each one, including catch evaluation and propagation, and determines the resulting traversal. The arc host records the occurrence and returns the resulting frontier, which the hub follows: it dispatches catch work or ends the lap.
 
-An interruption comes from a host module outcome, such as a due timeout, or from a worker's interrupt disposition. The interruption occurrence records its issuance regardless of whether Arc catches it. A caught interruption may produce replacement work. An uncaught interruption ends the current lap and leaves the run parked as `uncaught-interruption` until it is resumed; see [Parking](#parking). A deflection arises from Arc evaluation or from a worker's deflect disposition. A deflected run can later be selected for re-entry.
+An interruption comes from a host module outcome, such as a due timeout, or from a worker's interrupt disposition. The interruption occurrence records its issuance regardless of whether Arc catches it. A caught interruption may produce replacement work. An uncaught interruption ends the current lap and leaves the run parked as `uncaught-interruption` until it is resumed; see [Park](#park). A deflection arises from Arc evaluation or from a worker's deflect disposition. A deflected run can later be selected for re-entry.
 
 A worker disposition concludes its task's whole frontier rather than answering the task. The hub runs no further tasks of the batch, and the disposition overrides the batch's other results: they answer a frontier that no longer stands, so Arc reissues whatever work remains.
 
-A host module interruption can arrive while workers are running or waiting for answers. A due timeout remains pending until Arc permits interruption and execution control permits progress. Paused and parked runs retain pending deadlines for resume. On such an interruption, the worker hub cancels superseded worker work and settles its unanswered asks. It retains the old routine until invocation and eventual disposal finish; disposal does not hold the run queue. Backend warmup and invocation serialize within each worker, run, and context, so a replacement using the same context waits for the old invocation and its writes. Independent contexts can execute concurrently on the same worker. The arc host uses the feedback's originating frontier ID to reject obsolete results.
+A host module interruption can arrive while workers are running or waiting for answers. A due timeout remains pending until Arc permits interruption and execution control permits progress; paused and parked runs retain it for resume. On admission, the hub cancels superseded work and settles its unanswered asks before dispatching replacement work. Old routines remain owned through disposal, and obsolete feedback cannot advance the replacement frontier.
 
 ### Handshakes
 
@@ -175,9 +175,9 @@ A handshake is a staged question from Arcade to the connector client during trig
 
 An accepted answer activates or joins a run, stages a follow-up handshake, or rejects the branch. Any pending handshake can be declined with `{ decline: true }`, which rejects its activation without changing candidate runs. Connectors decide when to proceed or decline under their own policy. Invalid answers leave the handshake pending; the connector logs the host diagnostic and renders retry guidance from the requirement.
 
-Each branch settles independently. Activated siblings and other pending handshakes continue, and the originating submission channel closes when no branch remains outstanding.
+Each branch reports its outcome on the originating submission's lifecycle stream. Other branches continue independently, and the stream closes when admission is complete. See the [messaging API](./service-apis.md#messaging-api) for event and resolution contracts.
 
-Handshakes live only in memory and do not survive a process restart. They expire after about ten minutes, with collection occurring on the next store access. A pending handshake holds no partial durable run. After expiry or restart, callers can resubmit to attempt activation again; already activated siblings remain intact.
+Handshakes live only in memory. The hub gives each decision 24 hours and publishes its deadline; invalid answers keep that deadline. Expiry or restart makes the decision unavailable. A caller can submit a fresh activation request, which evaluates current state without undoing already activated siblings. The deadline is an internal policy.
 
 ### Replay, Jump, And Rewind
 
@@ -359,14 +359,16 @@ The connector is also where deployment-specific authorization belongs. For examp
 
 ## Inbound Messages
 
-An inbound message is channel-neutral content submitted by a connector.
+An inbound message is channel-neutral content submitted by a connector in one of two forms:
 
-- A free inbound has no `arcRunId`. It requests activation and may settle idle, activate fresh or planned work, or emit a `handshake-required` lifecycle event. Selecting an active run produces `joined` and additively attaches the submitting client session. Starting a fresh run or re-entering a deflected run produces `activated`.
+- A free inbound has no `arcRunId`. It requests activation and may settle idle, activate a fresh run or re-enter a deflected run, or emit a `handshake-required` lifecycle event. Selecting an active run produces `joined` and additively attaches the submitting client session. Starting a fresh run or re-entering a deflected run produces `activated`.
 - An ask-targeted inbound carries both `arcRunId` and a non-empty hub-generated `metadata.askId`. Its sole current purpose is to answer that exact live question or permission ask. Successful settlement produces `continued`, the category-level success event for a validated run-targeted inbound. The ask supplies the logical audience and asking role, while the connector supplies and verifies its concrete principal and session authority.
 
 A free inbound carrying `metadata.askId`, or a targeted inbound without a matching live `askId`, is rejected before the arc host, history, or worker dispatch. Other inbound metadata remains connector context and grants no routing authority.
 
-Pause and resume remain explicit execution-control operations. Active attachment exposes the run's current execution-control state but does not resume it. Additional targeted purposes such as steering require their own future authority and execution contract.
+`submitInbound` returns a lifecycle event stream whose termination marks completed admission or answer delivery, including cleanup. Activated runs continue independently. An optional `AbortSignal` cancels unfinished submission work; stopping iteration alone leaves it active. Processing and cleanup proceed without a reader. The [submission API](./service-apis.md#submitinboundmessage-options) defines cancellation, event ordering, and buffer limits.
+
+Pause and resume are explicit execution-control operations. Joining a run exposes its current execution-control state without resuming it.
 
 ## Agent Workers
 
@@ -384,7 +386,7 @@ Suspensions retain the selected worker and underlying continuation; the caller s
 
 The worker hub refreshes action frontiers before dispatch, after supersession cleanup, and before resuming a suspended worker. Its first refresh after activation replaces the held-inbound projector once the inbound is recorded in history. Later runtime transitions request the current role's dialog through this capability.
 
-The arc host retains action state in its live action session. The worker hub keeps one current work scope per run; queued work, effects, and paused continuations refer directly to their scope. Supersession closes old work before replacement dispatch. Completion releases both the host session and the hub scope. A driver failure also releases them, including when worker disposal fails after the host has produced live catch work. Released scopes fence queued continuations and captured effects, and released sessions fence timer progress. These cleanup operations preserve committed run state; explicit entry can reconstruct it later.
+The arc host owns live action execution; the worker hub owns each run's current tasks, effects, asks, and continuations. Completion, supersession, and driver failure retire the affected work while preserving committed run state for later reconstruction. The hub disposes routines after their invocations settle; backends may retain reusable resources in bounded idle caches.
 
 The [failure handling policy](#failure-handling-policy) defines how reports and exceptions affect routines, trigger probes, runs, and submissions. The backend translates recognized provider conditions into reports; the worker hub applies the corresponding handling at the owning boundary.
 
@@ -425,15 +427,13 @@ Filesystem, shell, and code operations use the SDK's native Claude Code tools ra
 
 Not every native action needs approval. Operations confined to the run's own workspace are pre-trusted and run without asking. Approval is required when an action reaches beyond that workspace: reading, writing, or searching a location elsewhere on the host, running a shell command, or fetching from the network.
 
-When a worker attempts such an action, Arcade suspends it and asks the permission approver to decide. The approver can allow the action once, deny it, or allow it for the remainder of the run. A denial returns to the worker with the action refused, leaving it to continue differently or stop. A later run starts without remembered approvals.
+When a worker attempts such an action, Arcade suspends it and asks the permission approver to decide. The approver can allow the action once, deny it, or allow it and temporarily remember that approval within the run. A denial returns to the worker with the action refused, leaving it to continue differently or stop. A later run starts without remembered approvals.
 
-Allowing an action for the remainder of the run remembers the approval for the managed context owner so that matching later actions in that context proceed without asking again. Under role isolation, that approval is available to later tasks in the same role context, including work from another node using that role. Under node isolation, it remains with the node context, so a same-role sibling node asks again.
+`allow_this_run` temporarily remembers approval within the [managed context owner](#managed-context-isolation). Filesystem grants cover the approved path and its descendants; command grants cover the same effective invocation; other capabilities such as network fetch are scoped by tool. Tools without a safe grant discriminator, such as `write_stdin`, require a new decision each time. Stock SDK grants expire five minutes after approval without renewal on reuse. Capacity eviction or restart may forget them sooner, causing another permission request. Provider-side approval rules cannot broaden or outlive these grants.
 
-The only thing that further narrows an approval is the path a filesystem action touches: that action is remembered for its path and everything beneath it, so a different path still raises a fresh ask. Every other action is remembered as the whole capability. Approving one shell command authorizes later matching shell commands in that context, and approving one network fetch authorizes later fetches in that context; the address a fetch reaches does not narrow the approval, even though it is a location of its own.
+Claude can reuse a healthy completed query for a later routine with the same context, cwd, and provider identity. Its bounded idle cache and separate prepared-start pool reduce startup cost; active routines and paused continuations retain their queries until completion or cancellation. See [worker configuration](./configuration.md#worker-slots-and-backend-registration) for cache settings and defaults.
 
-A live Claude query belongs to its routine through execution, questions, and paused continuation, until disposal, failure, cancellation, invocation timeout, or shutdown. Capacity and idle expiry govern unused prepared starts. Diagnostics distinguish `preparedStartUsed` from `liveSessionReused`.
-
-The Claude worker stores session continuity under its slot-scoped worker state using Arcade's opaque versioned context key. The stored session id survives query disposal. Before adding `resume` to a query, the worker resolves a non-secret provider, endpoint, and credential-scope identity and requires that identity and cwd to match the stored record. A mismatch or unavailable pre-resume identity starts a fresh session. A newly observed session id advances the state immediately.
+The Claude worker also persists session identity in slot-scoped state under Arcade's context key, so continuity can survive query disposal. Resume requires a matching cwd and non-secret provider, endpoint, and credential-scope identity; otherwise a fresh session starts. Suspended routines retain their exact continuation.
 
 The backend uses the SDK's default authentication behavior, so deployments can use `ANTHROPIC_API_KEY` or local Claude Code authentication supported by the installed SDK.
 
@@ -441,7 +441,7 @@ The backend uses the SDK's default authentication behavior, so deployments can u
 
 The OpenAI Agents SDK general backend is selected with `workers.default.backend = "openai-sdk"` or `workers.roles.<role>.backend = "openai-sdk"`. It is opt-in and separate from the tst backend used by `workers.fastTrigger`.
 
-Instruction runs use `SandboxAgent` with the Unix local sandbox and mount the resolved run workspace path inside the sandbox at `/workspace`. The execution cwd follows the same override order and hub-owned workspace contract as the Claude SDK backend. The backend consumes the existing directory and materializes its sandbox bundle copies inside it.
+Instruction runs use `SandboxAgent` with the Unix local sandbox and mount the resolved run workspace path at `/workspace`. The execution cwd follows the same override order as the Claude SDK backend. The backend creates temporary bundle copies in that workspace and removes them when their last routine owner finishes; source bundles remain application-owned.
 
 Arcade-owned worker tools are exposed as SDK function tools:
 
@@ -452,7 +452,7 @@ The OpenAI worker receives the same fixed interaction policy and per-assignment 
 - `ask_audience({ audience?, questions })` asks one to four structured questions and returns `{ answers }`. Unlike the Claude managed tool, an omitted audience defaults to `originator`; a named non-originator must match an instruction audience reference. The OpenAI SDK has no native `AskUserQuestion` equivalent here.
 - `report(...)` accepts the same completed-or-failed agent-authored subset as the Claude SDK backend, including the same one-continuation missing-report recovery behavior.
 
-The OpenAI worker stores response continuity under its slot-scoped worker state and the same opaque versioned context key. Resume requires a matching cwd, endpoint, provider, and non-secret credential-scope identity; any mismatch starts a fresh response chain. A newly observed response id advances the state immediately.
+The OpenAI worker persists response continuity in slot-scoped state under the same context key. Resume requires a matching cwd, endpoint, provider, and non-secret credential-scope identity; a mismatch starts a fresh response chain. Paused and retrying routines retain their exact execution state and completed tool results.
 
 Authentication is OpenAI API-key only. When the selected worker slot supplies `apiKeySecret`, that explicit secret is required. When it is unset, Arcade falls back to `OPENAI_API_KEY`, then `${CODEX_HOME}/auth.json` or `~/.codex/auth.json` only if those files contain an API-key value. Codex ChatGPT/session tokens are rejected with a non-secret diagnostic.
 
@@ -467,7 +467,7 @@ Handling a failure means reporting its outcome and releasing resources that are 
 | Class | Examples | Handling |
 | --- | --- | --- |
 | Routine execution failure | A worker reports failure, throws, or returns an invalid report; a required worker or handler is missing. | Record the failed routine and apply the trigger- or action-stage policy below. |
-| Execution suspension | Provider capacity limit, transport loss, or cooperative pause. | Park the work for continuation. Retryable parks can use bounded automatic retries under the [execution-control policy](#execution-control---pause-and-resume). |
+| Execution suspension | Provider capacity limit, transport loss, or cooperative pause. | Park the work for continuation. Retryable parks can use bounded automatic retries under the [execution-control policy](#execution-control---pause-park-and-resume). |
 | Worker unavailable | A worker reports `unavailable`. | Record the work as skipped using the worker's diagnostic. |
 | Infrastructure failure | Required operational storage or workspace preparation fails. | Propagate the exception and release resources owned by the affected operation. |
 | Internal consistency failure | Required execution state is missing, or submission bookkeeping contradicts itself. | Surface the exception through the affected operation. |
@@ -492,23 +492,13 @@ Trigger failure events are nonterminal for the submission. Successful activation
 
 Infrastructure and internal consistency exceptions surface according to the operation:
 
-- **Admission work, including resumed trigger evaluation:** fail the submission channel. The caller's iteration throws after buffered events have been delivered.
+- **Admission work, including resumed trigger evaluation:** fail the submission channel. The caller's iteration throws and buffered payloads are discarded.
 - **Direct execution calls:** reject the returned promise.
 - **Background action execution:** log the exception and park the run as `internal-error`. Other runs and pending admission decisions remain independent.
 
-When a submission channel fails with an exception, the hub releases its pending admission state, parked trigger continuations, and retry timers. Already-running trigger work may finish and write diagnostic records, but its late results are discarded. Cleanup checks prevent those results from recreating resources for the failed submission. Independently activated runs continue.
+A failed submission releases pending admission work and waits for in-flight routines and cleanup. Late results cannot reopen that submission; independently activated runs continue.
 
 An infrastructure problem may affect unrelated operations too. Arcade retains already recorded evidence and leaves the decision to retry or restart the service to the caller or operator. It does not automatically repair infrastructure or cancel all work in flight.
-
-### Extending Failure Handling
-
-Before adding an error handler, cleanup check, or retry mechanism, document:
-
-- Which failure class it handles and which operation owns the response.
-- What the caller observes and which independent work continues.
-- Which resources require cleanup and whether any additional recovery is promised.
-
-Keep the implementation proportional to those requirements. A cleanup check should protect a specific resource or pending operation. Stronger guarantees, such as automatic infrastructure recovery or coordinated cancellation, require an explicit policy change and corresponding contract tests.
 
 ## Execution Control - Pause, Park, and Resume
 

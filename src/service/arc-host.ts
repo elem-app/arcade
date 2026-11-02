@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { readdir, rmdir } from "node:fs/promises";
@@ -81,7 +82,8 @@ import {
 } from "../types/host-module.js";
 import type {
   ActivationPolicy,
-  AdvanceInput,
+  AdvanceActionInput,
+  AdvanceTriggerInput,
   ArcDocumentRecord,
   ArcDocumentSnapshot,
   ArcHostStep,
@@ -97,6 +99,7 @@ import type {
 import { parseArcManifest, type ArcManifest } from "../types/manifest.js";
 import {
   handoffCheckpoint,
+  stripBrief,
   type ActionReplayPosition,
   type ActionReplayStep,
   type CompatibleReplay,
@@ -116,6 +119,13 @@ import type {
   TaskDisposition,
 } from "../types/task.js";
 import { KeyedSerializer } from "../utils/keyed-serializer.js";
+import {
+  readRetention,
+  registerRetentionProbe,
+  type ArcHostRetention,
+  type HandshakeStoreRetention,
+  type KeyedSerializerRetention,
+} from "../utils/retention-registry.js";
 import { HandshakeStore } from "./handshake.js";
 import { audienceDeclaration } from "./host-module-declarations.js";
 import { ModuleExecution } from "./module-execution.js";
@@ -125,7 +135,10 @@ import {
   validateReplayPrefix,
 } from "./replay-history.js";
 import { RecordingRuntime } from "./replay-recorder.js";
-import { matchingReplayCheckpoint } from "./replay-state.js";
+import {
+  advanceHostModuleState,
+  matchingReplayCheckpoint,
+} from "./replay-state.js";
 import {
   alignActionReplay,
   alignTriggerReplay,
@@ -239,11 +252,26 @@ type ActivationCandidateGroup = {
 
 type ActivationBatch = {
   id: string;
+  phase: "collecting" | "finalizing" | "settled";
   dialog: Dialog;
   request: ActivationRequest;
   groups: Map<ArcRef, ActivationCandidateGroup>;
-  pendingProbeIds: Set<ArcRunId>;
-  cancelExpiry: () => void;
+  pendingProbes: Set<ArcRunId>;
+};
+
+type PendingRun = {
+  arcRunId: ArcRunId;
+  released: boolean;
+  claimed: boolean;
+  operations: Set<AdmissionOperation>;
+};
+
+type AdmissionOperation = {
+  cancelled: boolean;
+  failure?: unknown;
+  executions: Set<ModuleExecution>;
+  owners: Set<PendingRun>;
+  done: Promise<void>;
 };
 
 type LiveArcSession =
@@ -263,16 +291,20 @@ type LiveArcSession =
       workspacePath: string;
       // The activation request is captured on the live session so an id-addressed
       // advance can re-derive it (principal / clientId / activationPolicy /
-      // inbound) without the caller threading it back through.
+      // signal) without the caller threading it back through.
       request: ActivationRequest;
       batchId?: string;
       origin?: TriggerProbeOrigin;
+      /** Rendered frontier for `brief`, returned to no-op advances. */
+      frontier?: RunFrontier;
     };
+
+type TriggeringSession = Extract<LiveArcSession, { kind: "triggering" }>;
 
 type PlannedRunStartResult =
   | { kind: "idle" }
   | { kind: "invalid"; reason: string; unavailable?: boolean }
-  | { kind: "trigger"; arcRunId: ArcRunId; frontier: RunFrontier }
+  | Extract<ArcHostStep, { kind: "trigger" }>
   | {
       kind: "matched";
       arcRunId: ArcRunId;
@@ -281,12 +313,15 @@ type PlannedRunStartResult =
     };
 
 type PreparationOperation = {
+  signal?: AbortSignal;
   entry?: Extract<LiveArcSession, { kind: "preparing" }>;
   arcRunId?: ArcRunId;
 };
 
 /** A captured fresh selection whose root registration has been removed. */
 class FreshActivationUnavailable extends Error {}
+
+class AdmissionCancelled extends Error {}
 
 type RunEventCollection = {
   start?: Extract<CreateWorkEventInput, { kind: "run:started" }>;
@@ -323,7 +358,6 @@ const MAX_SETTLE_STEPS = 32;
 const MAX_SETTLE_TRANSITIONS = 256;
 const MAX_TRIGGER_STEPS = 8;
 const DEFAULT_SNAPSHOT_RUNTIME_CACHE_SIZE = 32;
-const DEFAULT_ACTIVATION_BATCH_TTL_MS = 5 * 60 * 1000;
 
 export type ArcHostServiceIssue =
   | {
@@ -353,8 +387,6 @@ export type ArcHostServiceOptions = {
    * one snapshot can still share their in-flight data load.
    */
   snapshotRuntimeCacheSize?: number;
-  /** Maximum lifetime of an unresolved multi-probe activation batch. */
-  activationBatchTtlMs?: number;
   /**
    * Optional replay store. When supplied, the host records the trigger/action
    * brief and report streams plus the action checkpoints for each run, enabling
@@ -367,6 +399,7 @@ export type ArcHostServiceOptions = {
 };
 
 type ActivationRequest = {
+  signal?: AbortSignal;
   /** Connector-tagged client id recorded on staged handshakes. */
   clientId?: string;
   /** Opaque connector-supplied principal for this activation request. */
@@ -388,6 +421,14 @@ type ActivationRequest = {
  * and persists only durable traversal state through `ArcHostStore`.
  */
 export class ArcHostService {
+  readonly #admission = new AsyncLocalStorage<AdmissionOperation>();
+  readonly #admissionOperations = new Set<AdmissionOperation>();
+  readonly #pendingRuns = new Map<ArcRunId, PendingRun>();
+  readonly #triggerReleases = new Map<ArcRunId, Promise<void>>();
+  readonly #actionReleases = new Map<
+    ArcRunId,
+    { execution: ActionSession; cleanup: Promise<void> }
+  >();
   readonly #actionMutations = new KeyedSerializer<ArcRunId>();
   readonly #frontierIds = new WeakMap<object, string>();
   readonly #moduleExecutions = new Map<ArcRunId, ModuleExecution>();
@@ -414,13 +455,14 @@ export class ArcHostService {
   >();
   readonly #liveSessions = new Map<string, LiveArcSession>();
   readonly #activationBatches = new Map<string, ActivationBatch>();
+  readonly #finalizingBatches = new Map<string, ActivationBatch>();
+  readonly #batchOperations = new Set<Promise<unknown>>();
   readonly #reentrySerializer = new KeyedSerializer<ArcRunId>();
   readonly #handshakeResolutions = new KeyedSerializer<string>();
   readonly #artifactRoot: string;
   readonly #handshakes: HandshakeStore;
   readonly #replayStore: ReplayStore | undefined;
   readonly #snapshotRuntimeCacheSize: number;
-  readonly #activationBatchTtlMs: number;
 
   /** Create an Arc host bound to the supplied durable state store. */
   constructor(opts: ArcHostServiceOptions) {
@@ -438,22 +480,55 @@ export class ArcHostService {
         opts.snapshotRuntimeCacheSize ?? DEFAULT_SNAPSHOT_RUNTIME_CACHE_SIZE,
       ),
     );
-    this.#activationBatchTtlMs = Math.max(
-      1,
-      Math.trunc(opts.activationBatchTtlMs ?? DEFAULT_ACTIVATION_BATCH_TTL_MS),
-    );
     this.#hostModules.set("audience", {
       declaration: structuredClone(audienceDeclaration),
     });
     this.#latestRuntime = this.#buildRuntime(new Map());
+    registerRetentionProbe(this, () => this.#retention());
   }
 
-  /** Abort host module resources before waiting for in-flight host operations. */
-  async stop(): Promise<void> {
+  /** Fence admission and abort resources synchronously; stop awaits their disposal. */
+  beginStop(): void {
+    if (this.#stopped) return;
     this.#stopped = true;
-    for (const batch of this.#activationBatches.values()) batch.cancelExpiry();
+    const errors: unknown[] = [];
+    try {
+      this.#handshakes.stop();
+    } catch (error) {
+      errors.push(error);
+    }
+    for (const batch of this.#activationBatches.values()) {
+      batch.groups.clear();
+      batch.pendingProbes.clear();
+    }
     this.#activationBatches.clear();
-    for (const execution of this.#moduleExecutions.values()) execution.abort();
+    for (const owner of this.#pendingRuns.values()) owner.released = true;
+    for (const execution of this.#moduleExecutions.values()) {
+      try {
+        execution.abort();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length)
+      throw new AggregateError(errors, "Host cancellation failed.");
+  }
+
+  /** Await all host cleanup after closing admission and cancelling resources. */
+  async stop(): Promise<void> {
+    const errors: unknown[] = [];
+    try {
+      this.beginStop();
+    } catch (error) {
+      errors.push(error);
+    }
+    const admissions = [...this.#admissionOperations];
+    await Promise.all(admissions.map((operation) => operation.done));
+    errors.push(
+      ...admissions.flatMap((operation) =>
+        operation.failure === undefined ? [] : [operation.failure],
+      ),
+    );
     const results = await Promise.allSettled(
       [...this.#moduleExecutions.keys()].map((arcRunId) =>
         this.#actionMutations.run(arcRunId, () =>
@@ -461,11 +536,87 @@ export class ArcHostService {
         ),
       ),
     );
-    const errors = results.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : [],
+    errors.push(
+      ...results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      ),
     );
+    const batches = await Promise.allSettled([...this.#batchOperations]);
+    errors.push(
+      ...batches.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      ),
+    );
+    const releases = await Promise.allSettled([
+      ...this.#triggerReleases.values(),
+      ...[...this.#actionReleases.values()].map((release) => release.cleanup),
+    ]);
+    errors.push(
+      ...releases.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      ),
+    );
+    this.#pendingRuns.clear();
+    this.#liveSessions.clear();
     if (errors.length)
       throw new AggregateError(errors, "Host execution cleanup failed.");
+  }
+
+  /** Payload-free ownership counts grouped by retention gate. */
+  #retention(): ArcHostRetention {
+    const sessions = { preparing: 0, triggering: 0, actioning: 0 };
+    for (const session of this.#liveSessions.values()) sessions[session.kind]++;
+    return {
+      transient: {
+        ...sessions,
+        pendingHandshakes: readRetention<HandshakeStoreRetention>(
+          this.#handshakes,
+        ).pending,
+        collectingBatches: this.#activationBatches.size,
+        finalizingBatches: this.#finalizingBatches.size,
+        batchOperations: this.#batchOperations.size,
+        pendingProbes: [...this.#activationBatches.values()].reduce(
+          (count, batch) => count + batch.pendingProbes.size,
+          0,
+        ),
+        triggerReleases: this.#triggerReleases.size,
+        actionReleases: this.#actionReleases.size,
+        pendingRuns: this.#pendingRuns.size,
+        admissionOperations: this.#admissionOperations.size,
+        moduleExecutions: this.#moduleExecutions.size,
+        snapshotLoads: this.#snapshotLoads.size,
+        actionMutations: readRetention<KeyedSerializerRetention>(
+          this.#actionMutations,
+        ).keys,
+        reentrySerializations: readRetention<KeyedSerializerRetention>(
+          this.#reentrySerializer,
+        ).keys,
+        handshakeResolutions: readRetention<KeyedSerializerRetention>(
+          this.#handshakeResolutions,
+        ).keys,
+        registryMutations: readRetention<KeyedSerializerRetention>(
+          this.#registryMutations,
+        ).keys,
+      },
+      registrations: {
+        arcs: this.#arcs.size,
+        hostModules: this.#hostModules.size,
+        documentRecords: this.#latestDocumentRecordIds.size,
+      },
+      caches: {
+        snapshotData: this.#snapshotData.size,
+        snapshotRuntimes: this.#snapshotRuntimes.size,
+      },
+    };
+  }
+
+  #trackBatchOperation<T>(operation: Promise<T>): Promise<T> {
+    this.#batchOperations.add(operation);
+    void operation.then(
+      () => this.#batchOperations.delete(operation),
+      () => this.#batchOperations.delete(operation),
+    );
+    return operation;
   }
 
   async #openModuleExecution(
@@ -475,10 +626,22 @@ export class ArcHostService {
     const previous = this.#moduleExecutions.get(arcRunId);
     if (previous) await previous.release();
     if (this.#stopped) throw new Error("The arc host has stopped.");
-    this.#moduleExecutions.set(
+    const execution = new ModuleExecution(
       arcRunId,
-      new ModuleExecution(arcRunId, action, this.#hostModules, this.#logger),
+      action,
+      this.#hostModules,
+      this.#logger,
     );
+    this.#moduleExecutions.set(arcRunId, execution);
+    if (!action) {
+      const owner = this.#ownPending(arcRunId);
+      const operation = this.#admission.getStore();
+      operation?.executions.add(execution);
+      if (owner.released || operation?.cancelled) {
+        execution.abort();
+        throw new AdmissionCancelled();
+      }
+    }
   }
 
   async #retireExecution(arcRunId: ArcRunId): Promise<void> {
@@ -510,21 +673,6 @@ export class ArcHostService {
       this.#frontierIds.set(brief, id);
     }
     return id;
-  }
-
-  /** @internal Inspect process-local session retention in deterministic tests. */
-  getLiveSessionCounts(): {
-    preparing: number;
-    triggering: number;
-    actioning: number;
-  } {
-    const counts = {
-      preparing: 0,
-      triggering: 0,
-      actioning: 0,
-    };
-    for (const session of this.#liveSessions.values()) counts[session.kind]++;
-    return counts;
   }
 
   #actionSession(arcRunId: ArcRunId): ActionSession | undefined {
@@ -562,24 +710,203 @@ export class ArcHostService {
 
   /** Relinquish this execution while preserving its committed durable state. */
   releaseAction(arcRunId: ArcRunId, frontierId: string): Promise<void> {
-    const trigger = this.#liveSessions.get(arcRunKey(arcRunId));
-    if (
-      trigger?.kind === "triggering" &&
-      this.#frontierId(trigger.brief) === frontierId
-    ) {
-      this.#moduleExecutions.get(arcRunId)?.abort();
-      return this.#actionMutations.run(arcRunId, async () => {
-        if (this.#liveSessions.get(arcRunKey(arcRunId)) === trigger)
-          await this.#retireExecution(arcRunId);
-      });
-    }
+    const retiring = this.#actionReleases.get(arcRunId);
+    if (retiring && frontierId.startsWith(`${retiring.execution.generation}:`))
+      return retiring.cleanup;
     const execution = this.#actionSession(arcRunId);
     if (!execution || !frontierId.startsWith(`${execution.generation}:`))
       return Promise.resolve();
     this.#moduleExecutions.get(arcRunId)?.abort();
-    return this.#actionMutations.run(arcRunId, () =>
-      this.#retireAction(arcRunId, execution),
-    );
+    const cleanup = this.#actionMutations
+      .run(arcRunId, () => this.#retireAction(arcRunId, execution))
+      .finally(() => {
+        if (this.#actionReleases.get(arcRunId)?.cleanup === cleanup)
+          this.#actionReleases.delete(arcRunId);
+      });
+    this.#actionReleases.set(arcRunId, { execution, cleanup });
+    return cleanup;
+  }
+
+  /** Abandon pending trigger, preparation, or handshake work and await cleanup. */
+  releaseTrigger(arcRunId: ArcRunId): Promise<void> {
+    const retiring = this.#triggerReleases.get(arcRunId);
+    if (retiring) return retiring;
+    const owner = this.#pendingRuns.get(arcRunId);
+    if (!owner || owner.claimed) return Promise.resolve();
+    owner.released = true;
+    for (const operation of owner.operations) {
+      operation.cancelled = true;
+      for (const execution of operation.executions) execution.abort();
+    }
+    this.#moduleExecutions.get(arcRunId)?.abort();
+    this.#removePendingHandshakes(arcRunId);
+    this.#dropProbe(arcRunId);
+    const operations = [...owner.operations];
+    const cleanup = (async () => {
+      await Promise.all(operations.map((operation) => operation.done));
+      const errors: unknown[] = operations.flatMap((operation) =>
+        operation.failure === undefined ? [] : [operation.failure],
+      );
+      try {
+        await this.#actionMutations.run(arcRunId, () =>
+          this.#retirePending(owner),
+        );
+      } catch (error) {
+        errors.push(error);
+      }
+      if (errors.length === 1) throw errors[0];
+      if (errors.length)
+        throw new AggregateError(errors, "Pending run cleanup failed.");
+    })().finally(() => {
+      if (this.#triggerReleases.get(arcRunId) === cleanup)
+        this.#triggerReleases.delete(arcRunId);
+    });
+    this.#triggerReleases.set(arcRunId, cleanup);
+    return cleanup;
+  }
+
+  #removePendingHandshakes(arcRunId: ArcRunId): void {
+    for (const handshake of this.#handshakes.listPending())
+      if (handshake.triggerSelection.arcRunId === arcRunId)
+        this.#handshakes.invalidate(handshake.id);
+  }
+
+  #dropProbe(arcRunId: ArcRunId): void {
+    for (const batch of this.#activationBatches.values()) {
+      if (!batch.pendingProbes.delete(arcRunId)) continue;
+      if (batch.pendingProbes.size === 0) {
+        this.#activationBatches.delete(batch.id);
+        this.#settleActivationBatch(batch);
+      }
+    }
+  }
+
+  async #retirePending(owner: PendingRun): Promise<void> {
+    if (owner.claimed || this.#pendingRuns.get(owner.arcRunId) !== owner)
+      return;
+    owner.released = true;
+    this.#removePendingHandshakes(owner.arcRunId);
+    this.#dropProbe(owner.arcRunId);
+    try {
+      await this.#retireExecution(owner.arcRunId);
+    } finally {
+      this.#pendingRuns.delete(owner.arcRunId);
+    }
+  }
+
+  #ownPending(arcRunId: ArcRunId): PendingRun {
+    let owner = this.#pendingRuns.get(arcRunId);
+    if (!owner) {
+      owner = {
+        arcRunId,
+        released: false,
+        claimed: false,
+        operations: new Set(),
+      };
+      this.#pendingRuns.set(arcRunId, owner);
+    }
+    const operation = this.#admission.getStore();
+    if (operation) {
+      owner.operations.add(operation);
+      operation.owners.add(owner);
+      if (operation.cancelled) owner.released = true;
+    }
+    if (owner.released || this.#stopped) throw new AdmissionCancelled();
+    return owner;
+  }
+
+  #claimPending(arcRunId: ArcRunId): void {
+    const owner = this.#ownPending(arcRunId);
+    owner.claimed = true;
+    this.#pendingRuns.delete(arcRunId);
+    const execution = this.#moduleExecutions.get(arcRunId);
+    if (execution) this.#admission.getStore()?.executions.delete(execution);
+  }
+
+  async #withAdmission<T>(
+    signal: AbortSignal | undefined,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const operation: AdmissionOperation = {
+      cancelled: false,
+      executions: new Set(),
+      owners: new Set(),
+      done,
+    };
+    const abort = () => {
+      operation.cancelled = true;
+      for (const owner of operation.owners)
+        if (!owner.claimed) owner.released = true;
+      for (const execution of operation.executions) execution.abort();
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    this.#admissionOperations.add(operation);
+    let failed = false;
+    try {
+      return await this.#admission.run(operation, run);
+    } catch (error) {
+      failed = true;
+      const abortedExecution =
+        (operation.cancelled || this.#stopped) &&
+        error instanceof Error &&
+        error.name === "AbortError";
+      if (
+        abortedExecution &&
+        ![...operation.owners].some((owner) => owner.claimed)
+      )
+        throw new AdmissionCancelled();
+      if (!abortedExecution && !(error instanceof AdmissionCancelled))
+        operation.failure = error;
+      throw error;
+    } finally {
+      try {
+        const results = await Promise.allSettled(
+          [...operation.owners]
+            .filter(
+              (owner) =>
+                !owner.claimed &&
+                (failed ||
+                  operation.cancelled ||
+                  owner.released ||
+                  this.#stopped),
+            )
+            .map((owner) => this.#retirePending(owner)),
+        );
+        const errors = results.flatMap((result) =>
+          result.status === "rejected" ? [result.reason] : [],
+        );
+        if (errors.length) {
+          operation.failure = new AggregateError(
+            errors,
+            "Admission cleanup failed.",
+          );
+          throw operation.failure;
+        }
+      } finally {
+        signal?.removeEventListener("abort", abort);
+        for (const owner of operation.owners) {
+          owner.operations.delete(operation);
+          if (
+            this.#pendingRuns.get(owner.arcRunId) === owner &&
+            !this.#liveSessions.has(arcRunKey(owner.arcRunId)) &&
+            !this.#handshakes.findPendingByRunId(owner.arcRunId) &&
+            ![...this.#activationBatches.values()].some((batch) =>
+              batch.pendingProbes.has(owner.arcRunId),
+            )
+          )
+            this.#pendingRuns.delete(owner.arcRunId);
+        }
+        operation.executions.clear();
+        operation.owners.clear();
+        this.#admissionOperations.delete(operation);
+        finish();
+      }
+    }
   }
 
   #liveAction(arcRunId: ArcRunId): LiveAction | undefined {
@@ -1118,6 +1445,7 @@ export class ArcHostService {
   }
 
   #prepare(id: ArcRunId, ownerPrincipal: string, arcRef: ArcRef) {
+    this.#ownPending(id);
     const key = arcRunKey(id);
     const current = this.#liveSessions.get(key);
     if (current?.kind === "preparing") return current;
@@ -1147,12 +1475,14 @@ export class ArcHostService {
    * work. Each step carries at most one run identity; plurality lives in the array.
    */
   async begin(input: BeginInput): Promise<ArcHostStep[]> {
+    if (this.#stopped) return [];
     if (input.arcRunId !== undefined) {
       const arcRunId = input.arcRunId;
       return this.#actionMutations.run(arcRunId, async () => {
         const state = await this.#store.getState(arcRunKey(arcRunId));
         if (state && state.lifecycle !== "active") return [];
-        if (this.#liveSessions.get(arcRunKey(arcRunId))?.kind === "triggering")
+        const live = this.#liveSessions.get(arcRunKey(arcRunId));
+        if (live?.kind === "triggering")
           return [
             {
               kind: "trigger",
@@ -1209,35 +1539,42 @@ export class ArcHostService {
       });
     }
 
-    return this.#beginTriggering(input);
+    try {
+      return await this.#withAdmission(input.signal, () =>
+        this.#beginTriggering(input),
+      );
+    } catch (error) {
+      if (error instanceof AdmissionCancelled) return [];
+      throw error;
+    }
   }
 
   /**
    * Advance a run's trigger frontier with semantic reports. Returns the next
    * steps: `[trigger]` for another round, the fan-out set once it settles, or
-   * `[]` when idle. `dialog` is the trigger-stage view (the activating
-   * inbound's projection); `input.projectDialog` serves the activation
-   * fan-out's action settles.
+   * `[]` when idle. `input.projectDialog` supplies both the trigger-stage
+   * view and the activation fan-out's action settles.
    */
   advanceTrigger(
     arcRunId: ArcRunId,
-    dialog: Dialog,
-    input: AdvanceInput,
+    input: AdvanceTriggerInput,
   ): Promise<ArcHostStep[]> {
-    return this.#actionMutations.run(arcRunId, async () => {
-      try {
-        return await this.#advanceTriggering(arcRunId, dialog, input);
-      } catch (error) {
-        try {
-          await this.#retireExecution(arcRunId);
-        } catch (cleanupError) {
-          this.#logger.info("arc_host.cleanup.failed", {
-            arcRunId,
-            message: String(cleanupError),
-          });
-        }
-        throw error;
-      }
+    assertAdvanceTriggerInput(input);
+    const live = this.#liveSessions.get(arcRunKey(arcRunId));
+    if (live?.kind !== "triggering") return Promise.resolve([]);
+    return this.#withAdmission(live.request.signal, () =>
+      this.#actionMutations.run(arcRunId, async () => {
+        const owner = this.#pendingRuns.get(arcRunId);
+        if (!owner || owner.released) return [];
+        this.#ownPending(arcRunId);
+        const steps = await this.#advanceTriggering(arcRunId, input);
+        if (this.#liveSessions.get(arcRunKey(arcRunId))?.kind !== "triggering")
+          this.#pendingRuns.delete(arcRunId);
+        return steps;
+      }),
+    ).catch((error) => {
+      if (error instanceof AdmissionCancelled) return [];
+      throw error;
     });
   }
 
@@ -1245,8 +1582,9 @@ export class ArcHostService {
   async advanceAction(
     arcRunId: ArcRunId,
     frontierId: string,
-    input: AdvanceInput,
+    input: AdvanceActionInput,
   ): Promise<ArcHostStep> {
+    assertAdvanceActionInput(input);
     return this.#mutateAction(arcRunId, frontierId, async () => {
       const execution = this.#actionSession(arcRunId)!;
       if (
@@ -1288,19 +1626,19 @@ export class ArcHostService {
   async #beginTriggering(
     input: Extract<BeginInput, { arcRunId?: undefined }>,
   ): Promise<ArcHostStep[]> {
+    if (input.signal?.aborted || this.#stopped) return [];
+    const dialog = await input.projectDialog({ roleId: DEFAULT_WORKER_ROLE });
+    if (input.signal?.aborted || this.#stopped) return [];
     this.#latestRuntime.init();
     const request = activationRequestFrom(input);
     const batchId = `activation-batch:${randomUUID()}`;
-    let expiry: ReturnType<typeof setTimeout> | undefined;
     const batch: ActivationBatch = {
       id: batchId,
-      dialog: input.dialog,
+      phase: "collecting",
+      dialog,
       request,
       groups: new Map(),
-      pendingProbeIds: new Set(),
-      cancelExpiry: () => {
-        if (expiry !== undefined) clearTimeout(expiry);
-      },
+      pendingProbes: new Set(),
     };
     this.#activationBatches.set(batch.id, batch);
 
@@ -1319,7 +1657,9 @@ export class ArcHostService {
         )),
       );
       const deflectedStates: ArcRunState[] = [];
+      if (request.signal?.aborted) throw new AdmissionCancelled();
       for await (const [, state] of this.#store.listStates()) {
+        if (request.signal?.aborted) throw new AdmissionCancelled();
         if (
           state.ownerPrincipal !== request.principal ||
           state.lifecycle !== "deflected"
@@ -1335,6 +1675,7 @@ export class ArcHostService {
           a.arcRunId.localeCompare(b.arcRunId),
       );
       for (const [order, state] of deflectedStates.entries()) {
+        if (request.signal?.aborted) throw new AdmissionCancelled();
         const runtime = await this.#runtimeForSnapshot(state.snapshotId);
         const reactivationCount = state.reactivationCount + 1;
         steps.push(
@@ -1347,24 +1688,28 @@ export class ArcHostService {
         );
       }
 
-      expiry = setTimeout(
-        () => this.#expireActivationBatch(batch.id),
-        this.#activationBatchTtlMs,
-      );
-      expiry.unref?.();
+      if (request.signal?.aborted) throw new AdmissionCancelled();
 
-      if (batch.pendingProbeIds.size > 0) return steps;
+      if (batch.pendingProbes.size > 0) return steps;
       return await this.#finalizeActivationBatch(batch, input.projectDialog);
     } catch (error) {
-      batch.cancelExpiry();
       this.#activationBatches.delete(batch.id);
-      await Promise.allSettled(
-        [...batch.pendingProbeIds].map((probeId) =>
+      const cleanup = await Promise.allSettled(
+        [...batch.pendingProbes.keys()].map((probeId) =>
           this.#actionMutations.run(probeId, () =>
             this.#retireExecution(probeId),
           ),
         ),
       );
+      const errors = cleanup.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (errors.length)
+        throw new AggregateError(
+          [error, ...errors],
+          "Activation cleanup failed.",
+        );
+      if (error instanceof AdmissionCancelled) return [];
       throw error;
     }
   }
@@ -1376,6 +1721,9 @@ export class ArcHostService {
     traversals: ArcTraversalSet,
   ): Promise<ArcHostStep[]> {
     const probeId: ArcRunId = `arc-run:${randomUUID()}`;
+    if (batch.request.signal?.aborted) throw new AdmissionCancelled();
+    this.#ownPending(probeId);
+    batch.pendingProbes.add(probeId);
     return this.#actionMutations.run(probeId, async () => {
       const recorder = this.#newRecorder(
         runtime,
@@ -1388,6 +1736,7 @@ export class ArcHostService {
       await this.#openModuleExecution(probeId, false);
       let handedOff = false;
       let failed = false;
+      let failure: unknown;
       try {
         const planned = await this.#planTrigger(
           probeId,
@@ -1402,13 +1751,13 @@ export class ArcHostService {
             recordIds: origin.kind === "fresh" ? origin.recordIds : undefined,
           },
         );
+        if (batch.request.signal?.aborted) throw new AdmissionCancelled();
         if (planned.status === "idle") return [];
         if (planned.status === "matched") {
           this.#collectProbeMatches(batch, origin, planned, recorder);
           return [];
         }
 
-        batch.pendingProbeIds.add(probeId);
         const started = await this.#startTriggeringFromReadyPlan(
           probeId,
           planned,
@@ -1434,17 +1783,20 @@ export class ArcHostService {
         ];
       } catch (error) {
         failed = true;
+        failure = error;
         throw error;
       } finally {
         if (!handedOff) {
+          batch.pendingProbes.delete(probeId);
           try {
             await this.#retireExecution(probeId);
+            this.#pendingRuns.delete(probeId);
           } catch (error) {
             if (!failed) throw error;
-            this.#logger.info("arc_host.cleanup.failed", {
-              arcRunId: probeId,
-              message: String(error),
-            });
+            throw new AggregateError(
+              [failure, error],
+              "Trigger probe cleanup failed.",
+            );
           }
         }
       }
@@ -1456,8 +1808,10 @@ export class ArcHostService {
     origin: TriggerProbeOrigin,
     planned: Extract<TriggerPlanResult, { status: "matched" }>,
     recorder: RecordingRuntime,
+    recordedSteps?: readonly TriggerReplayStep[],
   ): void {
-    const triggerSteps = recorder.drainTriggerBuffer();
+    if (batch.phase !== "collecting") return;
+    const triggerSteps = recordedSteps ?? recorder.drainTriggerBuffer();
     for (const [matchOrder, match] of planned.matches.entries()) {
       const originOrder =
         origin.kind === "fresh" ? matchOrder : 1_000_000 + origin.order;
@@ -1497,12 +1851,32 @@ export class ArcHostService {
     }
   }
 
-  async #finalizeActivationBatch(
+  #claimActivationBatch(batch: ActivationBatch): boolean {
+    if (
+      batch.phase !== "collecting" ||
+      this.#activationBatches.get(batch.id) !== batch
+    )
+      return false;
+    batch.phase = "finalizing";
+    this.#activationBatches.delete(batch.id);
+    this.#finalizingBatches.set(batch.id, batch);
+    return true;
+  }
+
+  #finalizeActivationBatch(
     batch: ActivationBatch,
     projectDialog: DialogProjector,
   ): Promise<ArcHostStep[]> {
-    if (!this.#activationBatches.delete(batch.id)) return [];
-    batch.cancelExpiry();
+    if (!this.#claimActivationBatch(batch)) return Promise.resolve([]);
+    return this.#trackBatchOperation(
+      this.#finishActivationBatch(batch, projectDialog),
+    );
+  }
+
+  async #finishActivationBatch(
+    batch: ActivationBatch,
+    projectDialog: DialogProjector,
+  ): Promise<ArcHostStep[]> {
     const groups = [...batch.groups.values()].sort(
       (a, b) => a.order - b.order || a.arcRef.localeCompare(b.arcRef),
     );
@@ -1514,6 +1888,12 @@ export class ArcHostService {
 
     try {
       for (const group of selected) {
+        if (
+          batch.request.signal?.aborted ||
+          this.#admission.getStore()?.cancelled ||
+          this.#stopped
+        )
+          break;
         const placeholder =
           group.fresh ?? this.#placeholderSelection(group.reentries[0]!);
         if (choose) {
@@ -1541,6 +1921,12 @@ export class ArcHostService {
             )
           : [];
         const reentryCandidates = await this.#runChoiceViews(group.reentries);
+        if (
+          batch.request.signal?.aborted ||
+          this.#admission.getStore()?.cancelled ||
+          this.#stopped
+        )
+          break;
         const candidates = [...activeCandidates, ...reentryCandidates].sort(
           (a, b) => b.updatedAt.localeCompare(a.updatedAt),
         );
@@ -1567,6 +1953,14 @@ export class ArcHostService {
             batch.request,
             batch.dialog,
           );
+          if (
+            batch.request.signal?.aborted ||
+            this.#admission.getStore()?.cancelled ||
+            this.#stopped
+          ) {
+            if (handshake) this.#handshakes.invalidate(handshake.id);
+            break;
+          }
           if (handshake) {
             steps.push(this.#handshakeStep(handshake));
             continue;
@@ -1595,37 +1989,29 @@ export class ArcHostService {
         }
       }
     } catch (error) {
-      await Promise.all(
+      if (error instanceof AdmissionCancelled) return steps;
+      await Promise.allSettled(
         steps.map((step) =>
           step.kind === "action"
             ? this.releaseAction(step.arcRunId, step.frontier.frontierId)
-            : undefined,
+            : step.kind === "handshake"
+              ? this.#handshakes.invalidate(step.handshakeId)
+              : undefined,
         ),
       );
       throw error;
+    } finally {
+      this.#settleActivationBatch(batch);
     }
     return steps;
   }
 
-  #expireActivationBatch(batchId: string): void {
-    const batch = this.#activationBatches.get(batchId);
-    if (!batch || !this.#activationBatches.delete(batchId)) return;
-    batch.cancelExpiry();
-    for (const probeId of batch.pendingProbeIds) {
-      this.#moduleExecutions.get(probeId)?.abort();
-      void this.#actionMutations
-        .run(probeId, () => this.#retireExecution(probeId))
-        .catch((error) => {
-          this.#logger.info("arc_host.cleanup.failed", {
-            arcRunId: probeId,
-            message: String(error),
-          });
-        });
-    }
-    this.#logger.info("arc_host.activation_batch.expired", {
-      batchId,
-      pendingProbeCount: batch.pendingProbeIds.size,
-    });
+  #settleActivationBatch(batch: ActivationBatch): void {
+    batch.phase = "settled";
+    batch.groups.clear();
+    batch.pendingProbes.clear();
+    if (this.#finalizingBatches.get(batch.id) === batch)
+      this.#finalizingBatches.delete(batch.id);
   }
 
   #placeholderSelection(
@@ -1726,20 +2112,32 @@ export class ArcHostService {
     opts: {
       clientId?: string;
       projectDialog: DialogProjector;
+      signal?: AbortSignal;
     },
   ): Promise<ResolveHandshakeResult> {
-    return this.#handshakeResolutions.run(id, async () => {
-      const operation: PreparationOperation = {};
-      try {
-        return await this.#resolveHandshaking(id, values, opts, operation);
-      } catch (error) {
-        if (!(error instanceof FreshActivationUnavailable)) throw error;
-        return this.#missingFreshHandshake(id, error.message);
-      } finally {
-        if (operation.arcRunId && operation.entry)
-          this.#releasePreparation(operation.arcRunId, operation.entry);
-      }
-    });
+    return this.#withAdmission(opts.signal, () =>
+      this.#handshakeResolutions.run(id, async () => {
+        const operation: PreparationOperation = { signal: opts.signal };
+        try {
+          const result = await this.#resolveHandshaking(
+            id,
+            values,
+            opts,
+            operation,
+          );
+          if (result.status === "invalid" && !this.#handshakes.get(id))
+            return { status: "missing" };
+          return result;
+        } catch (error) {
+          if (error instanceof AdmissionCancelled) return { status: "missing" };
+          if (!(error instanceof FreshActivationUnavailable)) throw error;
+          return this.#missingFreshHandshake(id, error.message);
+        } finally {
+          if (operation.arcRunId && operation.entry)
+            this.#releasePreparation(operation.arcRunId, operation.entry);
+        }
+      }),
+    );
   }
 
   async #resolveHandshaking(
@@ -1754,6 +2152,7 @@ export class ArcHostService {
     const clientId = opts.clientId;
     const handshake = this.#handshakes.get(id);
     if (!handshake) return { status: "missing" };
+    this.#ownPending(handshake.triggerSelection.arcRunId);
     if (
       clientId !== undefined &&
       handshake.clientId !== "" &&
@@ -1939,6 +2338,7 @@ export class ArcHostService {
               )
             )
               return { status: "missing" };
+            this.#claimPending(handshake.triggerSelection.arcRunId);
             const frontier = await this.#activateDeflectedReentry(
               state,
               reentrySelection,
@@ -2135,7 +2535,7 @@ export class ArcHostService {
   ): Promise<Extract<PlannedRunStartResult, { kind: "trigger" }>> {
     const key = arcRunKey(arcRunId);
     const workspacePath = defaultRunWorkspaceRoot(this.#artifactRoot, arcRunId);
-    this.#liveSessions.set(key, {
+    const session: TriggeringSession = {
       kind: "triggering",
       recorder,
       deps: planned.deps,
@@ -2143,7 +2543,8 @@ export class ArcHostService {
       brief: planned.brief,
       workspacePath,
       request: opts.request,
-    });
+    };
+    this.#liveSessions.set(key, session);
     this.#logger.info("arc_host.run.begun", {
       arcRunId,
       phase: "triggering",
@@ -2155,7 +2556,12 @@ export class ArcHostService {
       planned.brief,
       dialog,
     );
-    return { kind: "trigger", arcRunId, frontier };
+    session.frontier = frontier;
+    return {
+      kind: "trigger",
+      arcRunId,
+      frontier,
+    };
   }
 
   async #activateFromTriggerSelection(
@@ -2194,6 +2600,7 @@ export class ArcHostService {
       const existing = await this.#store.getState(
         arcRunKey(selection.arcRunId),
       );
+      this.#claimPending(selection.arcRunId);
       const frontier = await this.#activateMatchedRun(
         selection.arcRunId,
         {
@@ -2410,49 +2817,123 @@ export class ArcHostService {
 
   async #advanceTriggering(
     arcRunId: ArcRunId,
-    dialog: Dialog,
-    input: AdvanceInput,
+    input: AdvanceTriggerInput,
   ): Promise<ArcHostStep[]> {
     const key = arcRunKey(arcRunId);
     const live = this.#liveSessions.get(key);
     if (live?.kind !== "triggering") {
       return [];
     }
-
-    let effect: HostModuleEffect | undefined;
-    let report: TriggerReport | undefined;
+    const owner = this.#pendingRuns.get(arcRunId);
+    const operation = this.#admission.getStore();
+    // A sibling can keep the batch alive after this probe has been released.
+    const ownsProbe = () =>
+      owner !== undefined &&
+      !owner.released &&
+      !operation?.cancelled &&
+      (!live.batchId || this.#activationBatches.has(live.batchId)) &&
+      !live.request?.signal?.aborted &&
+      !this.#stopped;
+    if (!ownsProbe()) return [];
+    // No-op inputs have no effects, including projection.
+    if (
+      input.skip !== undefined &&
+      this.#frontierId(live.brief) !== input.skip.frontierId
+    )
+      return [];
+    let pendingCallId: BriefId | undefined;
     if ("hostCallId" in input) {
       assertModuleEffect(input);
       const record = live.recorder.hostModuleState.calls.find(
         (item) => item.call.hostCallId === input.hostCallId,
       );
       if (!record) throw new Error("Unknown host call occurrence.");
-      const pending = live.brief.hostCalls.find(
+      pendingCallId = live.brief.hostCalls.find(
         (call) => call.id === record.runtimeCallId,
-      );
+      )?.id;
       if (
-        !pending ||
+        pendingCallId === undefined ||
         record.effects.some(
           (item) =>
             item.hostCallOutcome.kind === "resolution" ||
             item.hostCallOutcome.kind === "failure",
         )
       )
-        return [
-          {
-            kind: "trigger",
-            arcRunId,
-            frontier: await this.#frontierFromTriggerBrief(
-              arcRunId,
-              live.deps,
-              live.snapshotId,
-              live.brief,
-              dialog,
-            ),
-          },
-        ];
+        return [{ kind: "trigger", arcRunId, frontier: live.frontier! }];
       if (input.hostCallOutcome.kind === "interruption")
         throw new TypeError("Interruption requires an action execution.");
+    }
+    const dialog = await input.projectDialog({ roleId: DEFAULT_WORKER_ROLE });
+    if (!ownsProbe()) return [];
+
+    if (input.skip !== undefined) {
+      const batch = live.batchId
+        ? this.#activationBatches.get(live.batchId)
+        : undefined;
+      if (batch && live.origin) {
+        const buffered = live.recorder.drainTriggerBuffer();
+        for (const arcRef of live.brief.matchableArcs) {
+          const selected = live.recorder.probeTrigger(
+            live.brief,
+            { preferredMatch: arcRef },
+            dialog,
+          );
+          if (selected.matched !== arcRef)
+            throw new Error(
+              "Skipping a trigger failed to preserve an established match.",
+            );
+          // Each selected match keeps its own truthful selection report in the buffered stream.
+          const selectionSteps: TriggerReplayStep[] = [...buffered];
+          const last = buffered.at(-1);
+          if (last?.kind === "trigger-brief") {
+            selectionSteps.push({
+              kind: "trigger-report",
+              position: last.position,
+              dialog,
+              report: { preferredMatch: arcRef },
+              origin: "host-preferred-match",
+            });
+            selectionSteps.push({
+              kind: "trigger-brief",
+              position: { ...last.position, index: last.position.index + 1 },
+              dialog,
+              brief: stripBrief(selected),
+              hostModules: advanceHostModuleState(
+                live.recorder.hostModuleState,
+                selected,
+              ).hostModules,
+            });
+          }
+          this.#collectProbeMatches(
+            batch,
+            live.origin,
+            {
+              status: "matched",
+              snapshotId: live.snapshotId,
+              matches: [
+                {
+                  arcRef,
+                  deps: [...selected.deps],
+                  traversals: structuredClone(selected.traversals),
+                },
+              ],
+            },
+            live.recorder,
+            selectionSteps,
+          );
+        }
+      }
+      await this.#retireExecution(arcRunId);
+      if (!ownsProbe()) return [];
+      batch?.pendingProbes.delete(arcRunId);
+      return batch && batch.pendingProbes.size === 0
+        ? this.#finalizeActivationBatch(batch, input.projectDialog)
+        : [];
+    }
+
+    let effect: HostModuleEffect | undefined;
+    let report: TriggerReport | undefined;
+    if ("hostCallId" in input) {
       effect = {
         hostCallId: input.hostCallId,
         hostCallOutcome: input.hostCallOutcome,
@@ -2460,7 +2941,7 @@ export class ArcHostService {
       if (input.hostCallOutcome.kind === "resolution")
         report = {
           hostCalls: {
-            [pending.id]: {
+            [pendingCallId!]: {
               status: "resolved",
               value: input.hostCallOutcome.value,
             },
@@ -2474,16 +2955,17 @@ export class ArcHostService {
       effect?.hostCallOutcome.kind === "failure"
     ) {
       await this.#retireExecution(arcRunId);
+      if (!ownsProbe()) return [];
       const batch = live.batchId
         ? this.#activationBatches.get(live.batchId)
         : undefined;
-      batch?.pendingProbeIds.delete(arcRunId);
+      batch?.pendingProbes.delete(arcRunId);
       this.#logger.info("arc_host.run.committed", {
         arcRunId,
         phase: "triggering",
         outcome: "failed-feedback",
       });
-      if (batch && batch.pendingProbeIds.size === 0) {
+      if (batch && batch.pendingProbes.size === 0) {
         return this.#finalizeActivationBatch(batch, input.projectDialog);
       }
       return [];
@@ -2496,6 +2978,10 @@ export class ArcHostService {
       effect ? "host-module" : "worker",
       effect,
     );
+    if (!ownsProbe()) {
+      await this.#retireExecution(arcRunId);
+      return [];
+    }
     const planned = await this.#planTriggerFromBrief(
       arcRunId,
       live.recorder,
@@ -2510,8 +2996,12 @@ export class ArcHostService {
           live.origin?.kind === "fresh" ? live.origin.recordIds : undefined,
       },
     );
+    if (!ownsProbe()) {
+      await this.#retireExecution(arcRunId);
+      return [];
+    }
     if (planned.status === "ready") {
-      this.#liveSessions.set(key, {
+      const session: TriggeringSession = {
         kind: "triggering",
         recorder: live.recorder,
         deps: planned.deps,
@@ -2521,7 +3011,8 @@ export class ArcHostService {
         request: live.request,
         batchId: live.batchId,
         origin: live.origin,
-      });
+      };
+      this.#liveSessions.set(key, session);
       const frontier = await this.#frontierFromTriggerBrief(
         arcRunId,
         planned.deps,
@@ -2529,20 +3020,32 @@ export class ArcHostService {
         planned.brief,
         dialog,
       );
+      session.frontier = frontier;
+      if (!ownsProbe()) {
+        await this.#retireExecution(arcRunId);
+        return [];
+      }
       this.#logger.info("arc_host.run.committed", {
         arcRunId,
         phase: "triggering",
         outcome: "ready",
       });
-      return [{ kind: "trigger", arcRunId, frontier }];
+      return [
+        {
+          kind: "trigger",
+          arcRunId,
+          frontier,
+        },
+      ];
     }
 
     await this.#retireExecution(arcRunId);
+    if (!ownsProbe()) return [];
     const batch = live.batchId
       ? this.#activationBatches.get(live.batchId)
       : undefined;
     if (batch) {
-      batch.pendingProbeIds.delete(arcRunId);
+      batch.pendingProbes.delete(arcRunId);
       if (planned.status === "matched") {
         if (!live.origin) {
           throw new Error(`Activation probe ${arcRunId} has no origin.`);
@@ -2554,7 +3057,7 @@ export class ArcHostService {
         phase: "triggering",
         outcome: planned.status,
       });
-      if (batch.pendingProbeIds.size > 0) return [];
+      if (batch.pendingProbes.size > 0) return [];
       return this.#finalizeActivationBatch(batch, input.projectDialog);
     }
     return [];
@@ -2562,7 +3065,7 @@ export class ArcHostService {
 
   async #advanceActioning(
     arcRunId: ArcRunId,
-    input: AdvanceInput,
+    input: AdvanceActionInput,
   ): Promise<RunFrontier> {
     const execution = this.#actionSession(arcRunId)!;
     const live = this.#liveAction(arcRunId);
@@ -4511,8 +5014,9 @@ export class ArcHostService {
     });
   }
 
-  #stageHandshake(handshake: PendingHandshake): PendingHandshake {
-    this.#handshakes.stage(handshake);
+  #stageHandshake(input: PendingHandshake): PendingHandshake {
+    this.#ownPending(input.triggerSelection.arcRunId);
+    const handshake = this.#handshakes.stage(input);
     const key = arcRunKey(handshake.triggerSelection.arcRunId);
     if (this.#liveSessions.get(key)?.kind === "preparing")
       this.#liveSessions.delete(key);
@@ -4529,11 +5033,14 @@ export class ArcHostService {
     outcome: HandshakeOutcome,
     operation: PreparationOperation,
   ): boolean {
+    if (operation.signal?.aborted || this.#stopped) return false;
     if (outcome.kind === "proceed" && !handshake.reentrySelections?.length) {
       this.#assertFreshAvailable(handshake.triggerSelection);
     }
     if (this.#handshakes.get(handshake.id) !== handshake) return false;
     if (!this.#handshakes.take(handshake.id)) return false;
+    if (outcome.kind === "join" || outcome.kind === "declined")
+      this.#claimPending(handshake.triggerSelection.arcRunId);
     const preparing =
       outcome.kind === "proceed" || outcome.kind === "reentry"
         ? this.#prepare(
@@ -4562,7 +5069,7 @@ export class ArcHostService {
   }
 
   #missingFreshHandshake(id: string, reason: string): ResolveHandshakeResult {
-    this.#handshakes.take(id);
+    this.#handshakes.invalidate(id);
     this.#logger.info("arc_host.handshake.unavailable", {
       handshakeId: id,
       reason,
@@ -4587,6 +5094,7 @@ function activationRequestFrom(
   input: Extract<BeginInput, { arcRunId?: undefined }>,
 ): ActivationRequest {
   return {
+    signal: input.signal,
     clientId: input.clientId,
     principal: input.principal,
     activationPolicy: input.activationPolicy ?? "first",
@@ -5022,7 +5530,9 @@ function lifecycleFromTraversals(
  * Whether trigger feedback ends its probe. Trigger tasks accept no
  * disposition, so one is treated like a failure.
  */
-function hasFailedTriggerFeedback(input: AdvanceInput): boolean {
+function hasFailedTriggerFeedback(
+  input: Exclude<AdvanceTriggerInput, { skip: { frontierId: string } }>,
+): boolean {
   return (
     "reports" in input &&
     input.reports.some(
@@ -5353,4 +5863,37 @@ function resolveContextIsolation(
   nodeIsolation: ContextIsolation | undefined,
 ): ContextIsolation {
   return runIsolation === "node" || nodeIsolation === "node" ? "node" : "role";
+}
+
+/** Require a dialog projector for callers without TypeScript checking. */
+function assertDialogProjector(input: { projectDialog: unknown }): void {
+  if (
+    !input ||
+    typeof input !== "object" ||
+    typeof input.projectDialog !== "function"
+  )
+    throw new TypeError("Advancement requires a dialog projector.");
+}
+
+/** Keep skip inputs on trigger steps for callers without TypeScript checking. */
+function assertAdvanceActionInput(input: AdvanceActionInput): void {
+  assertDialogProjector(input);
+  if ("skip" in input) throw new TypeError("Skip requires a trigger step.");
+}
+
+/** Keep skip inputs exclusive for callers without TypeScript checking. */
+function assertAdvanceTriggerInput(input: AdvanceTriggerInput): void {
+  assertDialogProjector(input);
+  if (input.skip === undefined) return;
+  if (
+    !input.skip ||
+    typeof input.skip !== "object" ||
+    Array.isArray(input.skip) ||
+    typeof input.skip.frontierId !== "string" ||
+    !input.skip.frontierId ||
+    ["reports", "hostCallId", "hostCallOutcome"].some((key) => key in input)
+  )
+    throw new TypeError(
+      "Skip requires an object with a frontierId and a separate dialog projector, without feedback.",
+    );
 }

@@ -15,6 +15,7 @@ import {
   InMemoryArcHostStore,
   InMemoryHistoryStore,
   arcRunKey,
+  probeRetention,
   type ArcRunId,
   type OutboundMessage,
   type RoleWorker,
@@ -384,7 +385,9 @@ function Watch() {
       backendDetails: { step: 1 },
     });
 
-    await waitFor(() => workerHub.getLiveWorkCounts().continuations === 1);
+    await waitFor(
+      () => probeRetention(workerHub).transient.continuations === 1,
+    );
     await workerHub.resume(arcRunId);
     await waitFor(async () => {
       const current = await routineStore.getRoutine(routine.id);
@@ -396,7 +399,9 @@ function Watch() {
         (current.backendDetails as Record<string, unknown>)["step"] === 2
       );
     });
-    await waitFor(() => workerHub.getLiveWorkCounts().continuations === 1);
+    await waitFor(
+      () => probeRetention(workerHub).transient.continuations === 1,
+    );
     await workerHub.resume(arcRunId);
     await waitFor(
       async () =>
@@ -598,7 +603,6 @@ function Watch() {
         instructionCoverage: {
           "instruction:[arc:greet:Greet]:[node:greet:Greet]:body/0": "failed",
         },
-        intent: "agent-work",
       },
     ]);
     await expect(store.getState(arcRunKey(arcRunId))).resolves.toEqual(

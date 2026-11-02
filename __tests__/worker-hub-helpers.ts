@@ -184,8 +184,8 @@ export function recordAdvanceInputs(arcHost: ArcHostService): unknown[] {
   const inputs: unknown[] = [];
   const realAction = arcHost.advanceAction.bind(arcHost);
   const realTrigger = arcHost.advanceTrigger.bind(arcHost);
-  // The projector closure is per-call plumbing, not report data; record the
-  // input without it so assertions compare the substantive fields.
+  // Record inputs without their dialog views so assertions compare the
+  // reported fields.
   vi.spyOn(arcHost, "advanceAction").mockImplementation(
     async (arcRunId, frontierId, input) => {
       const { projectDialog: _projectDialog, ...rest } = input;
@@ -194,10 +194,10 @@ export function recordAdvanceInputs(arcHost: ArcHostService): unknown[] {
     },
   );
   vi.spyOn(arcHost, "advanceTrigger").mockImplementation(
-    async (arcRunId, dialog, input) => {
+    async (arcRunId, input) => {
       const { projectDialog: _projectDialog, ...rest } = input;
       inputs.push(rest);
-      return realTrigger(arcRunId, dialog, input);
+      return realTrigger(arcRunId, input);
     },
   );
   return inputs;

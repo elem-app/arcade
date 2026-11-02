@@ -1,16 +1,18 @@
 # Arcade Testing And Evaluation Harnesses
 
-Arcade guards against masked-context failures — a worker silently compensating for a fact that never reached it — with three distinct test layers. The first two are deterministic and always on; the third runs real providers behind credential gates.
+Arcade uses deterministic tests to verify service contracts and real-provider evals to qualify worker behavior. The [behavior inventory](../specs/testing.md) defines required cases, and the [coverage manifest](../__tests__/COVERAGE.md) records their deterministic evidence.
 
-1. **Focused unit tests** prove projection, rendering, and provider continuity in isolation: `__tests__/dialog-projection.test.ts` (role visibility), `__tests__/task-renderer.test.ts` (instruction text, cell snapshots, host and sandbox artifact paths, audience-reference mappings, prior-turn priming), `__tests__/observation-cases.test.ts` (grouped, array, and asked observation briefs commit into the branch each eval case asserts on), the `*-sdk-tst-backend` tests (semantic prompt rendering), and the `*-sdk-backend` tests (fresh versus continued sessions, cwd-stable resume, and report ingest of scalar, array, and grouped observation values). These own the provider-specific prompt and continuity mechanics.
-2. **The always-on context-propagation suite** (`__tests__/context-propagation.test.ts`) proves the whole Arc-to-provider path with mocked SDK runners. It owns **input integrity** and **context topology**: that an inbound fact reaches effective provider input, role isolation continues a same-role response chain, and node isolation starts independent chains while preserving role-projected dialog visibility.
-3. **Real-provider evals** under `eval/` prove **behavioral fidelity**: that a real worker uses realistically distributed facts without recovering a missing one through a question or exploration, and that provider-private facts follow the configured context boundary.
+1. **Focused unit tests** cover configuration, validation, rendering, storage, and provider adapters with controlled inputs.
+2. **Service integration tests** exercise actual host and hub behavior across activation, handshakes, dispatch, messaging, execution control, replay, and cleanup. Mocked workers, providers, clocks, and held operations make outcomes and concurrent transitions reproducible.
+3. **Real-provider evals** under `eval/` exercise observable worker behavior: trigger decisions, instructions, audience interaction, artifacts, permissions, and context continuity.
 
-Input integrity is a deterministic property, so layers 1 and 2 own it and run in every unit pass. The general SDK live evals are black-box: they submit a message and inspect externally visible results — questions, replies, and produced artifacts — rather than routine dialogs or rendered prompts. A correct live outcome cannot be attributed to a fact duplicated into the Arc source, because each distinguishing fact lives in exactly one source.
+The first two run in the deterministic `unit` Vitest project. The on-demand `leak` project repeats the service retention workload at scale with a heap check (see [Retention Leak Run](#retention-leak-run)). Live evals run separately behind credential gates and complement deterministic coverage. General SDK evals submit messages and inspect observable results such as questions, replies, and artifacts; rendered prompts and provider transcripts remain diagnostic evidence.
 
 These harnesses have their own variables and inline config objects; they are separate from the production Arcade app config documented in `docs/configuration.md`.
 
 ## Deterministic Context Tests
+
+Context integrity illustrates the division between focused and integrated tests. Projection and rendering tests verify role visibility, instruction and cell content, artifact paths, and audience mappings. Backend tests verify prompt construction and session continuity; the integration suite checks that those pieces carry the right information through production dispatch. This prevents a worker from silently compensating for context that Arcade failed to provide.
 
 `__tests__/context-propagation.test.ts` is always on and needs no external model API. Its input-integrity case submits one opaque inbound fact through `WorkerHubService.submitInbound` into real arc host and worker hub services with in-memory stores, and injects mocked OpenAI trigger and instruction SDK runners that capture their actual invocation input and drive the real worker tools. It asserts that the inbound fact reaches:
 
@@ -22,6 +24,20 @@ These harnesses have their own variables and inline config objects; they are sep
 Cell-snapshot rendering is proven by `__tests__/task-renderer.test.ts` rather than this test, because a resolved primitive Arc cell requires a semantic observation the single-execution test deliberately avoids.
 
 The suite's context-topology case runs two actual same-role Arc nodes through `ArcHostService`, `WorkerHubService`, and the OpenAI general backend under both isolation policies. Role isolation gives the second provider call the first call's response id. Node isolation gives both calls no previous response id and distinct context keys, while both fresh prompts contain the same role-projected inbound fact. The second node's prompt never contains the first node's instruction-only marker.
+
+## Retention Leak Run
+
+`pnpm test:leak` is arc host and worker hub retention evidence for long-running work. It runs the seeded driver behind `__tests__/retention-fuzz.test.ts` for many more batches in the `leak` Vitest project, which Node starts with `--expose-gc`. Each batch mixes completed, handshake-gated, cancelled, expired, failed, and abandoned submissions against real services with file-backed stores. After every batch the driver asserts each scenario's outcome, then requires every transient owner and fake timer at zero, registrations at their setup values, and caches within their caps.
+
+The run then collects garbage and samples `heapUsed` after batch 2 and after the final batch, and fails if the heap grew by more than 5 MB. Cache occupancy must be equal at both samples so cache fill does not count as growth. Heap growth is a diagnostic signal; the ownership gates are the primary evidence.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ARCADE_LEAK_SEED` | `20261102` | Seed for the scenario mix and interleavings. |
+| `ARCADE_LEAK_BATCHES` | `40` | Batches in the run; must exceed 3. |
+| `ARCADE_LEAK_BATCH_SIZE` | `50` | Submissions per batch. |
+
+The default run takes about 100 seconds. A gate failure reports the seed, batch, scenario list, and the last 200 scheduler steps. Rerunning with the same seed and sizes reproduces it; `ARCADE_RETENTION_TRACE=1` also streams every step to stderr. A heap failure with passing gates points at memory held outside the probed owners: write heap snapshots from the driver's `onBatch` hook and compare object counts by constructor between two batches.
 
 ## External Backend Evals
 
@@ -50,7 +66,7 @@ Defaults are `--targets=all`, all profiles, and `--repetitions=1`. Supplying `--
 --dry-run
 ```
 
-The dry-run manifest lists the current stable case IDs and target/case executions. Smoke and extended are disjoint tiers. Shared general-SDK behavior is registered once per case and has separate Claude and OpenAI target executions. Claude-only artifact, permission, prepared-start, and trigger-pool behavior remains explicitly target-specific.
+The dry-run manifest lists the current stable case IDs and target/case executions. Smoke and extended are disjoint tiers. Shared general-SDK behavior is registered once per case and has separate Claude and OpenAI target executions. Claude-only artifact, permission, prepared-start, and trigger-pool behavior remains explicitly target-specific. Preparation cases first admit cold work, then observe real SDK startup readiness and one-shot consumption to verify reuse and replenishment; their observation wrappers preserve the SDK transports and backend pool policy.
 
 Examples:
 

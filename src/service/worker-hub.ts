@@ -39,7 +39,7 @@ import {
   type HostModuleEffect,
 } from "../types/host-module.js";
 import type {
-  AdvanceInput,
+  AdvanceActionInput,
   ArcHostStep,
   ArcRunView,
   InstructionCoverage,
@@ -82,6 +82,13 @@ import type {
 import type { BackendName, RawWorkersConfig } from "../types/worker-slot.js";
 import { HotAsyncQueue } from "../utils/hot-async-queue.js";
 import { KeyedSerializer } from "../utils/keyed-serializer.js";
+import {
+  readRetention,
+  registerRetentionProbe,
+  type HotAsyncQueueRetention,
+  type KeyedSerializerRetention,
+  type WorkerHubRetention,
+} from "../utils/retention-registry.js";
 import type { ArcHostService, NodeInfo } from "./arc-host.js";
 import {
   answerHistoryEntry,
@@ -145,6 +152,8 @@ export type WorkerHubServiceOptions = {
   logger?: ArcadeLogger;
   /** Optional automatic-recovery tuning for capacity-limited runs. */
   capacityRetry?: CapacityRetryOptions;
+  /** Encoded lifecycle-event retention per submission. Defaults to 256 events / 1 MiB. */
+  submissionQueue?: { maxEvents?: number; maxBytes?: number };
 };
 
 /** One-shot startup input resolved against the registered backend implementations. */
@@ -178,11 +187,38 @@ type SubmissionState = {
   pending: number;
   triggerProbeIds: Set<ArcRunId>;
   inbound: InboundMessage;
+  controller: AbortController;
+  removeAbortListener?: () => void;
+  operations: number;
+  finalizations: number;
+  answerClaimed: boolean;
+  failure?: string;
+  cleanup?: Promise<void>;
+  cancelling?: boolean;
+  finish: () => void;
+  finished: Promise<void>;
+};
+
+const TRIGGER_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+const HANDSHAKE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+
+type TriggerDeadline = {
+  step: Extract<ArcHostStep, { kind: "trigger" }>;
+  submissionId: string | undefined;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+  advancing: boolean;
 };
 
 type HandshakeSubmission = {
   submissionId: string;
   arcRef: ArcRef;
+  arcRunId: ArcRunId;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+  resolving?: boolean;
+  retirement?: Promise<void>;
+  retirementOutcome?: "expired" | "cancelled";
 };
 
 type QueueEvent =
@@ -250,6 +286,7 @@ type LapYieldReason =
 /** Bookkeeping for the lap a drain currently has open, if any. */
 type LapState = {
   arcRunId?: ArcRunId;
+  scope?: FrontierWorkScope;
   taskResultCount: number;
 };
 
@@ -298,12 +335,16 @@ type OwnedRoutine = {
 
 type FrontierWorkScope = {
   arcRunId: ArcRunId;
+  stage: "trigger" | "action";
+  reactivationCount?: number;
+  submissionId?: string;
   frontierId: string;
   event?: Extract<QueueEvent, { kind: "host-step" }>;
   superseded: boolean;
   routines: Map<string, OwnedRoutine>;
   invalidatedAskIds: Set<string>;
   cleanup: Promise<void>;
+  release?: Promise<readonly unknown[]>;
   released: boolean;
   dispatched: boolean;
 };
@@ -372,9 +413,13 @@ type PausedRoutineContinuation = {
  */
 export class WorkerHubService {
   readonly #arcHost: ArcHostService;
+  readonly #triggerDeadlines = new Map<ArcRunId, TriggerDeadline>();
   readonly #workScopes = new Map<ArcRunId, FrontierWorkScope>();
+  readonly #scopeReleases = new Set<Promise<readonly unknown[]>>();
   readonly #retiringRoutines = new Set<OwnedRoutine>();
-  readonly #workerContexts = new WeakMap<
+  readonly #runDrains = new Set<Promise<unknown>>();
+  /** Bounded by registered worker instances; cleared at stop. */
+  readonly #workerContexts = new Map<
     ResolvedWorker["worker"],
     KeyedSerializer<string>
   >();
@@ -427,6 +472,7 @@ export class WorkerHubService {
   readonly #submissions = new Map<string, SubmissionState>();
   /** Private branch correlation used to settle one handshake hold. */
   readonly #handshakeSubmissions = new Map<string, HandshakeSubmission>();
+  readonly #submissionQueue: { maxEvents: number; maxBytes: number };
   readonly #capacityRetry: ResolvedCapacityRetry;
   /**
    * Pending automatic capacity-resume per run. `attempts` counts consecutive
@@ -473,6 +519,11 @@ export class WorkerHubService {
       maxDelayMs: capacityRetry.maxDelayMs ?? 60000,
       schedule: capacityRetry.schedule ?? defaultCapacityRetrySchedule,
     };
+    this.#submissionQueue = {
+      maxEvents: opts.submissionQueue?.maxEvents ?? 256,
+      maxBytes: opts.submissionQueue?.maxBytes ?? 1024 * 1024,
+    };
+    registerRetentionProbe(this, () => this.#retention());
   }
 
   #scopeFor(
@@ -485,7 +536,11 @@ export class WorkerHubService {
       event.scope?.frontierId === step.frontier.frontierId
         ? event.scope
         : this.#workScopes.get(step.arcRunId);
-    if (scope?.frontierId !== step.frontier.frontierId || scope?.superseded) {
+    if (
+      scope?.frontierId !== step.frontier.frontierId ||
+      scope?.superseded ||
+      scope?.released
+    ) {
       if (scope) {
         this.#supersedeFrontier(scope);
         this.#forgetScope(scope);
@@ -495,6 +550,10 @@ export class WorkerHubService {
     if (!scope) {
       scope = {
         arcRunId: step.arcRunId,
+        stage: step.kind,
+        reactivationCount:
+          step.kind === "action" ? step.reactivationCount : undefined,
+        submissionId: event.submissionId,
         frontierId: step.frontier.frontierId,
         event,
         routines: new Map(),
@@ -511,16 +570,67 @@ export class WorkerHubService {
     return scope;
   }
 
-  /** @internal Inspect retained work without exposing mutable scopes. */
-  getLiveWorkCounts(): {
-    scopes: number;
-    routines: number;
-    continuations: number;
-  } {
+  /** Payload-free ownership counts grouped by retention gate. */
+  #retention(): WorkerHubRetention {
+    const submissions = [...this.#submissions.values()];
     return {
-      scopes: this.#workScopes.size,
-      routines: this.#routineWorkers.size,
-      continuations: this.#pausedContinuations.size,
+      transient: {
+        scopes: this.#workScopes.size,
+        scopeReleases: this.#scopeReleases.size,
+        routines: this.#routineWorkers.size,
+        continuations: this.#pausedContinuations.size,
+        submissions: this.#submissions.size,
+        handshakeCorrelations: this.#handshakeSubmissions.size,
+        triggerProbes: submissions.reduce(
+          (count, submission) => count + submission.triggerProbeIds.size,
+          0,
+        ),
+        triggerDeadlines: this.#triggerDeadlines.size,
+        laps: this.#laps.size,
+        lapFailures: this.#lapFailures.size,
+        uncaughtInterruptions: this.#uncaughtInterruptions.size,
+        runsSinceStart: this.#runsSinceStart.size,
+        taskInvocations: this.#taskInvocations.size,
+        retiringRoutines: this.#retiringRoutines.size,
+        runDrains: this.#runDrains.size,
+        moduleEffects: this.#moduleEffects.size,
+        retries: this.#capacityRetries.size,
+        asks: this.#askResolvers.size,
+        submissionOperations: submissions.reduce(
+          (n, state) => n + state.operations,
+          0,
+        ),
+        queuedEventBytes: submissions.reduce(
+          (n, state) =>
+            n + readRetention<HotAsyncQueueRetention>(state.channel).bytes,
+          0,
+        ),
+        answerDeliveries: submissions.filter((state) => state.answerClaimed)
+          .length,
+        finalizations: submissions.reduce(
+          (n, state) => n + state.finalizations,
+          0,
+        ),
+        runSerializations: readRetention<KeyedSerializerRetention>(
+          this.#runSerializer,
+        ).keys,
+        handshakeResolutions: readRetention<KeyedSerializerRetention>(
+          this.#handshakeResolutions,
+        ).keys,
+        controlMutations: readRetention<KeyedSerializerRetention>(
+          this.#controlMutations,
+        ).keys,
+        workerContextSerializations: [...this.#workerContexts.values()].reduce(
+          (n, contexts) =>
+            n + readRetention<KeyedSerializerRetention>(contexts).keys,
+          0,
+        ),
+      },
+      registrations: {
+        outboundNodes: countOutboundNodes(this.#outboundRoot),
+        unusableWorkers: this.#unusableWorkers.size,
+      },
+      caches: {},
     };
   }
 
@@ -534,40 +644,52 @@ export class WorkerHubService {
   }
 
   /** Completion and failure both relinquish the host session after fencing queued work. */
-  async #releaseScope(scope: FrontierWorkScope): Promise<void> {
-    if (scope.released) return;
+  #releaseScope(scope: FrontierWorkScope): Promise<readonly unknown[]> {
+    if (scope.release) return scope.release;
+    if (scope.released) return Promise.resolve([]);
     scope.released = true;
-    this.#moduleEffects.delete(scope.arcRunId);
-    this.#clearCapacityRetry(scope.arcRunId);
-    const continuation = this.#pausedContinuations.get(scope.arcRunId);
-    if (continuation?.scope === scope)
-      this.#pausedContinuations.delete(scope.arcRunId);
-    const askIds: string[] = [];
-    for (const [id, entry] of this.#askResolvers) {
-      if (entry.scope !== scope) continue;
-      this.#askResolvers.delete(id);
-      askIds.push(id);
-      entry.release();
-      entry.reject(new Error(scopeCancellationMessage(scope)));
-    }
-    this.#publishAskInvalidation(scope, askIds);
-    for (const owned of scope.routines.values()) {
-      void this.#disposeOwnedRoutine(owned);
-    }
-    const results = await Promise.allSettled([
-      this.#arcHost.releaseAction(scope.arcRunId, scope.frontierId),
-      ...[...scope.routines.values()].map((owned) =>
-        this.#clearSupersededControl(owned),
-      ),
-    ]);
-    this.#forgetScope(scope);
-    for (const result of results) {
-      if (result.status === "rejected")
+    const release = (async () => {
+      this.#moduleEffects.delete(scope.arcRunId);
+      this.#clearCapacityRetry(scope.arcRunId);
+      const continuation = this.#pausedContinuations.get(scope.arcRunId);
+      if (continuation?.scope === scope)
+        this.#pausedContinuations.delete(scope.arcRunId);
+      const askIds: string[] = [];
+      for (const [id, entry] of this.#askResolvers) {
+        if (entry.scope !== scope) continue;
+        this.#askResolvers.delete(id);
+        askIds.push(id);
+        entry.release();
+        entry.reject(new Error(scopeCancellationMessage(scope)));
+      }
+      this.#publishAskInvalidation(scope, askIds);
+      for (const owned of scope.routines.values()) {
+        void this.#disposeOwnedRoutine(owned);
+      }
+      const results = await Promise.allSettled([
+        scope.stage === "trigger"
+          ? this.#arcHost.releaseTrigger(scope.arcRunId)
+          : this.#arcHost.releaseAction(scope.arcRunId, scope.frontierId),
+        ...[...scope.routines.values()].map((owned) =>
+          this.#clearSupersededControl(owned),
+        ),
+      ]);
+      this.#forgetScope(scope);
+      const errors = results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      for (const error of errors)
         this.#logger.info("worker_hub.action.release_failed", {
           arcRunId: scope.arcRunId,
-          message: String(result.reason),
+          message: String(error),
         });
-    }
+      return errors;
+    })();
+    scope.release = release;
+    this.#scopeReleases.add(release);
+    const settled = () => this.#scopeReleases.delete(release);
+    void release.then(settled, settled);
+    return release;
   }
 
   #retireAcceptedResults(
@@ -661,25 +783,28 @@ export class WorkerHubService {
   #disposeOwnedRoutine(owned: OwnedRoutine): Promise<void> {
     if (owned.disposal) return owned.disposal;
     this.#retiringRoutines.add(owned);
-    owned.disposal = (async () => {
-      if (owned.invocation) await owned.invocation;
-      try {
-        await owned.selected.worker.disposeRoutine({
-          arcRunId: owned.routine.arcRunId,
-          routineId: owned.routine.id,
-        });
-      } catch (error) {
-        this.#unusableWorkers.add(owned.selected.worker);
-        throw error;
-      } finally {
-        this.#routineWorkers.delete(owned.routine.id);
-        const continuation = this.#pausedContinuations.get(
-          owned.routine.arcRunId,
-        );
-        if (continuation?.routineId === owned.routine.id)
-          this.#pausedContinuations.delete(owned.routine.arcRunId);
-      }
-    })();
+    owned.disposal = this.#submissionOperation(
+      owned.scope.stage === "trigger" ? owned.scope.submissionId : undefined,
+      async () => {
+        if (owned.invocation) await owned.invocation;
+        try {
+          await owned.selected.worker.disposeRoutine({
+            arcRunId: owned.routine.arcRunId,
+            routineId: owned.routine.id,
+          });
+        } catch (error) {
+          this.#unusableWorkers.add(owned.selected.worker);
+          throw error;
+        } finally {
+          this.#routineWorkers.delete(owned.routine.id);
+          const continuation = this.#pausedContinuations.get(
+            owned.routine.arcRunId,
+          );
+          if (continuation?.routineId === owned.routine.id)
+            this.#pausedContinuations.delete(owned.routine.arcRunId);
+        }
+      },
+    );
     void owned.disposal.then(
       () => this.#retiringRoutines.delete(owned),
       (error: unknown) => {
@@ -869,16 +994,22 @@ export class WorkerHubService {
         prior.submissionId &&
         this.#submissions.get(prior.submissionId)?.inbound;
       if (!inbound) return { kind: "continue" };
-      const steps = await this.#arcHost.advanceTrigger(arcRunId, prior.dialog, {
+      if (!this.#claimTriggerAdvance(arcRunId, step.frontier.frontierId))
+        return { kind: "continue" };
+      const steps = await this.#arcHost.advanceTrigger(arcRunId, {
         ...delivery.effect,
         projectDialog: async (view) => projectInboundDialog(inbound, view),
       });
       const only = steps.length === 1 ? steps[0] : undefined;
       if (only?.kind === "trigger") {
+        this.#watchTrigger(only, prior.submissionId);
+        if (!this.#ownsTriggerProbe(prior.submissionId, arcRunId))
+          return { kind: "continue" };
         if (
           only.frontier.frontierId === step.frontier.frontierId &&
           !scope.superseded
         ) {
+          prior.hostStep = only;
           delivery.attemptedFrontierId = step.frontier.frontierId;
           pending.splice(index, 0, delivery);
           return {
@@ -898,6 +1029,7 @@ export class WorkerHubService {
           ],
         };
       }
+      this.#unwatchTrigger(arcRunId);
       this.#supersedeFrontier(scope);
       this.#forgetScope(scope);
       const submission =
@@ -938,6 +1070,8 @@ export class WorkerHubService {
     if (this.#workerRegistry.started) this.#lifecycle = "started";
     this.#startupPromise = startup.then(
       () => {
+        if (this.#lifecycle === "stopping" || this.#lifecycle === "stopped")
+          return;
         this.#lifecycle = "started";
         void this.#announceRestartParks().catch((error: unknown) => {
           try {
@@ -951,7 +1085,8 @@ export class WorkerHubService {
         });
       },
       (error: unknown) => {
-        this.#lifecycle = "failed";
+        if (this.#lifecycle !== "stopping" && this.#lifecycle !== "stopped")
+          this.#lifecycle = "failed";
         throw error;
       },
     );
@@ -977,42 +1112,70 @@ export class WorkerHubService {
   /** Stop every created worker in reverse order and aggregate cleanup failures. */
   stop(): Promise<void> {
     if (this.#stopPromise) return this.#stopPromise;
+    this.#lifecycle = "stopping";
     this.#stopPromise = this.#stopAllWorkers();
     return this.#stopPromise;
   }
 
   async #stopAllWorkers(): Promise<void> {
-    if (this.#lifecycle === "starting" || this.#lifecycle === "started") {
-      try {
-        await this.#startupPromise;
-      } catch {
-        if (!this.#workerRegistry.started) return;
-      }
+    // Keep cleanup already in flight even if it settles during the startup wait.
+    const releases = new Set(this.#scopeReleases);
+    try {
+      await this.#startupPromise;
+    } catch {
+      /* Registry startup owns rollback. */
     }
-    if (this.#lifecycle === "stopped" || this.#lifecycle === "failed") return;
-    this.#lifecycle = "stopping";
+    const submissions = [...this.#submissions.entries()].map(([id, state]) => {
+      this.#cancelSubmission(id);
+      return state.finished;
+    });
     this.#moduleEffects.clear();
     for (const retry of this.#capacityRetries.values()) retry.cancel();
     this.#capacityRetries.clear();
     this.#rejectAllAsks(
       new Error("Worker hub stopped before the ask resolved."),
     );
-    const releases = [...this.#workScopes.values()].map((scope) =>
-      this.#releaseScope(scope),
+    for (const scope of this.#workScopes.values())
+      releases.add(this.#releaseScope(scope));
+    // Capture cleanup promises before asynchronous shutdown can settle and
+    // remove their owners from the live bookkeeping set.
+    const disposals = [...this.#retiringRoutines].map(
+      (owned) => owned.disposal,
     );
+    const errors: unknown[] = [];
     try {
-      await this.#workerRegistry.stop();
+      try {
+        await this.#workerRegistry.stop();
+      } catch (error) {
+        errors.push(error);
+      }
+      for (const result of await Promise.allSettled(releases))
+        if (result.status === "rejected") errors.push(result.reason);
+        else errors.push(...result.value);
+      while (this.#taskInvocations.size || this.#runDrains.size)
+        await Promise.allSettled([
+          ...this.#taskInvocations,
+          ...this.#runDrains,
+        ]);
+      for (const result of await Promise.allSettled([...disposals]))
+        if (result.status === "rejected") errors.push(result.reason);
+      await Promise.all(submissions);
     } finally {
-      await Promise.all(releases);
-      await Promise.allSettled([...this.#taskInvocations]);
-      await Promise.allSettled(
-        [...this.#retiringRoutines].map((owned) => owned.disposal),
-      );
       this.#workScopes.clear();
       this.#pausedContinuations.clear();
       this.#routineWorkers.clear();
+      this.#laps.clear();
+      this.#lapFailures.clear();
+      this.#runsSinceStart.clear();
+      this.#uncaughtInterruptions.clear();
+      this.#workerContexts.clear();
+      this.#outboundRoot.exact.clear();
+      delete this.#outboundRoot.wildcard;
+      delete this.#outboundRoot.handlers;
       this.#lifecycle = "stopped";
     }
+    if (errors.length)
+      throw new AggregateError(errors, "Worker hub cleanup failed.");
   }
 
   /**
@@ -1026,8 +1189,7 @@ export class WorkerHubService {
   }
 
   /**
-   * Submit an inbound connector message; returns the submission's lifecycle
-   * channel.
+   * Submit an inbound connector message; returns its lifecycle event stream.
    *
    * Routing runs asynchronously on internal drains, so the channel is returned
    * immediately and matched arcs are activated, gated, or rejected whether or not
@@ -1039,7 +1201,10 @@ export class WorkerHubService {
    * and internal consistency exceptions fail the channel on initial or resumed
    * execution. See `InboundLifecycleEvent` for per-event semantics and ordering.
    */
-  submitInbound(message: InboundMessage): AsyncIterable<InboundLifecycleEvent> {
+  submitInbound(
+    message: InboundMessage,
+    options: { signal?: AbortSignal } = {},
+  ): AsyncIterable<InboundLifecycleEvent> {
     this.#assertStarted();
     this.#logger.info("worker_hub.inbound.received", {
       domain: "messaging",
@@ -1047,33 +1212,113 @@ export class WorkerHubService {
       audience: message.audience?.name,
     });
     const submissionId = `submission:${randomUUID()}`;
-    const channel = new HotAsyncQueue<InboundLifecycleEvent>();
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const channel = new HotAsyncQueue<InboundLifecycleEvent>({
+      maxItems: this.#submissionQueue.maxEvents,
+      maxBytes: this.#submissionQueue.maxBytes,
+      sizeOf: (event) => Buffer.byteLength(JSON.stringify(event), "utf8"),
+      onOverflow: (error) =>
+        this.#failSubmissionChannel(submissionId, submission, error),
+    });
     const submission: SubmissionState = {
       channel,
       pending: 0,
       triggerProbeIds: new Set(),
       inbound: message,
+      controller: new AbortController(),
+      operations: 0,
+      finalizations: 0,
+      answerClaimed: false,
+      finished,
+      finish,
     };
     this.#submissions.set(submissionId, submission);
+    const signal = options.signal;
+    if (signal) {
+      const abort = () => this.#cancelSubmission(submissionId);
+      signal.addEventListener("abort", abort, { once: true });
+      submission.removeAbortListener = () =>
+        signal.removeEventListener("abort", abort);
+      if (signal.aborted) abort();
+    }
     // Return the channel now and run the drain asynchronously, so matched arcs
     // are scheduled whether or not the channel is consumed. The channel stays
     // open across handshake rounds and closes when nothing is outstanding (see
     // `#dispatchForkSteps` / `#routeConnectorHandshakeEvent`).
-    void this.#drainQueue(
-      [{ kind: "connector-inbound", message, submissionId }],
-      "submit",
-    ).catch((error: unknown) => {
-      this.#failSubmissionChannel(submissionId, submission, error);
-    });
-    return channel;
+    void this.#submissionOperation(submissionId, async () => {
+      if (submission.controller.signal.aborted) return;
+      await this.#drainQueue(
+        [{ kind: "connector-inbound", message, submissionId }],
+        "submit",
+      );
+    }).catch(() => {});
+    return this.#submissionEvents(channel, finished);
+  }
+
+  // Keep the returned stream outside the admission payload scope.
+  #submissionEvents(
+    events: AsyncIterable<InboundLifecycleEvent>,
+    finished: Promise<void>,
+  ): AsyncIterable<InboundLifecycleEvent> {
+    return {
+      [Symbol.asyncIterator]() {
+        const iterator = events[Symbol.asyncIterator]();
+        return {
+          async next() {
+            try {
+              const next = await iterator.next();
+              if (next.done) await finished;
+              return next;
+            } catch (error) {
+              // A failed queue can discard payloads immediately; consumers
+              // observe failure only after submission-owned cleanup settles.
+              await finished;
+              throw error;
+            }
+          },
+        };
+      },
+    };
+  }
+
+  async #submissionOperation<T>(
+    submissionId: string | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const submission = submissionId
+      ? this.#submissions.get(submissionId)
+      : undefined;
+    if (submission) submission.operations++;
+    try {
+      // Admission starts after the stream is returned, permitting cancellation
+      // before a synchronous ask/activation claim.
+      return await Promise.resolve().then(operation);
+    } catch (error) {
+      if (submission && submissionId)
+        this.#failSubmissionChannel(submissionId, submission, error);
+      throw error;
+    } finally {
+      if (submission) submission.operations--;
+      this.#closeSubmissionIfIdle(submissionId);
+    }
+  }
+
+  #cancelSubmission(id: string): void {
+    const state = this.#submissions.get(id);
+    if (state) this.#releaseSubmission(id, state);
   }
 
   #submissionChannel(
     submissionId: string | undefined,
   ): HotAsyncQueue<InboundLifecycleEvent> | undefined {
-    return submissionId === undefined
-      ? undefined
-      : this.#submissions.get(submissionId)?.channel;
+    const state =
+      submissionId === undefined
+        ? undefined
+        : this.#submissions.get(submissionId);
+    return state?.failure === undefined ? state?.channel : undefined;
   }
 
   /** Push a `handshake-required` event and correlate the handshake to its channel. */
@@ -1083,19 +1328,88 @@ export class WorkerHubService {
   ): void {
     if (submissionId === undefined) return;
     const state = this.#submissions.get(submissionId);
-    if (!state) return;
+    if (!state || this.#handshakeSubmissions.has(step.handshakeId)) return;
+    const expiresAt = Date.now() + HANDSHAKE_TIMEOUT_MS;
+    const timer = setTimeout(() => {
+      void this.#retireHandshake(step.handshakeId, correlation, "expired");
+    }, HANDSHAKE_TIMEOUT_MS);
+    timer.unref?.();
+    const correlation: HandshakeSubmission = {
+      submissionId,
+      arcRef: step.arcRef,
+      arcRunId: step.arcRunId,
+      expiresAt,
+      timer,
+    };
+    this.#handshakeSubmissions.set(step.handshakeId, correlation);
+    state.pending += 1;
     state.channel.push({
       kind: "handshake-required",
       arcRunId: step.arcRunId,
       handshakeId: step.handshakeId,
+      expiresAt: new Date(expiresAt).toISOString(),
       arcRef: step.arcRef,
       requirement: step.requirement,
     });
-    this.#handshakeSubmissions.set(step.handshakeId, {
-      submissionId,
-      arcRef: step.arcRef,
-    });
-    state.pending += 1;
+    if (state.controller.signal.aborted)
+      void this.#retireHandshake(step.handshakeId, correlation, "cancelled");
+  }
+
+  #retireHandshake(
+    id: string,
+    correlation: HandshakeSubmission,
+    outcome: "expired" | "cancelled",
+  ): Promise<void> {
+    if (correlation.retirement) return correlation.retirement;
+    if (this.#handshakeSubmissions.get(id) !== correlation)
+      return Promise.resolve();
+    correlation.retirementOutcome = outcome;
+    clearTimeout(correlation.timer);
+    const cleanup = this.#arcHost.releaseTrigger(correlation.arcRunId);
+    const retirement = this.#submissionOperation(
+      correlation.submissionId,
+      async () => {
+        try {
+          await cleanup;
+        } finally {
+          if (!correlation.resolving)
+            this.#releaseHandshakeCorrelation(id, correlation, outcome);
+        }
+      },
+    );
+    correlation.retirement = retirement;
+    void retirement.catch(() => {});
+    return retirement;
+  }
+
+  #releaseHandshakeCorrelation(
+    id: string,
+    correlation: HandshakeSubmission,
+    outcome: Extract<
+      InboundLifecycleEvent,
+      { kind: "handshake-settled" }
+    >["outcome"] = "unavailable",
+  ): void {
+    if (this.#handshakeSubmissions.get(id) !== correlation) return;
+    this.#handshakeSubmissions.delete(id);
+    clearTimeout(correlation.timer);
+    const submission = this.#submissions.get(correlation.submissionId);
+    if (!submission) return;
+    // Remove the correlation before publishing: overflow can reenter cancellation.
+    try {
+      if (!submission.failure)
+        submission.channel.push({
+          kind: "handshake-settled",
+          handshakeId: id,
+          outcome,
+        });
+    } catch (error) {
+      this.#failSubmissionChannel(correlation.submissionId, submission, error);
+      throw error;
+    } finally {
+      submission.pending -= 1;
+      this.#closeSubmissionIfIdle(correlation.submissionId);
+    }
   }
 
   /**
@@ -1173,6 +1487,11 @@ export class WorkerHubService {
     if (submission) submission.pending += 1;
     try {
       for (const step of steps) {
+        if (submission?.controller.signal.aborted && step.kind !== "action") {
+          if (step.kind === "handshake" || step.kind === "trigger")
+            await this.#arcHost.releaseTrigger(step.arcRunId);
+          continue;
+        }
         if (
           step.kind === "trigger" &&
           submission &&
@@ -1180,6 +1499,10 @@ export class WorkerHubService {
         ) {
           submission.triggerProbeIds.add(step.arcRunId);
           submission.pending += 1;
+        }
+        if (step.kind === "trigger") {
+          this.#watchTrigger(step, submissionId);
+          if (!this.#ownsTriggerProbe(submissionId, step.arcRunId)) continue;
         }
         const dialog =
           step.kind === "action"
@@ -1198,12 +1521,15 @@ export class WorkerHubService {
                 step.arcRunId,
                 step.frontier.frontierId,
               )
-            : undefined,
+            : step.kind === "trigger" || step.kind === "handshake"
+              ? this.#arcHost.releaseTrigger(step.arcRunId)
+              : undefined,
         ),
       );
       throw error;
     } finally {
       if (submission) submission.pending -= 1;
+      this.#closeSubmissionIfIdle(submissionId);
     }
     this.#closeSubmissionIfIdle(submissionId);
     return commands.length > 0 ? commands : { kind: "continue" };
@@ -1213,9 +1539,12 @@ export class WorkerHubService {
   #closeSubmissionIfIdle(submissionId: string | undefined): void {
     if (submissionId === undefined) return;
     const state = this.#submissions.get(submissionId);
-    if (!state || state.pending > 0) return;
+    if (!state || state.pending > 0 || state.operations > 0) return;
     state.channel.close();
+    state.removeAbortListener?.();
+    state.removeAbortListener = undefined;
     this.#submissions.delete(submissionId);
+    state.finish();
   }
 
   /** Drop one unusable submission channel without mutating arc host work. */
@@ -1225,23 +1554,202 @@ export class WorkerHubService {
     error: unknown,
   ): void {
     if (this.#submissions.get(submissionId) !== submission) return;
-    this.#releaseSubmission(submissionId, submission);
+    submission.failure ??= (
+      error instanceof Error ? error.message : String(error)
+    ).slice(0, 1024);
     submission.channel.fail(error);
+    this.#releaseSubmission(submissionId, submission);
   }
 
   #releaseSubmission(submissionId: string, submission: SubmissionState): void {
-    this.#submissions.delete(submissionId);
-    for (const probeId of submission.triggerProbeIds) {
+    if (submission.cancelling) return;
+    submission.cancelling = true;
+    submission.controller.abort();
+    // Own cleanup before releasing branch holds. In-flight deliveries and
+    // activation dispatches retain their separate operation holds.
+    submission.operations++;
+    const releases: Promise<unknown>[] = [];
+    releases.push(
+      ...this.#retireSubmissionProbes(submission, [
+        ...submission.triggerProbeIds,
+      ]),
+    );
+    for (const [handshakeId, correlation] of this.#handshakeSubmissions) {
+      if (correlation.submissionId === submissionId) {
+        releases.push(
+          this.#retireHandshake(handshakeId, correlation, "cancelled"),
+        );
+      }
+    }
+    submission.cleanup = Promise.allSettled(releases)
+      .then((results) => {
+        const errors = results.flatMap((result) =>
+          result.status === "rejected" ? [result.reason] : [],
+        );
+        if (errors.length) {
+          submission.failure ??= "Submission cleanup failed.";
+          submission.channel.fail(
+            new AggregateError(errors, submission.failure),
+          );
+          this.#logger.info("worker_hub.submission.cleanup_failed", {
+            submissionId,
+            failures: errors.length,
+          });
+        }
+      })
+      .finally(() => {
+        submission.operations--;
+        this.#closeSubmissionIfIdle(submissionId);
+      });
+  }
+
+  #retireSubmissionProbes(
+    submission: SubmissionState,
+    probeIds: readonly ArcRunId[],
+  ): Promise<unknown>[] {
+    const releases: Promise<unknown>[] = [];
+    for (const probeId of probeIds) {
+      if (!submission.triggerProbeIds.delete(probeId)) continue;
+      this.#retireProbeBookkeeping(probeId);
       const continuation = this.#pausedContinuations.get(probeId);
       if (continuation) this.#routineWorkers.delete(continuation.routineId);
       this.#pausedContinuations.delete(probeId);
       this.#clearCapacityRetry(probeId);
-    }
-    for (const [handshakeId, correlation] of this.#handshakeSubmissions) {
-      if (correlation.submissionId === submissionId) {
-        this.#handshakeSubmissions.delete(handshakeId);
+      releases.push(this.#arcHost.releaseTrigger(probeId));
+      const scope = this.#workScopes.get(probeId);
+      if (scope) {
+        const routines = [...scope.routines.values()];
+        releases.push(
+          this.#releaseScope(scope).then(() =>
+            Promise.all(
+              routines.map((owned) => this.#disposeOwnedRoutine(owned)),
+            ),
+          ),
+        );
       }
+      submission.pending--;
     }
+    return releases;
+  }
+
+  #watchTrigger(
+    step: Extract<ArcHostStep, { kind: "trigger" }>,
+    submissionId: string | undefined,
+  ): void {
+    const previous = this.#triggerDeadlines.get(step.arcRunId);
+    if (previous?.step.frontier.frontierId === step.frontier.frontierId) {
+      previous.step = step;
+      previous.advancing = false;
+      if (Date.now() >= previous.expiresAt) this.#expireTrigger(previous);
+      return;
+    }
+    const timer = setTimeout(
+      () => this.#expireTrigger(deadline),
+      TRIGGER_TIMEOUT_MS,
+    );
+    timer.unref?.();
+    const deadline: TriggerDeadline = {
+      step,
+      submissionId,
+      expiresAt: Date.now() + TRIGGER_TIMEOUT_MS,
+      timer,
+      advancing: false,
+    };
+    this.#triggerDeadlines.set(step.arcRunId, deadline);
+    if (previous) clearTimeout(previous.timer);
+  }
+
+  #unwatchTrigger(arcRunId: ArcRunId): void {
+    const deadline = this.#triggerDeadlines.get(arcRunId);
+    if (deadline) clearTimeout(deadline.timer);
+    this.#triggerDeadlines.delete(arcRunId);
+  }
+
+  #claimTriggerAdvance(arcRunId: ArcRunId, frontierId: string): boolean {
+    const deadline = this.#triggerDeadlines.get(arcRunId);
+    if (
+      !deadline ||
+      deadline.advancing ||
+      !this.#triggerWorkCurrent(arcRunId, frontierId)
+    )
+      return false;
+    deadline.advancing = true;
+    return true;
+  }
+
+  #triggerStepAvailable(arcRunId: ArcRunId, frontierId: string): boolean {
+    return (
+      this.#triggerDeadlines.get(arcRunId)?.advancing === false &&
+      this.#triggerWorkCurrent(arcRunId, frontierId)
+    );
+  }
+
+  /** Worker preparation can overlap advancement that retains this frontier. */
+  #triggerWorkCurrent(arcRunId: ArcRunId, frontierId: string): boolean {
+    const deadline = this.#triggerDeadlines.get(arcRunId);
+    if (
+      !deadline ||
+      deadline.step.frontier.frontierId !== frontierId ||
+      !this.#ownsTriggerProbe(deadline.submissionId, arcRunId)
+    )
+      return false;
+    if (Date.now() >= deadline.expiresAt) {
+      this.#expireTrigger(deadline);
+      return false;
+    }
+    return true;
+  }
+
+  #expireTrigger(deadline: TriggerDeadline): void {
+    const { step, submissionId } = deadline;
+    if (
+      this.#triggerDeadlines.get(step.arcRunId) !== deadline ||
+      deadline.advancing
+    )
+      return;
+    const submission =
+      submissionId === undefined
+        ? undefined
+        : this.#submissions.get(submissionId);
+    if (!submission || !this.#ownsTriggerProbe(submissionId, step.arcRunId)) {
+      this.#unwatchTrigger(step.arcRunId);
+      return;
+    }
+    deadline.advancing = true;
+    clearTimeout(deadline.timer);
+    const scope = this.#workScopes.get(step.arcRunId);
+    if (scope?.frontierId === step.frontier.frontierId) {
+      this.#supersedeFrontier(scope);
+      const cleanup = scope.cleanup;
+      void this.#submissionOperation(submissionId, () => cleanup).catch(
+        () => {},
+      );
+      this.#forgetScope(scope);
+    }
+    this.#moduleEffects.delete(step.arcRunId);
+    submission.finalizations++;
+    const operation = this.#submissionOperation(submissionId, async () => {
+      try {
+        this.#retireProbeBookkeeping(step.arcRunId);
+        if (submission.triggerProbeIds.delete(step.arcRunId))
+          submission.pending--;
+        const steps = await this.#arcHost.advanceTrigger(step.arcRunId, {
+          skip: { frontierId: step.frontier.frontierId },
+          projectDialog: async (view) =>
+            projectInboundDialog(submission.inbound, view),
+        });
+        const commands = await this.#dispatchForkSteps(
+          steps,
+          submission.inbound,
+          submissionId,
+        );
+        for (const command of queueRouteCommands(commands))
+          this.#applyQueueRouteCommand(command, []);
+      } finally {
+        submission.finalizations--;
+      }
+    });
+    void operation.catch(() => {});
   }
 
   #ownsTriggerProbe(
@@ -1249,10 +1757,21 @@ export class WorkerHubService {
     arcRunId: ArcRunId,
   ): boolean {
     return (
-      submissionId === undefined ||
-      this.#submissions.get(submissionId)?.triggerProbeIds.has(arcRunId) ===
-        true
+      this.#lifecycle === "started" &&
+      (submissionId === undefined ||
+        (this.#submissions.get(submissionId)?.controller.signal.aborted ===
+          false &&
+          this.#submissions.get(submissionId)?.triggerProbeIds.has(arcRunId) ===
+            true))
     );
+  }
+
+  /** Probe identities never become action-run identities or resumable failures. */
+  #retireProbeBookkeeping(arcRunId: ArcRunId): void {
+    this.#unwatchTrigger(arcRunId);
+    const lap = this.#laps.get(arcRunId);
+    if (lap) this.#finishLap(lap, "retired", "terminated");
+    this.#lapFailures.delete(arcRunId);
   }
 
   #ownsContinuation(
@@ -1260,7 +1779,14 @@ export class WorkerHubService {
   ): boolean {
     return (
       continuation?.stage !== "trigger" ||
-      this.#ownsTriggerProbe(continuation.submissionId, continuation.arcRunId)
+      (this.#ownsTriggerProbe(
+        continuation.submissionId,
+        continuation.arcRunId,
+      ) &&
+        this.#triggerWorkCurrent(
+          continuation.arcRunId,
+          continuation.frontier.frontierId,
+        ))
     );
   }
 
@@ -1280,9 +1806,7 @@ export class WorkerHubService {
 
   /** Unconditionally close a submission (terminal-immediate paths: idle/rejected/targeted). */
   #closeSubmission(submissionId: string | undefined): void {
-    if (submissionId === undefined) return;
-    this.#submissions.get(submissionId)?.channel.close();
-    this.#submissions.delete(submissionId);
+    this.#closeSubmissionIfIdle(submissionId);
   }
 
   /**
@@ -1302,9 +1826,13 @@ export class WorkerHubService {
         : undefined;
       let result: QueueDrainResult;
       try {
-        result = await this.#drainQueue(
-          [{ kind: "connector-handshake", id, values, clientId }],
-          "handshake",
+        result = await this.#submissionOperation(
+          correlation?.submissionId,
+          () =>
+            this.#drainQueue(
+              [{ kind: "connector-handshake", id, values, clientId }],
+              "handshake",
+            ),
         );
       } catch (error) {
         if (correlation && submission) {
@@ -1313,8 +1841,19 @@ export class WorkerHubService {
             submission,
             error,
           );
+          this.#releaseHandshakeCorrelation(id, correlation);
         }
         throw error;
+      } finally {
+        if (correlation) {
+          correlation.resolving = false;
+          if (correlation.retirementOutcome)
+            this.#releaseHandshakeCorrelation(
+              id,
+              correlation,
+              correlation.retirementOutcome,
+            );
+        }
       }
       if (result.kind !== "handshake-receipt") {
         throw new Error(
@@ -1326,8 +1865,14 @@ export class WorkerHubService {
   }
 
   #scheduleRun(arcRunId: ArcRunId, events: QueueEvent[]): void {
-    void this.#run(arcRunId, () =>
-      this.#drainQueue(events, "background"),
+    const submissionId = events.find(
+      (event) => "submissionId" in event && event.submissionId !== undefined,
+    );
+    void this.#submissionOperation(
+      submissionId && "submissionId" in submissionId
+        ? submissionId.submissionId
+        : undefined,
+      () => this.#run(arcRunId, () => this.#drainQueue(events, "background")),
     ).catch((error: unknown) => {
       for (const event of events) {
         if (!("submissionId" in event) || event.submissionId === undefined)
@@ -1344,8 +1889,9 @@ export class WorkerHubService {
   }
 
   async #run<T>(arcRunId: string, task: () => Promise<T>): Promise<T> {
-    return this.#runSerializer.run(arcRunId, async () => {
+    const operation = this.#runSerializer.run(arcRunId, async () => {
       try {
+        this.#assertStarted();
         return await task();
       } catch (error) {
         const scope = this.#workScopes.get(arcRunId);
@@ -1353,14 +1899,48 @@ export class WorkerHubService {
         throw error;
       }
     });
+    this.#runDrains.add(operation);
+    try {
+      return await operation;
+    } finally {
+      this.#runDrains.delete(operation);
+    }
   }
 
-  /** Retain the first failure, release its work, and announce the resulting park. */
+  /** Only a continuing action run owns a recoverable failure. */
   async #recordLapFailure(
     arcRunId: ArcRunId,
     error: unknown,
     scope?: FrontierWorkScope,
   ): Promise<void> {
+    if (this.#lifecycle !== "started") return;
+    if (
+      scope &&
+      (scopeCancelled(scope) || this.#workScopes.get(arcRunId) !== scope)
+    )
+      return;
+    const lap = this.#laps.get(arcRunId);
+    if (scope?.stage === "trigger") {
+      this.#retireProbeBookkeeping(arcRunId);
+      await this.#releaseScope(scope);
+      return;
+    }
+    if (!scope) {
+      // A rebuild can fail before a frontier/scope exists. Prove that it still
+      // belongs to an active action run before retaining an execution-control park.
+      const run = await this.#arcHost
+        .getRunView(arcRunId)
+        .catch(() => undefined);
+      if (
+        this.#lifecycle !== "started" ||
+        run?.stage !== "actioning" ||
+        run.lifecycle !== "active" ||
+        this.#laps.get(arcRunId) !== lap
+      )
+        return;
+    }
+    if (lap && (!scope || lap.scope === scope))
+      this.#finishLap(lap, "failed", "parked");
     const failure = this.#lapFailures.get(arcRunId) ?? {
       message: error instanceof Error ? error.message : String(error),
       failedAt: new Date().toISOString(),
@@ -1368,7 +1948,12 @@ export class WorkerHubService {
     };
     this.#lapFailures.set(arcRunId, failure);
     if (scope) await this.#releaseScope(scope);
-    if (failure.announced || this.#lifecycle !== "started") return;
+    if (
+      failure.announced ||
+      this.#lifecycle !== "started" ||
+      this.#lapFailures.get(arcRunId) !== failure
+    )
+      return;
     failure.announced = true;
     this.#emitParkedControl(
       {
@@ -1398,7 +1983,6 @@ export class WorkerHubService {
     const lap: LapState = (runId && this.#laps.get(runId)) || {
       taskResultCount: 0,
     };
-    if (runId) this.#laps.set(runId, lap);
     let result: QueueDrainResult | undefined;
     while (queue.length > 0) {
       const event = queue.shift();
@@ -1463,6 +2047,7 @@ export class WorkerHubService {
     lap: LapState,
     entrypoint: QueueEntrypoint,
   ): Promise<QueueRouteCommands> {
+    if (this.#lifecycle !== "started") return { kind: "continue" };
     if ("scope" in event && event.scope?.released) return { kind: "continue" };
     if (event.kind === "connector-inbound") {
       return this.#routeConnectorInboundEvent(
@@ -1489,6 +2074,10 @@ export class WorkerHubService {
     message: InboundMessage,
     submissionId: string | undefined,
   ): Promise<QueueRouteCommands> {
+    const submission = submissionId
+      ? this.#submissions.get(submissionId)
+      : undefined;
+    if (submission?.controller.signal.aborted) return { kind: "continue" };
     const channel = this.#submissionChannel(submissionId);
     if (message.arcRunId !== undefined) {
       const arcRunId = message.arcRunId;
@@ -1502,7 +2091,12 @@ export class WorkerHubService {
         this.#closeSubmission(submissionId);
         return { kind: "continue" };
       }
-      const settlement = await this.#settleAskAnswer(arcRunId, askId, message);
+      const settlement = await this.#settleAskAnswer(
+        arcRunId,
+        askId,
+        message,
+        submission,
+      );
       if (settlement === "settled") {
         channel?.push({ kind: "continued", arcRunId });
       } else {
@@ -1561,8 +2155,7 @@ export class WorkerHubService {
         ? rawPolicy
         : undefined;
     const steps = await this.#arcHost.begin({
-      dialog: projectInboundDialog(message, { roleId: DEFAULT_WORKER_ROLE }),
-      inbound: message,
+      signal: submission?.controller.signal,
       clientId,
       principal,
       activationPolicy,
@@ -1582,6 +2175,10 @@ export class WorkerHubService {
     if (!correlation) {
       return { kind: "handshake-receipt", receipt: { status: "missing" } };
     }
+    if (correlation.retirement || Date.now() >= correlation.expiresAt) {
+      await this.#retireHandshake(event.id, correlation, "expired");
+      return { kind: "handshake-receipt", receipt: { status: "missing" } };
+    }
     const { submissionId, arcRef } = correlation;
     const submission = this.#submissions.get(submissionId);
     if (!submission) {
@@ -1598,11 +2195,13 @@ export class WorkerHubService {
       throw error;
     }
 
+    correlation.resolving = true;
     const result = await this.#arcHost.resolveHandshake(
       event.id,
       event.values,
       {
         clientId: event.clientId,
+        signal: submission.controller.signal,
         projectDialog: async (view) =>
           projectInboundDialog(submission.inbound, view),
       },
@@ -1611,15 +2210,30 @@ export class WorkerHubService {
       this.#handshakeSubmissions.get(event.id) !== correlation ||
       this.#submissions.get(submissionId) !== submission
     ) {
+      if (
+        result.status === "missing" &&
+        !this.#handshakeSubmissions.has(event.id)
+      )
+        return { kind: "handshake-receipt", receipt: { status: "missing" } };
       throw new Error(
         `Submission ${submissionId} changed while handshake ${event.id} was resolving.`,
       );
     }
 
     if (result.status === "missing") {
-      this.#handshakeSubmissions.delete(event.id);
-      submission.pending -= 1;
-      this.#closeSubmissionIfIdle(submissionId);
+      this.#releaseHandshakeCorrelation(
+        event.id,
+        correlation,
+        correlation.retirementOutcome ?? "unavailable",
+      );
+      return { kind: "handshake-receipt", receipt: { status: "missing" } };
+    }
+    if (result.status === "invalid" && correlation.retirementOutcome) {
+      this.#releaseHandshakeCorrelation(
+        event.id,
+        correlation,
+        correlation.retirementOutcome,
+      );
       return { kind: "handshake-receipt", receipt: { status: "missing" } };
     }
     if (result.status === "invalid") {
@@ -1632,7 +2246,6 @@ export class WorkerHubService {
 
     // Resolved: the handshake correlation is spent. Its decision unit is
     // released after its authoritative lifecycle outcome is published.
-    this.#handshakeSubmissions.delete(event.id);
     const okReceipt: QueueRouteCommand = {
       kind: "handshake-receipt",
       receipt: { status: "ok" },
@@ -1650,8 +2263,7 @@ export class WorkerHubService {
         reactivationCount: result.reactivationCount,
         arcRef,
       });
-      submission.pending -= 1;
-      this.#closeSubmissionIfIdle(submissionId);
+      this.#releaseHandshakeCorrelation(event.id, correlation, "joined");
       try {
         this.#logInboundAccepted(result.arcRunId, submission.inbound);
       } catch {
@@ -1663,13 +2275,27 @@ export class WorkerHubService {
     // status === "ok": one step — a fresh `action`, a next-round `handshake`, or
     // a semantic rejection. Dispatch it like a single-step fork.
 
-    const forkCommands = await this.#dispatchForkSteps(
-      [result.step],
-      submission.inbound,
-      submissionId,
-    );
-    submission.pending -= 1;
-    this.#closeSubmissionIfIdle(submissionId);
+    let forkCommands: QueueRouteCommands;
+    try {
+      forkCommands = await this.#dispatchForkSteps(
+        [result.step],
+        submission.inbound,
+        submissionId,
+      );
+    } finally {
+      const declined =
+        event.values.decline === true ||
+        event.values.arcChoice?.activate === false;
+      this.#releaseHandshakeCorrelation(
+        event.id,
+        correlation,
+        declined
+          ? "declined"
+          : result.step.kind === "rejected"
+            ? "unavailable"
+            : "proceeded",
+      );
+    }
     return [
       ...(Array.isArray(forkCommands) ? forkCommands : [forkCommands]),
       okReceipt,
@@ -1688,9 +2314,15 @@ export class WorkerHubService {
       return { kind: "continue" };
     }
     const { arcRunId, frontier } = step;
+    if (this.#lifecycle !== "started") {
+      if (step.kind === "trigger") await this.#arcHost.releaseTrigger(arcRunId);
+      else await this.#arcHost.releaseAction(arcRunId, frontier.frontierId);
+      return { kind: "continue" };
+    }
     if (
       step.kind === "trigger" &&
-      !this.#ownsTriggerProbe(event.submissionId, arcRunId)
+      (!this.#ownsTriggerProbe(event.submissionId, arcRunId) ||
+        !this.#triggerStepAvailable(arcRunId, frontier.frontierId))
     ) {
       return { kind: "continue" };
     }
@@ -1701,6 +2333,7 @@ export class WorkerHubService {
       });
       lap.arcRunId = arcRunId;
     }
+    this.#laps.set(arcRunId, lap);
     if (event.step >= MAX_HOST_STEPS_PER_DRAIN) {
       // Depth bound: yield the run's lane, re-queuing the carried frontier
       // verbatim behind anything scheduled for this run in the meantime.
@@ -1713,7 +2346,11 @@ export class WorkerHubService {
       if (frontier.interruption)
         this.#uncaughtInterruptions.set(arcRunId, frontier.interruption);
       // Every other handback leaves the active lifecycle, where no park applies.
-      else this.#runsSinceStart.delete(arcRunId);
+      else {
+        this.#runsSinceStart.delete(arcRunId);
+        this.#lapFailures.delete(arcRunId);
+        this.#uncaughtInterruptions.delete(arcRunId);
+      }
       const scope = event.scope ?? this.#workScopes.get(arcRunId);
       if (scope) await this.#releaseScope(scope);
       else await this.#arcHost.releaseAction(arcRunId, frontier.frontierId);
@@ -1739,6 +2376,7 @@ export class WorkerHubService {
       );
     }
     const workScope = this.#scopeFor(event);
+    lap.scope = workScope;
     if (this.#moduleEffects.get(arcRunId)?.length)
       this.#scheduleRun(arcRunId, [{ kind: "module-effects", arcRunId }]);
     const tasks = this.#dedupeTasks(frontier.tasks);
@@ -1751,42 +2389,64 @@ export class WorkerHubService {
       );
     if (workScope?.dispatched) return { kind: "continue" };
     if (workScope) workScope.dispatched = true;
-    const invocation = this.#handleTasks(tasks, workScope).then(
-      (results) => {
-        this.#scheduleRun(arcRunId, [
-          {
-            kind: "task-results",
+    const invocation = this.#submissionOperation(event.submissionId, () =>
+      this.#handleTasks(tasks, workScope).then(
+        async (results) => {
+          if (this.#lifecycle !== "started" || scopeCancelled(workScope))
+            return;
+          if (
+            step.kind === "trigger" &&
+            !this.#ownsTriggerProbe(event.submissionId, arcRunId)
+          ) {
+            // Result persistence may have completed after ownership ended. Retire
+            // its resources without opening another lap or retaining a park.
+            await this.#releaseScope(workScope);
+            return;
+          }
+          this.#scheduleRun(arcRunId, [
+            {
+              kind: "task-results",
+              arcRunId,
+              stage: step.kind,
+              frontier,
+              scope: workScope,
+              dialog: event.dialog,
+              tasks,
+              results,
+              step: event.step,
+              submissionId: event.submissionId,
+            },
+          ]);
+        },
+        async (error: unknown) => {
+          await this.#recordLapFailure(arcRunId, error, workScope);
+          if (event.submissionId) {
+            const submission = this.#submissions.get(event.submissionId);
+            if (submission)
+              this.#failSubmissionChannel(
+                event.submissionId,
+                submission,
+                error,
+              );
+          }
+          this.#logger.info("worker_hub.lap.failed", {
             arcRunId,
-            stage: step.kind,
-            frontier,
-            scope: workScope,
-            dialog: event.dialog,
-            tasks,
-            results,
-            step: event.step,
-            submissionId: event.submissionId,
-          },
-        ]);
-      },
-      async (error: unknown) => {
-        await this.#recordLapFailure(arcRunId, error, workScope);
-        if (event.submissionId) {
-          const submission = this.#submissions.get(event.submissionId);
-          if (submission)
-            this.#failSubmissionChannel(event.submissionId, submission, error);
-        }
-        this.#logger.info("worker_hub.lap.failed", {
-          arcRunId,
-          message: String(error),
-        });
-      },
+            message: String(error),
+          });
+        },
+      ),
     );
+    this.#trackTaskInvocation(invocation);
+    return { kind: "continue" };
+  }
+
+  #trackTaskInvocation(invocation: Promise<void>): Promise<void> {
     this.#taskInvocations.add(invocation);
     void invocation.then(
       () => this.#taskInvocations.delete(invocation),
       () => this.#taskInvocations.delete(invocation),
     );
-    return { kind: "continue" };
+    return invocation;
   }
 
   async #routeTaskResultsEvent(
@@ -1797,7 +2457,8 @@ export class WorkerHubService {
     void entrypoint;
     if (
       event.stage === "trigger" &&
-      !this.#ownsTriggerProbe(event.submissionId, event.arcRunId)
+      (!this.#ownsTriggerProbe(event.submissionId, event.arcRunId) ||
+        !this.#triggerStepAvailable(event.arcRunId, event.frontier.frontierId))
     ) {
       this.#clearCapacityRetry(event.arcRunId);
       for (const result of event.results) {
@@ -1806,6 +2467,8 @@ export class WorkerHubService {
       }
       return { kind: "continue" };
     }
+    const workScope = event.scope;
+    if (workScope && scopeCancelled(workScope)) return { kind: "continue" };
     if (!lap.arcRunId) {
       // A drain opens on task-results only via a park-resume continuation.
       this.#logger.info("worker_hub.lap.started", {
@@ -1814,8 +2477,8 @@ export class WorkerHubService {
       });
       lap.arcRunId = event.arcRunId;
     }
-    const workScope = event.scope;
-    if (workScope && scopeCancelled(workScope)) return { kind: "continue" };
+    lap.scope = workScope;
+    this.#laps.set(event.arcRunId, lap);
     const hasFailedResult = event.results.some(
       (result) =>
         result.status === "finished" && result.report.error === "failed",
@@ -1910,21 +2573,21 @@ export class WorkerHubService {
       event.submissionId !== undefined
         ? this.#submissions.get(event.submissionId)?.inbound
         : undefined;
-    const steps = await this.#arcHost.advanceTrigger(
-      event.arcRunId,
-      event.dialog,
-      {
-        ...advanceInput,
-        projectDialog: async (view) => {
-          if (!heldInbound) {
-            throw new Error(
-              `Trigger advance for ${event.arcRunId} cannot project a dialog: its submission is gone.`,
-            );
-          }
-          return projectInboundDialog(heldInbound, view);
-        },
+    const trigger = this.#triggerDeadlines.get(event.arcRunId)?.step;
+    if (!trigger) return { kind: "continue" };
+    if (!this.#claimTriggerAdvance(event.arcRunId, event.frontier.frontierId))
+      return { kind: "continue" };
+    const steps = await this.#arcHost.advanceTrigger(event.arcRunId, {
+      reports: advanceInput.reports,
+      projectDialog: async (view) => {
+        if (!heldInbound) {
+          throw new Error(
+            `Trigger advance for ${event.arcRunId} cannot project a dialog: its submission is gone.`,
+          );
+        }
+        return projectInboundDialog(heldInbound, view);
       },
-    );
+    });
 
     this.#retireAcceptedResults(workScope, event.results);
 
@@ -1951,6 +2614,9 @@ export class WorkerHubService {
 
     const only = steps.length === 1 ? steps[0] : undefined;
     if (only?.kind === "trigger") {
+      this.#watchTrigger(only, event.submissionId);
+      if (!this.#ownsTriggerProbe(event.submissionId, event.arcRunId))
+        return { kind: "continue" };
       return {
         kind: "enqueue",
         events: [
@@ -1964,6 +2630,7 @@ export class WorkerHubService {
         ],
       };
     }
+    this.#unwatchTrigger(event.arcRunId);
     if (event.submissionId !== undefined) {
       const submission = this.#submissions.get(event.submissionId);
       if (submission?.triggerProbeIds.delete(event.arcRunId)) {
@@ -2016,8 +2683,9 @@ export class WorkerHubService {
       yieldReason,
       taskResultCount: lap.taskResultCount,
     });
-    this.#laps.delete(lap.arcRunId);
+    if (this.#laps.get(lap.arcRunId) === lap) this.#laps.delete(lap.arcRunId);
     lap.arcRunId = undefined;
+    lap.scope = undefined;
     lap.taskResultCount = 0;
   }
 
@@ -2137,12 +2805,15 @@ export class WorkerHubService {
       const runContext = await this.#arcHost.getRunWorkspaceContext(
         task.arcRunId,
       );
+      if (scopeCancelled(workScope)) break;
       const contextKey = workerContextKey(task, runContext.reactivationCount);
       const context = await this.#prepareRoutineContext(task, {
         workspacePath: runContext.workspacePath,
         workspaceBundle: runContext.workspaceBundle,
       });
+      if (scopeCancelled(workScope)) break;
       const node = await this.#nodeInfoForTask(task);
+      if (scopeCancelled(workScope)) break;
       const selected = this.#selectWorker(task);
       entries.push({ task, context, contextKey, node, selected });
     }
@@ -2201,36 +2872,6 @@ export class WorkerHubService {
     }
   }
 
-  async #warmWorker(
-    selected: ResolvedWorker,
-    task: Task,
-    context: RoutineContext,
-    contextKey: string,
-  ): Promise<void> {
-    if (!selected.worker.warm) return;
-    const logFailure = (error: unknown): void => {
-      this.#logger.info("worker_hub.worker.warm_failed", {
-        backend: selected.backend,
-        slot: selected.slot,
-        role: task.role,
-        arcRunId: task.arcRunId,
-        error: previewLogValue(error),
-      });
-    };
-    try {
-      await Promise.resolve(
-        selected.worker.warm({
-          arcRunId: task.arcRunId,
-          role: task.role,
-          contextKey,
-          workspacePath: context.workspacePath,
-        }),
-      ).catch(logFailure);
-    } catch (error) {
-      logFailure(error);
-    }
-  }
-
   async #runRoutine(
     routine: RoutineState,
     context: RoutineContext,
@@ -2283,7 +2924,15 @@ export class WorkerHubService {
         JSON.stringify([routine.arcRunId, contextKey]),
         async () => {
           try {
-            if (scopeCancelled(workScope) && owned)
+            if (
+              owned &&
+              (scopeCancelled(workScope) ||
+                (workScope?.stage === "trigger" &&
+                  !this.#triggerWorkCurrent(
+                    workScope.arcRunId,
+                    workScope.frontierId,
+                  )))
+            )
               return this.#skipSupersededRoutine(owned);
             let report: RoutineReport;
             const scope = this.#effectsForRoutine(
@@ -2312,8 +2961,10 @@ export class WorkerHubService {
                   "Worker resource release failed; this worker cannot be reused.",
                 );
               // Resumption consumes live provider state retained by this worker.
-              if (!options.resume)
-                await this.#warmWorker(selected, task, context, contextKey);
+              if (!owned)
+                throw new Error("Routine invocation has no frontier owner.");
+              if (scopeCancelled(workScope))
+                return this.#skipSupersededRoutine(owned);
               const input: RoutineInput = {
                 routine: describeRoutine(routine, contextKey),
                 context,
@@ -2327,6 +2978,16 @@ export class WorkerHubService {
                 throw new Error(
                   "Worker resource release failed; this worker cannot be reused.",
                 );
+              // Setup and context serialization may cross the deadline before
+              // its timer is delivered. Check again at worker admission.
+              if (
+                workScope?.stage === "trigger" &&
+                !this.#triggerWorkCurrent(
+                  workScope.arcRunId,
+                  workScope.frontierId,
+                )
+              )
+                return this.#skipSupersededRoutine(owned);
               let rawReport: unknown;
               try {
                 rawReport = await selected.worker.run(input);
@@ -2857,9 +3518,7 @@ export class WorkerHubService {
     leaf.handlers = handlers;
     return () => {
       handlers.delete(handler);
-      // Pruning empty nodes is intentionally skipped: connectors register
-      // once at startup, so leftover branches are harmless and the
-      // bookkeeping would complicate registration.
+      pruneOutboundPath(this.#outboundRoot, path, leaf);
     };
   }
 
@@ -2956,9 +3615,15 @@ export class WorkerHubService {
     arcRunId: ArcRunId,
     askId: string,
     message: InboundMessage,
+    submission?: SubmissionState,
   ): Promise<"settled" | "invalid" | "missing"> {
     const entry = this.#askResolvers.get(askId);
     if (!entry || entry.arcRunId !== arcRunId) return "missing";
+    if (
+      entry.scope?.stage === "trigger" &&
+      !this.#triggerStepAvailable(arcRunId, entry.scope.frontierId)
+    )
+      return "missing";
 
     const verdict =
       entry.cause === PERMISSION_ASK_CAUSE
@@ -2969,7 +3634,10 @@ export class WorkerHubService {
     }
 
     // Taking the map entry is the claim. No await may occur before this delete.
+    if (submission?.controller.signal.aborted || this.#lifecycle !== "started")
+      return "missing";
     this.#askResolvers.delete(askId);
+    if (submission) submission.answerClaimed = true;
 
     if (entry.cause === PERMISSION_ASK_CAUSE) {
       entry.release();
@@ -2999,23 +3667,29 @@ export class WorkerHubService {
         ),
       );
     } catch (error) {
-      if (entry.isOwnerLive() && entry.scope && scopeCancelled(entry.scope)) {
-        this.#publishAskInvalidation(entry.scope, [askId]);
-        entry.release();
-        entry.reject(new Error(scopeCancellationMessage(entry.scope)));
-        throw error;
-      }
       if (
         entry.isOwnerLive() &&
+        !scopeCancelled(entry.scope) &&
         this.#lifecycle === "started" &&
         !this.#askResolvers.has(askId)
       ) {
         this.#askResolvers.set(askId, entry);
+      } else {
+        if (entry.scope) this.#publishAskInvalidation(entry.scope, [askId]);
+        entry.release();
+        entry.reject(new Error(`Answer ${askId} outlived its owning routine.`));
       }
       throw error;
     }
 
-    if (!entry.isOwnerLive()) {
+    if (
+      !entry.isOwnerLive() ||
+      scopeCancelled(entry.scope) ||
+      this.#lifecycle !== "started"
+    ) {
+      if (entry.scope) this.#publishAskInvalidation(entry.scope, [askId]);
+      entry.release();
+      entry.reject(new Error(`Answer ${askId} outlived its owning routine.`));
       throw new Error(
         `Routine ${entry.routineId} ended while answer ${askId} was committing.`,
       );
@@ -3760,12 +4434,30 @@ export class WorkerHubService {
     this.#capacityRetries.delete(arcRunId);
   }
 
-  async #resumeParkedRoutine(
+  #resumeParkedRoutine(
+    routineId: string,
+    origin: PausedRoutineOrigin | undefined,
+    continuation?: PausedRoutineContinuation,
+  ): Promise<void> {
+    return this.#trackTaskInvocation(
+      this.#submissionOperation(continuation?.submissionId, () =>
+        this.#prepareParkedRoutine(routineId, origin, continuation),
+      ),
+    );
+  }
+
+  async #prepareParkedRoutine(
     routineId: string,
     origin: PausedRoutineOrigin | undefined,
     continuation?: PausedRoutineContinuation,
   ): Promise<void> {
     const routine = await this.#routineStore.getRoutine(routineId);
+    if (
+      this.#lifecycle !== "started" ||
+      scopeCancelled(continuation?.scope) ||
+      !this.#ownsContinuation(continuation)
+    )
+      return;
     if (
       !routine ||
       (routine.status !== "paused" &&
@@ -3781,10 +4473,22 @@ export class WorkerHubService {
     routine.error = undefined;
     routine.updatedAt = new Date().toISOString();
     await this.#routineStore.putRoutine(routine);
+    if (
+      this.#lifecycle !== "started" ||
+      scopeCancelled(continuation?.scope) ||
+      !this.#ownsContinuation(continuation)
+    )
+      return;
 
     const runContext = await this.#arcHost.getRunWorkspaceContext(
       routine.arcRunId,
     );
+    if (
+      this.#lifecycle !== "started" ||
+      scopeCancelled(continuation?.scope) ||
+      !this.#ownsContinuation(continuation)
+    )
+      return;
     const contextKey = workerContextKey(
       routine.task,
       runContext.reactivationCount,
@@ -3800,10 +4504,14 @@ export class WorkerHubService {
           ? { delivery: "fresh-start" }
           : { delivery: "continue" },
     });
-    void this.#continueParkedRoutine(routine, context, contextKey, {
-      requireContinuation: wasPark,
-      continuation,
-    }).catch(async (error: unknown) => {
+    const invocation = this.#submissionOperation(
+      continuation?.submissionId,
+      () =>
+        this.#continueParkedRoutine(routine, context, contextKey, {
+          requireContinuation: wasPark,
+          continuation,
+        }),
+    ).catch(async (error: unknown) => {
       await this.#recordLapFailure(
         routine.arcRunId,
         error,
@@ -3815,6 +4523,7 @@ export class WorkerHubService {
         message: error instanceof Error ? error.message : String(error),
       });
     });
+    this.#trackTaskInvocation(invocation);
   }
 
   async #continueParkedRoutine(
@@ -3828,7 +4537,8 @@ export class WorkerHubService {
   ): Promise<void> {
     const continuation =
       opts.continuation ?? this.#pausedContinuations.get(routine.arcRunId);
-    if (!this.#ownsContinuation(continuation)) return;
+    if (this.#lifecycle !== "started" || !this.#ownsContinuation(continuation))
+      return;
     if (!continuation && opts.requireContinuation) return;
     if (continuation) {
       this.#pausedContinuations.delete(routine.arcRunId);
@@ -4195,7 +4905,7 @@ function advanceInputFromResults(
   results: readonly TaskResult[],
 ):
   | Omit<
-      Extract<AdvanceInput, { reports: readonly RoutineReport[] }>,
+      Extract<AdvanceActionInput, { reports: readonly RoutineReport[] }>,
       "projectDialog"
     >
   | undefined {
@@ -4251,7 +4961,6 @@ function advanceInputFromResults(
   return {
     reports,
     instructionCoverage: coverage,
-    intent: "agent-work",
   };
 }
 
@@ -4273,6 +4982,42 @@ function ensureOutboundNode(
     }
   }
   return node;
+}
+
+function pruneOutboundPath(
+  root: OutboundHandlerNode,
+  path: readonly string[],
+  leaf: OutboundHandlerNode,
+): void {
+  const ancestors: Array<{
+    parent: OutboundHandlerNode;
+    value: string;
+    node: OutboundHandlerNode;
+  }> = [];
+  let current = root;
+  for (const value of path) {
+    const node = value === "*" ? current.wildcard : current.exact.get(value);
+    if (!node) return;
+    ancestors.push({ parent: current, value, node });
+    current = node;
+  }
+  if (current !== leaf) return;
+  for (const { parent, value, node } of ancestors.reverse()) {
+    if (node.handlers?.size || node.exact.size || node.wildcard) return;
+    if (value === "*") delete parent.wildcard;
+    else parent.exact.delete(value);
+  }
+}
+
+function countOutboundNodes(node: OutboundHandlerNode): number {
+  return (
+    1 +
+    [...node.exact.values()].reduce(
+      (count, child) => count + countOutboundNodes(child),
+      0,
+    ) +
+    (node.wildcard ? countOutboundNodes(node.wildcard) : 0)
+  );
 }
 
 /** Whether a registered situation matches one under exact-or-`"*"` slots. */

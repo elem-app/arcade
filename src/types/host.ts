@@ -21,7 +21,6 @@ import type {
 import type { ActivationRequirement } from "./handshake.js";
 import type { HostModuleEffect, HostModuleState } from "./host-module.js";
 import type { ArcManifest } from "./manifest.js";
-import type { InboundMessage } from "./messaging.js";
 import type { RoutineReport } from "./routine.js";
 import type { ContextIsolation, InstructionIssue, Task } from "./task.js";
 
@@ -182,11 +181,7 @@ export type BeginInput =
   | {
       /** Absent when Arcade should match the inbound against registered arcs. */
       arcRunId?: undefined;
-      /** Trigger-stage view: the activating inbound's projection. */
-      dialog: Dialog;
-      /** Inbound message that triggered activation. */
-      inbound: InboundMessage;
-      /** Projects the held inbound's dialog for a worker role. */
+      /** Projects the held inbound's dialog for a worker role at call time. */
       projectDialog: DialogProjector;
       /** Opaque connector-supplied principal for this activation request. */
       principal: string;
@@ -194,16 +189,38 @@ export type BeginInput =
       clientId?: string;
       /** How many matchable arcs to activate; defaults to `first`. */
       activationPolicy?: ActivationPolicy;
+      /** Fences unclaimed admission; already claimed activations complete independently. */
+      signal?: AbortSignal;
     };
 
 /**
- * Input accepted by `advanceTrigger`/`advanceAction` when advancing a run.
- * Supply empty reports and coverage when there are no entries to report.
+ * Input accepted by `advanceTrigger`: worker reports, one host module outcome,
+ * or a skip of the named trigger step.
  */
-export type AdvanceInput = {
-  /** Projects the run's dialog for a worker role during this operation. */
+export type AdvanceTriggerInput = {
+  /** Projects the activating inbound's dialog for a worker role at call time. */
   projectDialog: DialogProjector;
-  intent?: string;
+} & (
+  | ({ skip?: never } & (
+      | { reports: readonly RoutineReport[] }
+      | HostModuleEffect
+    ))
+  | {
+      skip: { frontierId: string };
+      reports?: never;
+      hostCallId?: never;
+      hostCallOutcome?: never;
+    }
+);
+
+/**
+ * Input accepted by `advanceAction`: worker feedback or one host module
+ * outcome. Supply empty reports and coverage when there are no entries to
+ * report.
+ */
+export type AdvanceActionInput = {
+  /** Projects the run's dialog for a worker role at call time. */
+  projectDialog: DialogProjector;
 } & (
   | {
       reports: readonly RoutineReport[];
@@ -247,7 +264,11 @@ export type InstructionCoverage = Record<
  * - `rejected`: a matched arc's activation was refused. Carries no `arcRunId`.
  */
 export type ArcHostStep =
-  | { kind: "trigger"; arcRunId: ArcRunId; frontier: RunFrontier }
+  | {
+      kind: "trigger";
+      arcRunId: ArcRunId;
+      frontier: RunFrontier;
+    }
   | {
       kind: "action";
       arcRunId: ArcRunId;

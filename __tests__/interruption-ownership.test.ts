@@ -14,6 +14,7 @@ import {
   InMemoryReplayStore,
   InMemoryWorkerHubStore,
   arcRunKey,
+  probeRetention,
   taskId,
 } from "../src/testing.js";
 import {
@@ -402,14 +403,10 @@ describe("Host interruption ownership", () => {
     const releaseDisposal = deferred();
     const releaseCatch = deferred();
     const inputs: RoutineInput[] = [];
-    const warmed: string[] = [];
     let oldRunId: string | undefined;
     let disposing = false;
     const env = await fixture(
       {
-        async warm(input) {
-          warmed.push(input.contextKey);
-        },
         async run(input) {
           inputs.push(input);
           if (inputs.length === 1) {
@@ -444,7 +441,6 @@ describe("Host interruption ownership", () => {
             .length === 2,
       );
       expect(inputs).toHaveLength(1);
-      expect(warmed).toHaveLength(1);
       await collectAsync(
         env.workerHub!.submitInbound({
           content: "other",
@@ -457,7 +453,6 @@ describe("Host interruption ownership", () => {
       releaseWrite.resolve();
       await waitFor(() => disposing && inputs.length === 3);
       expect(inputs[2]!.routine.contextKey).toBe(inputs[0]!.routine.contextKey);
-      expect(warmed).toHaveLength(3);
     } finally {
       releaseWrite.resolve();
       releaseDisposal.resolve();
@@ -467,16 +462,12 @@ describe("Host interruption ownership", () => {
     }
   });
 
-  it("interruption.context never warms or invokes a superseded context waiter", async () => {
+  it("interruption.context never prepares or invokes a superseded context waiter", async () => {
     const releaseWrite = deferred();
     const releaseCatch = deferred();
     const inputs: RoutineInput[] = [];
-    let warmed = 0;
     const env = await fixture(
       {
-        async warm() {
-          warmed++;
-        },
         async run(input) {
           inputs.push(input);
           await (inputs.length === 1
@@ -522,10 +513,8 @@ describe("Host interruption ownership", () => {
           (await collectAsync(env.routineStore!.listRoutines(runId))).length ===
           3,
       );
-      expect(warmed).toBe(1);
       releaseWrite.resolve();
       await waitFor(() => inputs.length === 2);
-      expect(warmed).toBe(2);
       const routines = await collectAsync(
         env.routineStore!.listRoutines(runId),
       );
@@ -609,8 +598,8 @@ describe("Host interruption ownership", () => {
         kind: "cancel",
       });
       expect(releases).not.toHaveBeenCalled();
-      expect(env.host.getLiveSessionCounts().actioning).toBe(1);
-      expect(env.workerHub!.getLiveWorkCounts().scopes).toBe(1);
+      expect(probeRetention(env.host).transient.actioning).toBe(1);
+      expect(probeRetention(env.workerHub!).transient.scopes).toBe(1);
       // The reissued original work selects the worker whose disposal failed.
       releaseCatch.resolve();
       await waitFor(
@@ -955,6 +944,7 @@ describe("Host interruption ownership", () => {
           ).toHaveLength(1);
         } else {
           await waitFor(() => asks.length === 2);
+          expect(inputs[1]!.routine.contextKey).toBe(old.routine.contextKey);
           expect(await old.effects.checkSignal()).toEqual({ kind: "cancel" });
           expect(await inputs[1]!.effects.checkSignal()).toBeUndefined();
           await expect(
@@ -1053,6 +1043,39 @@ describe("Host interruption ownership", () => {
     },
   );
 
+  it("interruption.admission answers a duplicate trigger host call outcome without projecting", async () => {
+    const host = await createTestArcHost({ store: new InMemoryArcHostStore() });
+    await host.registerArc(
+      "duplicate-trigger-call",
+      parse(
+        '"arc"; import Time from "host:time"; function Main() { this.trigger = () => Time.nowMillis() > 0 && judge("matches?"); $instruct("work"); }',
+      ),
+    );
+    try {
+      const [probe] = await host.begin({
+        principal: "owner",
+        projectDialog: projectorFor(dialog),
+      });
+      if (probe?.kind !== "trigger") throw new Error("Expected trigger.");
+      const [delivery] = takeModuleEffects(host);
+      const judging = await host.advanceTrigger(probe.arcRunId, {
+        ...delivery!.effect,
+        projectDialog: projectorFor(dialog),
+      });
+      expect(judging).toEqual([expect.objectContaining({ kind: "trigger" })]);
+      await expect(
+        host.advanceTrigger(probe.arcRunId, {
+          ...delivery!.effect,
+          projectDialog: () =>
+            Promise.reject(new Error("A duplicate outcome must not project.")),
+        }),
+      ).resolves.toEqual(judging);
+      expect(probeRetention(host).transient.triggering).toBe(1);
+    } finally {
+      await host.stop();
+    }
+  });
+
   it("interruption.publication dispatches replacement and disposes old work despite a held then failed occurrence append", async () => {
     const releaseWorker = deferred();
     const releaseAppend = deferred();
@@ -1130,8 +1153,8 @@ describe("Host interruption ownership", () => {
       await waitFor(() => disposed);
       await waitFor(() => runs === 2);
       expect(advancementError).toBeUndefined();
-      expect(env.host.getLiveSessionCounts().actioning).toBe(1);
-      expect(env.workerHub!.getLiveWorkCounts().scopes).toBe(1);
+      expect(probeRetention(env.host).transient.actioning).toBe(1);
+      expect(probeRetention(env.workerHub!).transient.scopes).toBe(1);
       releaseAppend.resolve();
       await waitFor(async () =>
         (await env.events.list(old!.routine.arcRunId)).some(
@@ -1279,7 +1302,7 @@ describe("Host interruption ownership", () => {
       env.clock.fireDue();
       await releasing;
       await env.host.releaseAction(driver.arcRunId, driver.frontier.frontierId);
-      expect(env.host.getLiveSessionCounts()).toMatchObject({
+      expect(probeRetention(env.host).transient).toMatchObject({
         actioning: 0,
       });
       expect(env.clock.pendingCount).toBe(0);
@@ -1306,9 +1329,9 @@ describe("Host interruption ownership", () => {
       expect(
         caught?.kind === "action" && caught.frontier.briefs.judgments,
       ).toHaveLength(1);
-      expect(env.host.getLiveSessionCounts().actioning).toBe(1);
+      expect(probeRetention(env.host).transient.actioning).toBe(1);
       await env.host.releaseAction(driver.arcRunId, next.frontier.frontierId);
-      expect(env.host.getLiveSessionCounts().actioning).toBe(0);
+      expect(probeRetention(env.host).transient.actioning).toBe(0);
     } finally {
       env.host.stop();
     }
@@ -1344,10 +1367,10 @@ describe("Host interruption ownership", () => {
       invocation.resolve();
       await stopping;
       expect(disposed).toBe(true);
-      expect(env.host.getLiveSessionCounts()).toMatchObject({
+      expect(probeRetention(env.host).transient).toMatchObject({
         actioning: 0,
       });
-      expect(env.workerHub!.getLiveWorkCounts()).toEqual({
+      expect(probeRetention(env.workerHub!).transient).toMatchObject({
         scopes: 0,
         routines: 0,
         continuations: 0,
@@ -1376,7 +1399,7 @@ describe("Host interruption ownership", () => {
           }),
         ).toEqual([]);
       }
-      expect(host.getLiveSessionCounts().actioning).toBe(0);
+      expect(probeRetention(host).transient.actioning).toBe(0);
       await host.registerArc("uncaught", parse(source(false)));
       const driver = await beginActivatedDriver(host, dialog);
       await host.releaseAction(driver.arcRunId, driver.frontier.frontierId);
@@ -1386,7 +1409,7 @@ describe("Host interruption ownership", () => {
         projectDialog: projectorFor(dialog),
       });
       expect(steps).toHaveLength(1);
-      expect(host.getLiveSessionCounts().actioning).toBe(1);
+      expect(probeRetention(host).transient.actioning).toBe(1);
       const [interrupted] = await drainModuleEffects(host, steps, dialog);
       if (interrupted?.kind !== "action") throw new Error("Missing handoff.");
       expect(interrupted.frontier.traversals[0]?.state).toBe("interrupted");
@@ -1394,7 +1417,7 @@ describe("Host interruption ownership", () => {
         driver.arcRunId,
         interrupted.frontier.frontierId,
       );
-      expect(host.getLiveSessionCounts().actioning).toBe(0);
+      expect(probeRetention(host).transient.actioning).toBe(0);
       expect(clock.pendingCount).toBe(0);
       expect(
         (await store.getState(arcRunKey(driver.arcRunId)))?.lifecycle,
@@ -1419,7 +1442,7 @@ describe("Host interruption ownership", () => {
           },
         }),
       ).rejects.toBe(failure);
-      expect(env.host.getLiveSessionCounts()).toMatchObject({
+      expect(probeRetention(env.host).transient).toMatchObject({
         actioning: 0,
       });
       expect(env.clock.pendingCount).toBe(0);
@@ -1450,17 +1473,16 @@ describe("Host interruption ownership", () => {
     try {
       await expect(
         host.begin({
-          dialog,
-          inbound: { content: "go" },
           principal: "owner",
           activationPolicy: "all",
+          // The first projection is the trigger-stage view.
           projectDialog: async () => {
-            if (++projections === 2) throw failure;
+            if (++projections === 3) throw failure;
             return dialog;
           },
         }),
       ).rejects.toBe(failure);
-      expect(host.getLiveSessionCounts()).toMatchObject({
+      expect(probeRetention(host).transient).toMatchObject({
         preparing: 0,
         actioning: 0,
       });
@@ -1502,9 +1524,9 @@ describe("Host interruption ownership", () => {
               metadata: { principal: `owner-${i}` },
             }),
           );
-        await waitFor(() => host.getLiveSessionCounts().actioning === 0);
+        await waitFor(() => probeRetention(host).transient.actioning === 0);
         expect(calls).toBe(immediate ? 0 : 20);
-        expect(workerHub.getLiveWorkCounts()).toEqual({
+        expect(probeRetention(workerHub).transient).toMatchObject({
           scopes: 0,
           routines: 0,
           continuations: 0,
@@ -1607,8 +1629,6 @@ describe("Host module execution retirement", () => {
       ),
     );
     const pending = host.begin({
-      dialog,
-      inbound: { content: "go" },
       principal: "owner",
       projectDialog: projectorFor(dialog),
     });
@@ -1618,7 +1638,7 @@ describe("Host module execution retirement", () => {
     expect(signal?.aborted).toBe(true);
     await Promise.all([stopped, rejection]);
     expect(released).toHaveBeenCalledTimes(1);
-    expect(host.getLiveSessionCounts().actioning).toBe(0);
+    expect(probeRetention(host).transient.actioning).toBe(0);
     expect(takeModuleEffects(host)).toEqual([]);
     const states = await collectAsync(store.listStates());
     expect(states[0]?.[1].hostModules.calls[0]).toMatchObject({
@@ -1684,7 +1704,7 @@ describe("Host module execution retirement", () => {
       expect(firstRelease).not.toHaveBeenCalled();
       expect(secondRelease).not.toHaveBeenCalled();
       expect(signals.every((signal) => !signal.aborted)).toBe(true);
-      expect(host.getLiveSessionCounts().actioning).toBe(1);
+      expect(probeRetention(host).transient.actioning).toBe(1);
       await expect(
         host.releaseAction(driver.arcRunId, driver.frontier.frontierId),
       ).rejects.toThrow("Host module cleanup failed.");
@@ -1692,7 +1712,7 @@ describe("Host module execution retirement", () => {
       expect(secondRelease).toHaveBeenCalledTimes(1);
       expect(signals).toHaveLength(2);
       expect(signals.every((signal) => signal.aborted)).toBe(true);
-      expect(host.getLiveSessionCounts().actioning).toBe(0);
+      expect(probeRetention(host).transient.actioning).toBe(0);
     } finally {
       await host.stop();
     }
@@ -1748,7 +1768,7 @@ describe("Host module execution generation boundaries", () => {
     expect(signal?.aborted).toBe(true);
     await Promise.all([release, rejection]);
     expect(released).toHaveBeenCalledTimes(1);
-    expect(host.getLiveSessionCounts().actioning).toBe(0);
+    expect(probeRetention(host).transient.actioning).toBe(0);
     expect(
       (await store.getState(arcRunKey(driver.arcRunId)))?.hostModules.calls[0],
     ).toMatchObject({ acknowledged: false, effects: [] });
@@ -1811,7 +1831,7 @@ describe("Host module execution generation boundaries", () => {
       );
       expect(firstRelease).not.toHaveBeenCalled();
       expect(secondRelease).not.toHaveBeenCalled();
-      expect(host.getLiveSessionCounts().actioning).toBe(1);
+      expect(probeRetention(host).transient.actioning).toBe(1);
       if (step?.kind !== "action") throw new Error("Expected action frontier.");
       const next = await host.advanceAction(
         first.arcRunId,
@@ -1826,7 +1846,7 @@ describe("Host module execution generation boundaries", () => {
       await host.releaseAction(first.arcRunId, step.frontier.frontierId);
       expect(firstRelease).toHaveBeenCalledTimes(1);
       expect(secondRelease).toHaveBeenCalledTimes(1);
-      expect(host.getLiveSessionCounts().actioning).toBe(0);
+      expect(probeRetention(host).transient.actioning).toBe(0);
       expect(
         (await store.getState(arcRunKey(first.arcRunId)))?.hostModules,
       ).toEqual(before.hostModules);

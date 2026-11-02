@@ -87,6 +87,28 @@ function ask(
 }
 
 describe("command-scoped permission grants", () => {
+  it("remembers the approved replacement command without approving the original command", async () => {
+    const h = harness();
+    let asks = 0;
+    h.ctx.requestPermission = async () => {
+      asks++;
+      return asks === 1
+        ? { decision: "allow_this_run", updatedInput: { cmd: "safe-command" } }
+        : { decision: "deny" };
+    };
+    expect(
+      await ask(h.ctx, "exec_command", { cmd: "original-command" }),
+    ).toMatchObject({ decision: "allow_this_run" });
+    expect(
+      await ask(h.ctx, "exec_command", { cmd: "safe-command" }),
+    ).toMatchObject({ decision: "allow" });
+    expect(asks).toBe(1);
+    expect(
+      await ask(h.ctx, "exec_command", { cmd: "original-command" }),
+    ).toMatchObject({ decision: "deny" });
+    expect(asks).toBe(2);
+  });
+
   it("scopes exec_command allow_this_run to the exact invocation", async () => {
     const h = harness();
     h.enqueue("allow_this_run");

@@ -501,10 +501,12 @@ function Watch() {
     });
 
     await submitActivation(workerHub, "start watching");
-    await waitFor(() => warmQuery.mock.calls.length === 1);
+    await waitFor(() => coldQuery.mock.calls.length === 1);
 
-    expect(startup).toHaveBeenCalledTimes(1);
-    expect(coldQuery).not.toHaveBeenCalled();
+    expect(startup).toHaveBeenCalledTimes(4);
+    expect(coldQuery).toHaveBeenCalledTimes(1);
+    expect(coldQuery.mock.calls[0]![0].options?.resume).toBeUndefined();
+    await workerHub.stop();
     expect(startupOptions?.resume).toBeUndefined();
   });
 
@@ -622,7 +624,7 @@ function Watch() {
     });
   });
 
-  it("treats warm hints as optional and preserves cold Claude execution", async () => {
+  it("preserves cold Claude execution when prepared starts are disabled", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     let startupOptions: NonNullable<
       Parameters<ClaudeSdkStartupFn>[0]
@@ -663,7 +665,7 @@ function Watch() {
     );
   });
 
-  it("starts fast-trigger warmup from hub context without delaying dispatch", async () => {
+  it("prepares fast-trigger starts within run without delaying cold execution", async () => {
     const arcHost = await makeArcHost();
     await arcHost.registerArc(
       "semantic-eval",
@@ -1430,7 +1432,6 @@ function Main() {
       instructionCoverage: Object.fromEntries(
         briefIds.map((briefId) => [briefId, "applied"]),
       ),
-      intent: "agent-work",
     });
   });
 
@@ -1452,7 +1453,6 @@ function Main() {
       instructionCoverage: {
         "instruction:[arc:greet:Greet]:[node:greet:Greet]:body/0": "applied",
       },
-      intent: "agent-work",
     });
   });
 
@@ -1630,8 +1630,6 @@ it.each(["live", "reconstructed"] as const)(
     };
     const projectDialog = async () => dialog;
     const [probe] = await host.begin({
-      dialog,
-      inbound: { content: "start" },
       principal: ALICE_OWNER,
       projectDialog,
     });
@@ -1639,9 +1637,8 @@ it.each(["live", "reconstructed"] as const)(
     await expect(
       host.nodeInfoForRef(toNodeRef("retained", ["Absent"]), probe.arcRunId),
     ).rejects.toThrow("has no node");
-    const [initial] = await host.advanceTrigger(probe.arcRunId, dialog, {
+    const [initial] = await host.advanceTrigger(probe.arcRunId, {
       projectDialog,
-      instructionCoverage: {},
       reports: [
         {
           outcome: "completed",
@@ -1702,6 +1699,11 @@ it.each(["live", "reconstructed"] as const)(
         kind: "activated",
         reactivationCount: 1,
         arcRunId: initial.arcRunId,
+      });
+      expect((await iterator.next()).value).toEqual({
+        kind: "handshake-settled",
+        handshakeId: pending.value.handshakeId,
+        outcome: "proceeded",
       });
       expect((await iterator.next()).done).toBe(true);
       expect(worker).toHaveBeenCalledTimes(1);

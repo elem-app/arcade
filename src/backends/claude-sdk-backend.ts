@@ -13,6 +13,9 @@ import {
   type WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 import * as z from "zod/v4";
+import type { PermissionGrants } from "./managed-worker-tools.js";
+import { PermissionGrantCache } from "./permission-grant-cache.js";
+import { PreparedStartPool } from "./prepared-start-pool.js";
 
 import {
   createArcadeLogger,
@@ -36,12 +39,7 @@ import {
   normalizeReplyAudience,
   validateAgentRoutineReport,
 } from "../service/utils.js";
-import {
-  defineBackend,
-  type Backend,
-  type Worker,
-  type WorkerWarmupInput,
-} from "../types/backend.js";
+import { defineBackend, type Backend, type Worker } from "../types/backend.js";
 import type { ExternalWorkerTool } from "../types/external-worker-tool.js";
 import type { JsonValue } from "../types/json.js";
 import type {
@@ -56,13 +54,21 @@ import type { InstructionTask, SemanticTask, Task } from "../types/task.js";
 import type { WorkerSlotKind } from "../types/worker-slot.js";
 import { createWorkerSlotSchema } from "../types/worker-slot.js";
 import {
+  readRetention,
+  registerRetentionProbe,
+  type PermissionGrantCacheRetention,
+  type PreparedStartPoolRetention,
+} from "../utils/retention-registry.js";
+import {
   backendRoutine,
   providerFailureReport,
   withBackendDetails,
   type BackendRoutine,
 } from "./backend-support.js";
 import {
-  createContinuityController,
+  createContinuityPreparation,
+  type InvocationContinuity,
+  type PrepareContinuity,
   type ResolveClaudeContinuityIdentity,
 } from "./continuity.js";
 import {
@@ -75,7 +81,6 @@ import {
   EmitOutboundInputSchema,
   emitWorkerQuestion,
   invalidToolInputError,
-  isCommandScopedPermissionTool,
   normalizeRoutineReportInput,
   OUTBOUND_TOOL_NAME,
   outboundQuestionForm,
@@ -87,7 +92,6 @@ import {
   ToolFailure,
   WORKER_INTERACTION_SYSTEM_PROMPT,
   type ManagedWorkerToolContext,
-  type PermissionGrant,
 } from "./managed-worker-tools.js";
 
 export const DEFAULT_CLAUDE_SDK_MODEL = "claude-opus-4-7";
@@ -304,6 +308,7 @@ class AsyncSdkUserMessageQueue implements AsyncIterable<SDKUserMessage> {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#queue.length = 0;
     for (const waiter of this.#waiters.splice(0)) {
       waiter({ done: true, value: undefined });
     }
@@ -339,7 +344,11 @@ class ClaudeSdkLiveSession {
   #closed = false;
   #tail: Promise<void> = Promise.resolve();
   signal: RoutineSignal | undefined;
-  owner: Parameters<Worker["disposeRoutine"]>[0];
+  owner?: Parameters<Worker["disposeRoutine"]>[0];
+  reusable = false;
+  reuseKey?: string;
+  sessionId?: string;
+  continuity?: InvocationContinuity;
 
   constructor(input: {
     sessionKey: string;
@@ -398,6 +407,7 @@ class ClaudeSdkLiveSession {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.holder.current = undefined;
     this.#prompt.close();
     this.#abortController.abort();
     this.#query.close?.();
@@ -704,6 +714,7 @@ export type ClaudeSdkRoutineOptions = {
 export type ClaudeSdkSessionCacheOptions = {
   enabled?: boolean;
   maxPreparedStarts?: number;
+  maxIdleSessions?: number;
   idleTtlMs?: number;
   initializeTimeoutMs?: number;
 };
@@ -713,6 +724,7 @@ type NormalizedSessionCacheOptions = Required<ClaudeSdkSessionCacheOptions>;
 const DEFAULT_SESSION_CACHE: NormalizedSessionCacheOptions = {
   enabled: true,
   maxPreparedStarts: 4,
+  maxIdleSessions: 4,
   idleTtlMs: 300000,
   initializeTimeoutMs: 30000,
 };
@@ -734,6 +746,7 @@ const ClaudeWorkerSlotSchema = createWorkerSlotSchema({
     .strictObject({
       enabled: z.boolean().optional(),
       maxPreparedStarts: OptionalNonNegativeIntegerSchema,
+      maxIdleSessions: OptionalNonNegativeIntegerSchema,
       idleTtlMs: OptionalPositiveIntegerSchema,
       initializeTimeoutMs: OptionalPositiveIntegerSchema,
     })
@@ -789,95 +802,40 @@ export function createClaudeSdkBackendForTesting(
     workerSlotSchema: ClaudeWorkerSlotSchema,
     createWorker(host, slot) {
       const config = slot;
-      const warmStarts = new Map<string, Promise<void>>();
-      let continuity!: ReturnType<typeof createContinuityController>;
-      const worker = new ClaudeSdkWorker({
-        ...options,
-        logger: host.logger,
-        model: config.model ?? options.model,
-        timeoutMs: config.timeoutMs ?? options.timeoutMs,
-        cwd: config.cwd ?? options.cwd,
-        sessionCache: config.sessionCache ?? options.sessionCache,
-        onSessionObserved: async (observed) => {
-          await options.onSessionObserved?.(observed);
-          await continuity.persistObserved(
-            observed.routine,
-            observed.sessionKey,
-            observed.sessionId,
-            observed.cwd,
-          );
-        },
-      });
-      continuity = createContinuityController({
+      const prepare = createContinuityPreparation({
         backend: "claude-sdk",
         host,
         slot,
         configuredCwd: config.cwd ?? options.cwd,
         resolveIdentity: options.resolveContinuityIdentity,
         continuityField: "sessionId",
-        seed: (contextKey, sessionId, cwd) =>
-          worker.seedSession(contextKey, sessionId, cwd),
-        clear: (contextKey) => worker.clearSession(contextKey),
       });
-      return {
-        warm(input) {
-          const key = workerWarmKey(input);
-          const pending = continuity
-            .warm(input)
-            .then(() => worker.prepareWarmStart(input))
-            .catch((error: unknown) => {
-              host.logger.info("backend.claude_sdk.warm_failed", {
-                arcRunId: input.arcRunId,
-                contextKey: input.contextKey,
-                message: error instanceof Error ? error.message : String(error),
-              });
-            });
-          warmStarts.set(key, pending);
-          return pending;
+      const worker = new ClaudeSdkWorker(
+        {
+          ...options,
+          logger: host.logger,
+          model: config.model ?? options.model,
+          timeoutMs: config.timeoutMs ?? options.timeoutMs,
+          cwd: config.cwd ?? options.cwd,
+          sessionCache: config.sessionCache ?? options.sessionCache,
         },
+        prepare,
+      );
+      return {
         async run(input) {
-          const sessionResume = claudeSessionResume(input);
           try {
-            await continuity.prepareRun(input, {
-              preserveLiveContinuation:
-                sessionResume !== undefined ||
-                worker.hasRetryState(input.routine.id),
-            });
-            const warmStart = warmStarts.get(workerWarmKey(input));
-            if (warmStart) {
-              warmStarts.delete(workerWarmKey(input));
-              await warmStart;
-            }
-            const report = await worker.run(input, sessionResume);
-            continuity.finish(
-              input.routine.id,
-              report.suspension !== undefined,
-            );
-            return report;
+            return await worker.run(input, claudeSessionResume(input));
           } catch (error) {
-            continuity.fail(input.routine.id);
             const report = providerFailureReport(error, "claude-sdk");
             if (report) return report;
             throw error;
           }
         },
-        async disposeRoutine(input) {
-          try {
-            await worker.disposeRoutine(input);
-          } finally {
-            continuity.disposeRoutine(input.routineId);
-          }
-        },
+        disposeRoutine: (input) => worker.disposeRoutine(input),
         stop: () => worker.stop(),
       };
     },
   });
-}
-
-function workerWarmKey(input: WorkerWarmupInput | RoutineInput): string {
-  return "routine" in input
-    ? JSON.stringify([input.routine.arcRunId, input.routine.contextKey])
-    : JSON.stringify([input.arcRunId, input.contextKey]);
 }
 
 function claudeSessionResume(
@@ -889,24 +847,8 @@ function claudeSessionResume(
     : undefined;
 }
 
-type StoredSdkSession = {
-  sessionId: string;
-  cwd: string;
-};
-
-type PreparedStart = {
-  key: string;
-  sessionKey: string;
-  cwd: string;
-  holder: ManagedWorkerToolContextHolder;
-  abortController: AbortController;
-  model: string;
-  createdAt: number;
-  closed: boolean;
-  promise: Promise<WarmQuery>;
-};
-
 type ClaudeSdkRunInput = {
+  reuseKey?: string;
   owner: Parameters<Worker["disposeRoutine"]>[0];
   sessionKey: string;
   cwd: string;
@@ -933,7 +875,6 @@ export class ClaudeSdkWorker implements Worker {
   readonly #startup: ClaudeSdkStartupFn;
   readonly #logger: ArcadeLogger;
   readonly #sessionCache: NormalizedSessionCacheOptions;
-  readonly #sessions = new Map<string, StoredSdkSession>();
   readonly #retryStates = new Map<
     string,
     {
@@ -942,6 +883,7 @@ export class ClaudeSdkWorker implements Worker {
       cwd: string;
       model: string;
       report?: RoutineReport;
+      continuity?: InvocationContinuity;
     }
   >();
 
@@ -949,11 +891,26 @@ export class ClaudeSdkWorker implements Worker {
     return this.#retryStates.has(routineId);
   }
   readonly #liveSessions = new Map<string, ClaudeSdkLiveSession>();
-  readonly #preparedStarts = new Map<string, PreparedStart>();
-  readonly #grantsBySession = new Map<string, PermissionGrant[]>();
+  readonly #idleSessions = new Map<
+    string,
+    {
+      session: ClaudeSdkLiveSession;
+      timer: ReturnType<typeof setTimeout>;
+      expiresAt: number;
+    }
+  >();
+  #idleCleanupFailure: Error | undefined;
+  readonly #preparedStarts: PreparedStartPool<{
+    warm: WarmQuery;
+    holder: ManagedWorkerToolContextHolder;
+  }>;
+  readonly #grantsBySession = new PermissionGrantCache();
   #stopped = false;
 
-  constructor(options: ClaudeSdkBackendTestOptions) {
+  constructor(
+    options: ClaudeSdkBackendTestOptions,
+    private readonly prepareContinuity?: PrepareContinuity,
+  ) {
     this.#options = {
       ...options,
       model: options.model ?? DEFAULT_CLAUDE_SDK_MODEL,
@@ -963,129 +920,154 @@ export class ClaudeSdkWorker implements Worker {
     this.#startup = options.startup ?? startup;
     this.#logger = options.logger ?? createArcadeLogger();
     this.#sessionCache = normalizeSessionCache(options.sessionCache);
-  }
-
-  seedSession(sessionKey: string, sessionId: string, cwd: string): void {
-    if (!this.#sessions.has(sessionKey)) {
-      this.#sessions.set(sessionKey, { sessionId, cwd });
-    }
-  }
-
-  clearSession(sessionKey: string): void {
-    this.#sessions.delete(sessionKey);
-    this.#grantsBySession.delete(sessionKey);
-    const session = this.#liveSessions.get(sessionKey);
-    if (session) this.#closeLiveSession(session);
-    for (const [key, entry] of this.#preparedStarts) {
-      if (entry.sessionKey !== sessionKey) continue;
-      this.#closePreparedStart(entry);
-      this.#preparedStarts.delete(key);
-    }
+    this.#preparedStarts = new PreparedStartPool({
+      max: this.#sessionCache.enabled
+        ? this.#sessionCache.maxPreparedStarts
+        : 0,
+      idleTtlMs: this.#sessionCache.idleTtlMs,
+      start: async (cwd, abortController) => {
+        const holder: ManagedWorkerToolContextHolder = {};
+        const warm = await this.#startup({
+          options: this.#buildOptions({
+            abortController,
+            cwd,
+            model: this.#options.model,
+            workerCtx: holder,
+          }),
+          initializeTimeoutMs: this.#sessionCache.initializeTimeoutMs,
+        });
+        return { warm, holder };
+      },
+      close: ({ warm }) => warm.close(),
+      failed: (error) =>
+        this.#logger.info("backend.claude_sdk.prepared_start_failed", {
+          message: String(error),
+        }),
+    });
+    registerRetentionProbe(this, () => {
+      const grants = readRetention<PermissionGrantCacheRetention>(
+        this.#grantsBySession,
+      );
+      return {
+        grantContexts: grants.contexts,
+        grants: grants.grants,
+        liveRoutines: this.#liveSessions.size,
+        idleSessions: this.#idleSessions.size,
+        retryRoutines: this.#retryStates.size,
+        preparedStarts: readRetention<PreparedStartPoolRetention>(
+          this.#preparedStarts,
+        ).reserved,
+      };
+    });
   }
 
   async disposeRoutine(
     input: Parameters<Worker["disposeRoutine"]>[0],
   ): Promise<void> {
-    if (this.#retryStates.get(input.routineId)?.arcRunId === input.arcRunId)
+    const preparations = new Set<InvocationContinuity>();
+    const errors: unknown[] = [];
+    const retry = this.#retryStates.get(input.routineId);
+    if (retry?.arcRunId === input.arcRunId) {
+      if (retry.continuity) preparations.add(retry.continuity);
       this.#retryStates.delete(input.routineId);
+    }
     for (const session of this.#liveSessions.values()) {
       if (
-        session.owner.routineId === input.routineId &&
-        session.owner.arcRunId === input.arcRunId
-      )
-        this.#closeLiveSession(session);
+        session.owner?.routineId === input.routineId &&
+        session.owner?.arcRunId === input.arcRunId
+      ) {
+        if (session.continuity) preparations.add(session.continuity);
+        try {
+          this.#closeLiveSession(session);
+        } catch (error) {
+          errors.push(error);
+        }
+      }
     }
+    const results = await Promise.allSettled(
+      [...preparations].map((preparation) => preparation.close()),
+    );
+    for (const result of results)
+      if (result.status === "rejected") errors.push(result.reason);
+    if (errors.length)
+      throw new AggregateError(errors, "Claude routine cleanup failed.");
   }
 
   async stop(): Promise<void> {
     this.#stopped = true;
-    this.#retryStates.clear();
-    for (const session of this.#liveSessions.values()) session.close();
+    const preparations = new Set<InvocationContinuity>();
+    const errors: unknown[] = [];
+    for (const retry of this.#retryStates.values())
+      if (retry.continuity) preparations.add(retry.continuity);
+    for (const session of this.#liveSessions.values()) {
+      if (session.continuity) preparations.add(session.continuity);
+      try {
+        this.#closeLiveSession(session);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
     this.#liveSessions.clear();
-    for (const entry of this.#preparedStarts.values()) {
-      this.#closePreparedStart(entry);
-    }
-    this.#preparedStarts.clear();
-  }
-
-  async prepareWarmStart(input: WorkerWarmupInput): Promise<void> {
-    if (
-      this.#stopped ||
-      !this.#sessionCache.enabled ||
-      this.#sessionCache.maxPreparedStarts === 0
-    ) {
-      return;
-    }
-    this.#sweepPreparedStarts();
-    const sessionKey = input.contextKey;
-    const cwd = this.#options.cwd ?? input.workspacePath;
-    const live = this.#liveSessions.get(sessionKey);
-    if (live && live.cwd === cwd) return;
-    const key = preparedStartKey(sessionKey, cwd);
-    const existing = this.#preparedStarts.get(key);
-    if (existing) {
-      await existing.promise;
-      return;
-    }
-    const holder: ManagedWorkerToolContextHolder = {};
-    const abortController = new AbortController();
-    const resume = this.#resumeForSession(sessionKey, cwd, input.role);
-    const entry: PreparedStart = {
-      key,
-      sessionKey,
-      cwd,
-      holder,
-      abortController,
-      model: this.#options.model,
-      createdAt: Date.now(),
-      closed: false,
-      promise: this.#startup({
-        options: this.#buildOptions({
-          abortController,
-          cwd,
-          model: this.#options.model,
-          resume,
-          workerCtx: holder,
-        }),
-        initializeTimeoutMs: this.#sessionCache.initializeTimeoutMs,
-      }),
-    };
-    entry.promise.catch((error) => {
-      this.#logger.info("backend.claude_sdk.prepared_start_failed", {
-        sessionKey,
-        cwd,
-        message: error instanceof Error ? error.message : String(error),
-      });
-    });
-    this.#preparedStarts.set(key, entry);
-    this.#enforcePreparedStartLimit();
-    await entry.promise;
+    for (const key of this.#idleSessions.keys()) this.#retireIdleSession(key);
+    if (this.#idleCleanupFailure) errors.push(this.#idleCleanupFailure);
+    this.#retryStates.clear();
+    this.#grantsBySession.stop();
+    const results = await Promise.allSettled([
+      this.#preparedStarts.stop(),
+      ...[...preparations].map((entry) => entry.close()),
+    ]);
+    for (const result of results)
+      if (result.status === "rejected") errors.push(result.reason);
+    if (errors.length)
+      throw new AggregateError(errors, "Claude worker cleanup failed.");
   }
 
   async run(
     input: RoutineInput,
     sessionResume?: ClaudeSdkSessionResume,
   ): Promise<RoutineReport> {
-    const { context, effects, diagnostics } = input;
-    const routine = backendRoutine(input);
-    if (!this.#sessionCache.enabled) {
-      return this.#run(
-        routine,
-        context,
-        effects,
-        diagnostics,
-        false,
+    if (this.#stopped) throw new Error("Claude SDK worker is stopped.");
+    const ownerKey = JSON.stringify([input.routine.arcRunId, input.routine.id]);
+    const preparation =
+      this.#retryStates.get(input.routine.id)?.continuity ??
+      this.#liveSessions.get(ownerKey)?.continuity ??
+      (await this.prepareContinuity?.(input));
+    try {
+      if (
+        this.#stopped ||
+        (await input.effects.checkSignal())?.kind === "cancel"
+      )
+        return { cancellation: "superseded" };
+      return await this.#run(
+        backendRoutine(input),
+        input.context,
+        input.effects,
+        input.diagnostics,
+        this.#sessionCache.enabled,
         sessionResume,
+        preparation,
       );
+    } finally {
+      const session = this.#liveSessions.get(ownerKey);
+      if (session?.reusable && !this.#stopped) {
+        try {
+          await preparation?.close();
+          session.continuity = undefined;
+          if ((await input.effects.checkSignal())?.kind === "cancel")
+            this.#closeLiveSession(session);
+          else this.#cacheLiveSession(session);
+        } catch (error) {
+          this.#closeLiveSession(session);
+          throw error;
+        }
+      } else {
+        const retained =
+          this.#retryStates.get(input.routine.id)?.continuity === preparation ||
+          session?.continuity === preparation;
+        if (retained && !this.#stopped) await preparation?.drain();
+        else await preparation?.close();
+      }
     }
-    return this.#run(
-      routine,
-      context,
-      effects,
-      diagnostics,
-      true,
-      sessionResume,
-    );
   }
 
   async #run(
@@ -1095,10 +1077,15 @@ export class ClaudeSdkWorker implements Worker {
     diagnostics: RoutineDiagnostics,
     cacheEnabled: boolean,
     sessionResume: ClaudeSdkSessionResume | undefined,
+    preparation: InvocationContinuity | undefined,
   ): Promise<RoutineReport> {
     if (this.#stopped) throw new Error("Claude SDK worker is stopped.");
-    this.#sweepPreparedStarts();
-    const input = this.#buildRunInput(routine, context, sessionResume);
+    const input = this.#buildRunInput(
+      routine,
+      context,
+      sessionResume,
+      preparation,
+    );
     const retry = this.#retryStates.get(routine.id);
     if (retry) {
       if (!retry.sessionId) {
@@ -1116,11 +1103,15 @@ export class ClaudeSdkWorker implements Worker {
       input.prompt =
         "Continue the interrupted assigned task from the retained conversation and tool results. Account for work already performed, including delivered messages. Complete only the remaining work and call the report tool.";
     }
-    const { sessionKey, cwd, prompt, model, timeoutMs } = input;
+    const { sessionKey, cwd, model, timeoutMs } = input;
+    let { prompt } = input;
     await diagnostics.writeText("prompt", prompt);
+    if (this.#stopped) return { cancellation: "superseded" };
 
-    const grants = this.#grantsBySession.get(sessionKey) ?? [];
-    this.#grantsBySession.set(sessionKey, grants);
+    const grants = this.#grantsBySession.forContext(
+      routine.arcRunId,
+      routine.contextKey,
+    );
 
     let report: RoutineReport | undefined = retry?.report;
     const workerCtx = this.#workerContext(
@@ -1182,13 +1173,11 @@ export class ClaudeSdkWorker implements Worker {
         typeof message.session_id === "string" &&
         message.session_id
       ) {
+        if (session) session.sessionId = message.session_id;
         const continuation = this.#retryStates.get(routine.id);
         if (continuation && continuation.sessionId !== message.session_id) {
           continuation.sessionId = message.session_id;
-          this.#sessions.set(sessionKey, {
-            sessionId: message.session_id,
-            cwd,
-          });
+          await preparation?.observe(message.session_id);
           await this.#options.onSessionObserved?.({
             routine,
             sessionKey,
@@ -1211,6 +1200,24 @@ export class ClaudeSdkWorker implements Worker {
     try {
       acquisition = await this.#getLiveSession(input);
       session = acquisition.session;
+      session.continuity = preparation;
+      session.reusable = false;
+      session.reuseKey = this.prepareContinuity
+        ? preparation?.reuseKey
+        : "worker";
+      if (acquisition.liveSessionReused && !retry) {
+        // A live query already has its dialog even without a durable pointer.
+        const continuedPrompt = buildClaudeSdkPrompt(
+          routine.task,
+          input.renderContext,
+          sessionResume,
+          false,
+        );
+        if (continuedPrompt !== prompt) {
+          prompt = continuedPrompt;
+          await diagnostics.writeText("prompt", prompt);
+        }
+      }
       backendDetails = {
         ...backendDetails,
         liveSessionReused: acquisition.liveSessionReused,
@@ -1224,12 +1231,17 @@ export class ClaudeSdkWorker implements Worker {
         session!.holder.current = workerCtx;
         try {
           await session!.setModel(model);
+          if (this.#stopped) {
+            signal = { kind: "cancel" };
+            return;
+          }
           this.#retryStates.set(routine.id, {
             arcRunId: routine.arcRunId,
             sessionId: input.resume,
             cwd,
             model,
             report,
+            continuity: preparation,
           });
           await session!.runPrompt(prompt, effects.checkSignal, observeMessage);
           await diagnostics.writeJson("sdk-messages", transcript);
@@ -1239,6 +1251,7 @@ export class ClaudeSdkWorker implements Worker {
           }
           let result = summarizeSdkMessages(transcript);
           if (result.sessionId) {
+            await preparation?.observe(result.sessionId);
             await this.#options.onSessionObserved?.({
               routine,
               sessionKey,
@@ -1271,6 +1284,7 @@ export class ClaudeSdkWorker implements Worker {
             }
             result = summarizeSdkMessages(transcript);
             if (result.sessionId) {
+              await preparation?.observe(result.sessionId);
               await this.#options.onSessionObserved?.({
                 routine,
                 sessionKey,
@@ -1295,12 +1309,6 @@ export class ClaudeSdkWorker implements Worker {
             throw new Error(
               `Claude SDK worker did not call the ${WORKER_MCP_SERVER_NAME}.report tool before exiting.`,
             );
-          }
-          if (result.sessionId) {
-            this.#sessions.set(sessionKey, {
-              sessionId: result.sessionId,
-              cwd,
-            });
           }
           backendDetails = {
             backend: "claude-sdk",
@@ -1356,12 +1364,15 @@ export class ClaudeSdkWorker implements Worker {
       }
       await recordTranscriptTokenUsage();
       this.#retryStates.delete(routine.id);
-      if (!cacheEnabled) closeOwnedSession();
+      // A completed turn can remain warm once its routine callbacks and
+      // continuity writes have been detached by run()'s finalizer.
+      session.reusable = cacheEnabled && Boolean(session.reuseKey);
+      if (!session.reusable) closeOwnedSession();
       return withBackendDetails(report, backendDetails);
     } catch (error) {
       closeOwnedSession();
       await recordTranscriptTokenUsage();
-      if ((await effects.checkSignal())?.kind === "cancel") {
+      if (this.#stopped || (await effects.checkSignal())?.kind === "cancel") {
         await this.disposeRoutine({
           arcRunId: routine.arcRunId,
           routineId: routine.id,
@@ -1430,6 +1441,7 @@ export class ClaudeSdkWorker implements Worker {
     routine: BackendRoutine,
     context: RoutineContext,
     sessionResume: ClaudeSdkSessionResume | undefined,
+    preparation: InvocationContinuity | undefined,
   ): ClaudeSdkRunInput {
     const sessionKey = routine.contextKey;
     const cwd = this.#options.cwd ?? context.workspacePath;
@@ -1442,6 +1454,7 @@ export class ClaudeSdkWorker implements Worker {
     const timeoutMs = selected?.timeoutMs ?? this.#options.timeoutMs;
     return {
       owner: { arcRunId: routine.arcRunId, routineId: routine.id },
+      reuseKey: this.prepareContinuity ? preparation?.reuseKey : "worker",
       sessionKey,
       cwd,
       renderContext,
@@ -1449,45 +1462,24 @@ export class ClaudeSdkWorker implements Worker {
         routine.task,
         renderContext,
         sessionResume,
-        this.#shouldPrimeDialog(sessionKey, cwd),
+        !this.#liveSessions.has(
+          JSON.stringify([routine.arcRunId, routine.id]),
+        ) && preparation?.prior === undefined,
       ),
       model,
       timeoutMs,
-      resume: this.#resumeForSession(sessionKey, cwd, routine.role),
+      resume: preparation?.prior,
     };
-  }
-
-  // Prime the dialog only into a fresh backend session. A warm live session or
-  // a seeded server-side resume already carries those turns in its own history,
-  // so re-rendering them would duplicate context. Resume delivery is irrelevant
-  // here: what matters is whether this session has already seen the dialog.
-  #shouldPrimeDialog(sessionKey: string, cwd: string): boolean {
-    const existing =
-      this.#liveSessions.get(sessionKey) ?? this.#sessions.get(sessionKey);
-    return existing?.cwd !== cwd;
-  }
-
-  #resumeForSession(
-    sessionKey: string,
-    cwd: string,
-    role: string,
-  ): string | undefined {
-    const seeded = this.#sessions.get(sessionKey);
-    if (!seeded) return undefined;
-    if (seeded.cwd === cwd) return seeded.sessionId;
-    this.#logger.info("backend.claude_sdk.resume_skipped", {
-      sessionKey,
-      role,
-      storedCwd: seeded.cwd,
-      cwd,
-    });
-    return undefined;
   }
 
   async #getLiveSession(
     input: ClaudeSdkRunInput,
   ): Promise<LiveSessionAcquisition> {
-    const existing = this.#liveSessions.get(input.sessionKey);
+    const ownerKey = JSON.stringify([
+      input.owner.arcRunId,
+      input.owner.routineId,
+    ]);
+    const existing = this.#liveSessions.get(ownerKey);
     if (existing) {
       if (existing.cwd === input.cwd) {
         // Transfer ownership before returning across the acquisition boundary.
@@ -1508,13 +1500,36 @@ export class ClaudeSdkWorker implements Worker {
       });
       this.#closeLiveSession(existing);
     }
+    const idleKey = JSON.stringify([input.owner.arcRunId, input.sessionKey]);
+    const idle = this.#idleSessions.get(idleKey);
+    if (idle) {
+      if (
+        idle.expiresAt > Date.now() &&
+        input.reuseKey &&
+        idle.session.reuseKey === input.reuseKey &&
+        idle.session.cwd === input.cwd &&
+        (!this.prepareContinuity || idle.session.sessionId === input.resume)
+      ) {
+        clearTimeout(idle.timer);
+        this.#idleSessions.delete(idleKey);
+        idle.session.owner = input.owner;
+        idle.session.reusable = false;
+        this.#liveSessions.set(ownerKey, idle.session);
+        return {
+          session: idle.session,
+          liveSessionReused: true,
+          preparedStartUsed: false,
+        };
+      }
+      this.#retireIdleSession(idleKey);
+    }
     const prepared = await this.#consumePreparedStart(input);
     const session = prepared ?? this.#createColdLiveSession(input);
     if (this.#stopped) {
       session.close();
       throw new Error("Claude SDK worker is stopped.");
     }
-    this.#liveSessions.set(input.sessionKey, session);
+    this.#liveSessions.set(ownerKey, session);
     return {
       session,
       liveSessionReused: false,
@@ -1525,31 +1540,26 @@ export class ClaudeSdkWorker implements Worker {
   async #consumePreparedStart(
     input: ClaudeSdkRunInput,
   ): Promise<ClaudeSdkLiveSession | undefined> {
-    const key = preparedStartKey(input.sessionKey, input.cwd);
-    const entry = this.#preparedStarts.get(key);
-    if (!entry) return undefined;
-    this.#preparedStarts.delete(key);
-    if (entry.closed) return undefined;
+    if (input.resume) return undefined;
+    const prepared = this.#preparedStarts.take(input.cwd);
+    if (!prepared) return undefined;
     try {
       const prompt = new AsyncSdkUserMessageQueue();
-      const warm = await entry.promise;
-      const sdkQuery = warm.query(prompt);
       return new ClaudeSdkLiveSession({
         owner: input.owner,
         sessionKey: input.sessionKey,
         cwd: input.cwd,
-        holder: entry.holder,
-        abortController: entry.abortController,
+        holder: prepared.value.holder,
+        abortController: prepared.abortController,
         prompt,
-        query: sdkQuery,
-        model: entry.model,
+        query: prepared.value.warm.query(prompt),
+        model: this.#options.model,
       });
     } catch (error) {
-      entry.abortController.abort();
+      prepared.abortController.abort();
+      prepared.value.warm.close();
       this.#logger.info("backend.claude_sdk.prepared_start_consume_failed", {
-        sessionKey: input.sessionKey,
-        cwd: input.cwd,
-        message: error instanceof Error ? error.message : String(error),
+        message: String(error),
       });
       return undefined;
     }
@@ -1582,38 +1592,65 @@ export class ClaudeSdkWorker implements Worker {
   }
 
   #closeLiveSession(session: ClaudeSdkLiveSession): void {
+    if (session.owner) {
+      const key = JSON.stringify([
+        session.owner.arcRunId,
+        session.owner.routineId,
+      ]);
+      if (this.#liveSessions.get(key) === session)
+        this.#liveSessions.delete(key);
+    }
+    session.owner = undefined;
     session.close();
-    if (this.#liveSessions.get(session.sessionKey) === session)
-      this.#liveSessions.delete(session.sessionKey);
   }
 
-  #sweepPreparedStarts(): void {
-    const now = Date.now();
-    for (const [key, entry] of this.#preparedStarts) {
-      if (now - entry.createdAt > this.#sessionCache.idleTtlMs) {
-        this.#closePreparedStart(entry);
-        this.#preparedStarts.delete(key);
+  #cacheLiveSession(session: ClaudeSdkLiveSession): void {
+    const owner = session.owner;
+    if (!owner || this.#stopped || !this.#sessionCache.maxIdleSessions) {
+      this.#closeLiveSession(session);
+      return;
+    }
+    const ownerKey = JSON.stringify([owner.arcRunId, owner.routineId]);
+    if (this.#liveSessions.get(ownerKey) === session)
+      this.#liveSessions.delete(ownerKey);
+    const key = JSON.stringify([owner.arcRunId, session.sessionKey]);
+    session.owner = undefined;
+    session.holder.current = undefined;
+    this.#retireIdleSession(key);
+    const timer = setTimeout(() => {
+      if (this.#idleSessions.get(key) === entry) this.#retireIdleSession(key);
+    }, this.#sessionCache.idleTtlMs);
+    timer.unref?.();
+    const entry = {
+      session,
+      timer,
+      expiresAt: Date.now() + this.#sessionCache.idleTtlMs,
+    };
+    this.#idleSessions.set(key, entry);
+    while (this.#idleSessions.size > this.#sessionCache.maxIdleSessions) {
+      this.#retireIdleSession(this.#idleSessions.keys().next().value!);
+    }
+  }
+
+  #retireIdleSession(key: string): void {
+    const entry = this.#idleSessions.get(key);
+    if (!entry) return;
+    this.#idleSessions.delete(key);
+    clearTimeout(entry.timer);
+    try {
+      entry.session.close();
+    } catch (error) {
+      this.#idleCleanupFailure ??= new Error(
+        `Claude idle session cleanup failed: ${String(error).slice(0, 1024)}`,
+      );
+      try {
+        this.#logger.info("backend.claude_sdk.idle_cleanup_failed", {
+          message: this.#idleCleanupFailure.message,
+        });
+      } catch {
+        /* Diagnostics cannot prevent eviction or remaining cleanup. */
       }
     }
-  }
-
-  #enforcePreparedStartLimit(): void {
-    while (this.#preparedStarts.size > this.#sessionCache.maxPreparedStarts) {
-      const oldest = this.#preparedStarts.keys().next().value as
-        | string
-        | undefined;
-      if (!oldest) return;
-      const entry = this.#preparedStarts.get(oldest);
-      if (entry) this.#closePreparedStart(entry);
-      this.#preparedStarts.delete(oldest);
-    }
-  }
-
-  #closePreparedStart(entry: PreparedStart): void {
-    if (entry.closed) return;
-    entry.closed = true;
-    entry.abortController.abort();
-    entry.promise.then((warm) => warm.close()).catch(() => undefined);
   }
 
   #buildOptions(input: {
@@ -1714,25 +1751,13 @@ export class ClaudeSdkWorker implements Worker {
           decisionClassification: "user_reject",
         };
       }
-      // Command-scoped tools (Bash) must re-enter canUseTool on every call so
-      // Arcade's per-command grant decides each one. Handing the SDK a blanket
-      // "remember this tool" permission would let later commands skip the gate,
-      // so suppress SDK-level persistence for them; Arcade remembers instead.
-      // Re-entering canUseTool is NOT re-prompting: resolveWorkerPermission
-      // short-circuits on a remembered grant (no escalation), so an already
-      // allow_this_run'd command auto-allows silently here. Only a new, unseen
-      // invocation escalates to the approver. Per Bash call != per Bash prompt.
-      const persistAtSdkLevel =
-        verdict.decision === "allow_this_run" &&
-        !isCommandScopedPermissionTool(toolName);
+      // Arcade rechecks temporary grants on every permission-gated call.
+      // SDK-wide rules would outlive our expiry and may widen the grant.
       return {
         behavior: "allow",
         updatedInput: verdict.updatedInput ?? input,
-        updatedPermissions: persistAtSdkLevel ? options.suggestions : undefined,
         toolUseID: options.toolUseID,
-        decisionClassification: persistAtSdkLevel
-          ? "user_permanent"
-          : "user_temporary",
+        decisionClassification: "user_temporary",
       };
     };
   }
@@ -1744,7 +1769,7 @@ export class ClaudeSdkWorker implements Worker {
     cwd: string,
     sessionKey: string,
     diagnostics: RoutineDiagnostics,
-    grants: PermissionGrant[],
+    grants: PermissionGrants,
     onReport: (report: RoutineReport) => void,
   ): ManagedWorkerToolContext {
     return {
@@ -1786,7 +1811,13 @@ export class ClaudeSdkWorker implements Worker {
 function normalizeSessionCache(
   input: ClaudeSdkSessionCacheOptions | undefined,
 ): NormalizedSessionCacheOptions {
-  return { ...DEFAULT_SESSION_CACHE, ...input };
+  return {
+    ...DEFAULT_SESSION_CACHE,
+    ...input,
+    maxIdleSessions:
+      OptionalNonNegativeIntegerSchema.parse(input?.maxIdleSessions) ??
+      DEFAULT_SESSION_CACHE.maxIdleSessions,
+  };
 }
 
 function preparedStartKey(sessionKey: string, cwd: string): string {

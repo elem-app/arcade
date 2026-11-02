@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import type { WorkerHost, WorkerWarmupInput } from "../types/backend.js";
+import type { WorkerHost } from "../types/backend.js";
 import type { JsonValue } from "../types/json.js";
 import type { RoutineInput } from "../types/routine.js";
 import type { BackendName, WorkerSlot } from "../types/worker-slot.js";
@@ -29,39 +29,36 @@ type ResolveContinuityIdentity = (input: {
   cwd: string;
 }) => Promise<ContinuityIdentity | undefined>;
 
-/** Slot-scoped durable continuity used directly by one returned Worker. */
-export function createContinuityController(input: {
+/** One invocation's continuity; only an exact live continuation may retain it. */
+export type InvocationContinuity = {
+  readonly prior: string | undefined;
+  /** Non-secret compatibility identity for backend-owned live resource reuse. */
+  readonly reuseKey?: string;
+  observe(continuityId: string): Promise<void>;
+  drain(): Promise<void>;
+  close(): Promise<void>;
+};
+
+export type PrepareContinuity = (
+  input: RoutineInput,
+) => Promise<InvocationContinuity>;
+
+/** Reads existing durable state without retaining a context or routine index. */
+export function createContinuityPreparation(input: {
   backend: BackendName;
   host: WorkerHost;
   slot: WorkerSlot;
   configuredCwd?: string;
   resolveIdentity?: ResolveContinuityIdentity;
   continuityField: "sessionId" | "responseId";
-  seed(contextKey: string, continuityId: string, cwd: string): void;
-  clear(contextKey: string): void;
-}) {
-  const identityByRoutine = new Map<string, ContinuityIdentity>();
-  // Warmup and invocation share the same context admission. Reuse that exact
-  // preparation in run() so a second identity resolution cannot clear the
-  // provider session that warmup just seeded.
-  const warmPreparations = new Map<
-    string,
-    Promise<ContinuityIdentity | undefined>
-  >();
-
-  const prepare = async (
-    arcRunId: RoutineInput["routine"]["arcRunId"],
-    contextKey: string,
-    cwd: string,
-    routineId: string | undefined,
-  ): Promise<ContinuityIdentity | undefined> => {
+}): PrepareContinuity {
+  return async (routineInput) => {
+    const { arcRunId, contextKey } = routineInput.routine;
+    const cwd = input.configuredCwd ?? routineInput.context.workspacePath;
     let identity: ContinuityIdentity | undefined;
     let identityError: string | undefined;
     try {
-      const resolved = await input.resolveIdentity?.({
-        slot: input.slot,
-        cwd,
-      });
+      const resolved = await input.resolveIdentity?.({ slot: input.slot, cwd });
       identity =
         resolved === undefined
           ? undefined
@@ -69,7 +66,15 @@ export function createContinuityController(input: {
     } catch (error) {
       identityError = error instanceof Error ? error.message : String(error);
     }
-    if (!identity) {
+    let prior: string | undefined;
+    if (identity) {
+      prior = readStoredContinuity(
+        await input.host.state.get(arcRunId, contextKey),
+        input.continuityField,
+        cwd,
+        identity,
+      );
+    } else {
       input.host.logger.info(
         `backend.${input.backend.replaceAll("-", "_")}.resume_identity_unavailable`,
         {
@@ -77,122 +82,67 @@ export function createContinuityController(input: {
           contextKey,
           message:
             identityError ??
-            (input.resolveIdentity === undefined
-              ? "No continuity identity resolver is configured; starting fresh."
-              : "The continuity identity resolver returned no identity; starting fresh."),
+            "No continuity identity is available; starting fresh.",
         },
       );
-      input.clear(contextKey);
-      return undefined;
     }
-    if (routineId) identityByRoutine.set(routineId, identity);
-    const stored = await input.host.state.get(arcRunId, contextKey);
-    const continuity = readStoredContinuity(
-      stored,
-      input.continuityField,
+    // Capture the state facade and scalar identity only, never routineInput.
+    return invocationContinuity(
+      input.host.state,
+      arcRunId,
+      contextKey,
       cwd,
+      input.continuityField,
       identity,
+      prior,
     );
-    if (continuity) input.seed(contextKey, continuity, cwd);
-    else input.clear(contextKey);
-    return identity;
-  };
-
-  return {
-    warm(hint: WorkerWarmupInput): Promise<void> {
-      const cwd = input.configuredCwd ?? hint.workspacePath;
-      const key = warmPreparationKey(hint.arcRunId, hint.contextKey, cwd);
-      const pending = prepare(
-        hint.arcRunId,
-        hint.contextKey,
-        cwd,
-        undefined,
-      ).catch((error: unknown) => {
-        input.host.logger.info(
-          `backend.${input.backend.replaceAll("-", "_")}.warm_continuity_failed`,
-          {
-            arcRunId: hint.arcRunId,
-            contextKey: hint.contextKey,
-            message: error instanceof Error ? error.message : String(error),
-          },
-        );
-        input.clear(hint.contextKey);
-        return undefined;
-      });
-      warmPreparations.set(key, pending);
-      return pending.then(() => undefined);
-    },
-
-    async prepareRun(
-      routineInput: RoutineInput,
-      options: { preserveLiveContinuation?: boolean } = {},
-    ): Promise<void> {
-      // An in-turn resume continues state already held by this exact Worker.
-      // Resolving durable identity again could clear that live state before the
-      // provider adapter consumes it; only fresh invocations consult storage.
-      if (options.preserveLiveContinuation) return;
-      const cwd = input.configuredCwd ?? routineInput.context.workspacePath;
-      const key = warmPreparationKey(
-        routineInput.routine.arcRunId,
-        routineInput.routine.contextKey,
-        cwd,
-      );
-      const warmed = warmPreparations.get(key);
-      if (warmed) {
-        // A preparation belongs to the first matching dispatch only. Promote
-        // its identity to that routine so any newly observed continuation can
-        // be persisted under the same identity that authorized the resume.
-        warmPreparations.delete(key);
-        const identity = await warmed;
-        if (identity) {
-          identityByRoutine.set(routineInput.routine.id, identity);
-        }
-        return;
-      }
-      await prepare(
-        routineInput.routine.arcRunId,
-        routineInput.routine.contextKey,
-        cwd,
-        routineInput.routine.id,
-      );
-    },
-
-    async persistObserved(
-      routine: RoutineInput["routine"],
-      contextKey: string,
-      continuityId: string,
-      cwd: string,
-    ): Promise<void> {
-      const identity = identityByRoutine.get(routine.id);
-      if (!identity) return;
-      await input.host.state.put(routine.arcRunId, contextKey, {
-        schema: 1,
-        [input.continuityField]: continuityId,
-        cwd,
-        identity,
-      });
-    },
-
-    finish(routineId: string, paused: boolean): void {
-      if (!paused) identityByRoutine.delete(routineId);
-    },
-
-    fail(routineId: string): void {
-      identityByRoutine.delete(routineId);
-    },
-
-    disposeRoutine(routineId: string): void {
-      identityByRoutine.delete(routineId);
-    },
   };
 }
 
-function warmPreparationKey(
-  arcRunId: string,
+function invocationContinuity(
+  state: WorkerHost["state"],
+  arcRunId: RoutineInput["routine"]["arcRunId"],
   contextKey: string,
   cwd: string,
-): string {
-  return JSON.stringify([arcRunId, contextKey, cwd]);
+  field: "sessionId" | "responseId",
+  identity: ContinuityIdentity | undefined,
+  prior: string | undefined,
+): InvocationContinuity {
+  let closed = false;
+  let pending = Promise.resolve();
+  return {
+    prior,
+    ...(identity
+      ? {
+          reuseKey: JSON.stringify([
+            identity.provider,
+            identity.endpoint,
+            identity.credentialScope,
+            cwd,
+          ]),
+        }
+      : {}),
+    observe(continuityId) {
+      if (closed || !identity) return Promise.resolve();
+      pending = pending.then(() =>
+        state.put(arcRunId, contextKey, {
+          schema: 1,
+          [field]: continuityId,
+          cwd,
+          identity,
+        }),
+      );
+      // Preserve the original failure for callers and teardown, without an
+      // unhandled rejection when a transport does not await its callback.
+      void pending.catch(() => undefined);
+      return pending;
+    },
+    drain: () => pending,
+    close() {
+      closed = true;
+      return pending;
+    },
+  };
 }
 
 export function readStoredContinuity(

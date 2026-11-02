@@ -133,8 +133,8 @@ export type OutboundMessage = {
  * One branch decision or routine failure on a submission's channel.
  *
  * A submission's channel emits activation decisions and per-routine trigger
- * failures. It closes once all probes and handshakes settle; closure is the
- * submission's "done" signal, and an empty channel means nothing matched.
+ * failures. It terminates once admission and owned cleanup settle, including on
+ * failure or cancellation. A processed request with no match produces no events.
  *
  * No ordering is guaranteed: `activated` and `handshake-required` for one fan-out
  * may interleave (in match order), and resolving a handshake pushes its
@@ -161,6 +161,8 @@ export type OutboundMessage = {
  *   `requirement.kind` discriminates its fields — e.g. candidates exist only
  *   on a run-choice. NOT terminal for the channel — resolving the handshake
  *   pushes its follow-on events back onto the same channel.
+ * - `handshake-settled`: one published handshake ended. Its outcome follows
+ *   any authoritative business result and releases that exact decision.
  */
 export type InboundLifecycleEvent =
   | {
@@ -182,8 +184,21 @@ export type InboundLifecycleEvent =
       kind: "handshake-required";
       arcRunId: ArcRunId;
       handshakeId: string;
+      /** Absolute ISO deadline for this decision. */
+      expiresAt: string;
       arcRef?: ArcRef;
       requirement: ActivationRequirement;
+    }
+  | {
+      kind: "handshake-settled";
+      handshakeId: string;
+      outcome:
+        | "proceeded"
+        | "joined"
+        | "declined"
+        | "expired"
+        | "cancelled"
+        | "unavailable";
     };
 
 /**

@@ -1,5 +1,6 @@
 import { createArcadeLogger } from "../../src/logging.js";
 import { WorkEventService } from "../../src/service/work-events.js";
+import { ownedSubmissionEvents } from "../submission-events.js";
 /**
  * OpenAI Agents SDK eval for Arcade instruction workers.
  *
@@ -129,7 +130,7 @@ defineManagedEvalGroup(
     // The record payload lives only in the inbound message; the Arc tells the
     // writer to copy it from the latest user message without repeating it.
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: `Store the record payload. The exact payload is: ${sentinel}`,
         metadata: { principal: "eval-user" },
       }),
@@ -223,7 +224,7 @@ defineManagedEvalGroup(
       );
 
       const arcRunId = await firstActivation(
-        workerHub.submitInbound({
+        ownedSubmissionEvents(workerHub, {
           content: "Run the context visibility check.",
           metadata: { principal: "eval-user" },
         }),
@@ -313,7 +314,7 @@ defineManagedEvalGroup(
       );
 
       const arcRunId = await firstActivation(
-        workerHub.submitInbound({
+        ownedSubmissionEvents(workerHub, {
           content: item.inbound,
           metadata: { principal: "eval-user" },
         }),
@@ -413,7 +414,7 @@ defineManagedEvalGroup(
     );
 
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: "Run the audience question case.",
         metadata: { principal: "eval-user" },
       }),
@@ -514,7 +515,7 @@ defineManagedEvalGroup(
     );
 
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: "Run the freeform question case.",
         metadata: { principal: "eval-user" },
       }),
@@ -597,7 +598,7 @@ defineManagedEvalGroup(
     );
 
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: "Run the feedback pause case.",
         metadata: { principal: "eval-user" },
       }),
@@ -680,7 +681,7 @@ defineManagedEvalGroup(
     );
 
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: "Run the staged task.",
         metadata: { principal: "eval-user" },
       }),
@@ -786,7 +787,7 @@ defineManagedEvalGroup(
       );
 
       const arcRunId = await firstActivation(
-        workerHub.submitInbound({
+        ownedSubmissionEvents(workerHub, {
           content: scenario.inbound,
           metadata: { principal: "eval-user" },
         }),
@@ -893,7 +894,7 @@ defineManagedEvalGroup(
       );
 
       const arcRunId = await firstActivation(
-        workerHub.submitInbound({
+        ownedSubmissionEvents(workerHub, {
           content: item.inbound,
           metadata: { principal: "eval-user" },
         }),

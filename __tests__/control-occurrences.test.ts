@@ -601,9 +601,7 @@ describe("committed control occurrences", () => {
     const driver = await beginActivatedDriver(host, dialog);
     const selection = expectSoleHandshake(
       await host.begin({
-        dialog,
         principal: ALICE_OWNER,
-        inbound: { content: "again" },
         projectDialog: projectorFor(dialog),
       }),
     );
@@ -1173,9 +1171,12 @@ describe("committed control occurrences", () => {
         expect(occurrences(await events.list(asks[0]!.runId))).toHaveLength(1);
         release();
         const result = await observed;
-        if (outcome === "accepted")
-          expect(result).toMatchObject({ value: [{ kind: "continued" }] });
-        else expect(result).toMatchObject({ error: expect.any(Error) });
+        expect(result).toMatchObject({ error: expect.any(Error) });
+        expect(
+          (await historyStore.listEntries(asks[0]!.runId)).some(
+            (entry) => entry.content === "answer",
+          ),
+        ).toBe(outcome === "accepted");
         await waitFor(
           async () =>
             occurrences(await events.list(asks[0]!.runId)).length === 1,
@@ -1185,9 +1186,7 @@ describe("committed control occurrences", () => {
           (await events.list(asks[0]!.runId)).flatMap((event) =>
             event.kind === "asks:invalidated" ? event.askIds : [],
           ),
-        ).toEqual(
-          outcome === "accepted" ? [asks[1]!.id] : [asks[1]!.id, asks[0]!.id],
-        );
+        ).toEqual([asks[1]!.id, asks[0]!.id]);
       } finally {
         release();
         await workerHub.stop();

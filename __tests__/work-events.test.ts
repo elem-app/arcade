@@ -7,7 +7,11 @@ import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import * as workerInstructions from "../src/instructions/worker-role.js";
 import { createArcadeLogger } from "../src/logging.js";
-import { InMemoryArcHostStore, WorkEventService } from "../src/testing.js";
+import {
+  InMemoryArcHostStore,
+  WorkEventService,
+  probeRetention,
+} from "../src/testing.js";
 import {
   beginActivatedDriver,
   beginDriver,
@@ -385,7 +389,7 @@ describe("Host module and execution-control work events", () => {
             control: { status: "paused" },
           });
         allowRelease.resolve();
-        await waitFor(() => workerHub.getLiveWorkCounts().scopes === 0);
+        await waitFor(() => probeRetention(workerHub).transient.scopes === 0);
         await waitFor(() => observations.length === 2);
         expect(
           observations.map(({ event, status }) => [event.kind, status]),
@@ -1492,9 +1496,7 @@ describe("Run work event publication", () => {
       events.push(event);
     });
     await host.begin({
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
       principal: "operator-owner",
-      inbound: { content: "go" },
       projectDialog: projectorFor({
         cursor: { user: 0, self: 0 },
         lastTurns: [],
@@ -1843,9 +1845,7 @@ describe("Run work event publication", () => {
         ],
       });
     const steps = await host.begin({
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
       principal: ALICE_OWNER,
-      inbound: { content: "go" },
       projectDialog: projectorFor({
         cursor: { user: 0, self: 0 },
         lastTurns: [],

@@ -28,6 +28,7 @@ import {
   InMemoryReplayStore,
   InMemoryWorkerHubStore,
   InMemoryWorkEventStore,
+  probeRetention,
   RoutinePausedError,
   taskId,
   workerContextKey,
@@ -99,7 +100,7 @@ describe("WorkerHubService execution control", () => {
         await waitFor(
           () =>
             retry !== undefined &&
-            workerHub.getLiveWorkCounts().continuations === 1,
+            probeRetention(workerHub).transient.continuations === 1,
         );
         expect(await workerHub.getExecutionControlView(runId)).toMatchObject({
           status,
@@ -469,9 +470,7 @@ function Main() {
         ),
       );
       const [step] = await arcHost.begin({
-        dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
         principal: ALICE_OWNER,
-        inbound: { content: "start" },
         projectDialog: async () => ({
           cursor: { user: 0, self: 0 },
           lastTurns: [],
@@ -722,6 +721,9 @@ function Main() {
       });
       expect(begin).toHaveBeenCalledWith(expect.objectContaining({ arcRunId }));
       await waitFor(() => dispatched.length === 2);
+      await waitFor(
+        () => probeRetention(workerHub).transient.retiringRoutines === 0,
+      );
       expect(taskId(dispatched[1]!)).toBe(taskId(dispatched[0]!));
       expect(
         (await store.getState(arcRunKey(arcRunId)))?.reactivationCount,
@@ -1163,7 +1165,9 @@ function Main() {
       });
       expect(run).toHaveBeenCalledTimes(1);
 
-      await waitFor(() => workerHub.getLiveWorkCounts().continuations === 1);
+      await waitFor(
+        () => probeRetention(workerHub).transient.continuations === 1,
+      );
       await expect(workerHub.resume(arcRunId)).resolves.toMatchObject({
         outcome: "resumed",
       });
@@ -1735,6 +1739,12 @@ describe("Host and hub parks and rebuilds", () => {
         "internal-error",
     );
 
+    await waitFor(() => probeRetention(workerHub).transient.scopes === 0);
+    expect(probeRetention(workerHub).transient).toMatchObject({
+      laps: 0,
+      lapFailures: 1,
+    });
+
     // A rebuild that fails again rejects, and the run reads its new failure.
     vi.spyOn(arcHost, "begin").mockRejectedValueOnce(
       new Error("arc host unavailable"),
@@ -1758,6 +1768,10 @@ describe("Host and hub parks and rebuilds", () => {
         (await workerHub.getExecutionControlView(arcRunId)).status ===
         "inactive",
     );
+    expect(probeRetention(workerHub).transient).toMatchObject({
+      laps: 0,
+      lapFailures: 0,
+    });
   });
 
   it("exec.resume dispatches once for concurrent resumes of a park without live work", async () => {
@@ -1822,8 +1836,6 @@ async function persistedRun(source = WATCH_SOURCE) {
   const earlier = await hostOver(durable, source);
   const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
   const [step] = await earlier.begin({
-    dialog,
-    inbound: { content: "start" },
     principal: ALICE_OWNER,
     projectDialog: async () => dialog,
   });
@@ -1864,8 +1876,6 @@ async function instructionTaskFromRun(): Promise<{
 }> {
   const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
   const begun = await arcHost.begin({
-    dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
-    inbound: { content: "start" },
     principal: ALICE_OWNER,
     projectDialog: async () => ({
       cursor: { user: 0, self: 0 },

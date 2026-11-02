@@ -13,9 +13,11 @@ import {
 } from "./work-event-fixtures.js";
 
 import {
+  DEFAULT_WORKER_ROLE,
   InMemoryArcHostStore,
   JsonFileArcHostStore,
   arcRunKey,
+  probeRetention,
   taskId,
   type ArcRunId,
   type Dialog,
@@ -98,9 +100,7 @@ ${roots === "ambiguous roots" ? 'function Other() { this.trigger = () => judge("
       try {
         const probe = expectSoleTrigger(
           await host.begin({
-            dialog: snapshotDialog,
             principal: ALICE_OWNER,
-            inbound: { content: "start" },
             projectDialog: projectorFor(snapshotDialog),
           }),
         );
@@ -436,9 +436,7 @@ ${roots === "ambiguous roots" ? 'function Other() { this.trigger = () => judge("
         snapshotManifest,
       );
       const [step] = await host.begin({
-        dialog: snapshotDialog,
         principal: ALICE_OWNER,
-        inbound: { content: "start" },
         projectDialog: projectorFor(snapshotDialog),
       });
       if (step?.kind !== "trigger" && step?.kind !== "action")
@@ -461,7 +459,8 @@ ${roots === "ambiguous roots" ? 'function Other() { this.trigger = () => judge("
       ]);
       try {
         await entered.promise;
-        await host.releaseAction(step.arcRunId, step.frontier.frontierId);
+        if (step.kind === "trigger") await host.releaseTrigger(step.arcRunId);
+        else await host.releaseAction(step.arcRunId, step.frontier.frontierId);
         await host.registerArc(
           "release-cache",
           parse('"arc"; function Main() { this.description = "Replacement"; }'),
@@ -591,9 +590,7 @@ function Third() {
     );
     const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
     const [step] = await host.begin({
-      dialog,
       principal: ALICE_OWNER,
-      inbound: { content: "go" },
       projectDialog: projectorFor(dialog),
     });
     if (step?.kind !== "trigger") throw new Error("Expected trigger work");
@@ -646,9 +643,7 @@ function Third() {
       );
       const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
       const [step] = await host.begin({
-        dialog,
         principal: ALICE_OWNER,
-        inbound: { content: "go" },
         projectDialog: projectorFor(dialog),
       });
       if (step?.kind !== "handshake") throw new Error("Expected handshake");
@@ -700,7 +695,7 @@ function Third() {
       const result = await completed;
       if (fail) {
         expect(result).toHaveProperty("error");
-        expect(host.getLiveSessionCounts().actioning).toBe(0);
+        expect(probeRetention(host).transient.actioning).toBe(0);
         expect(await host.getRunView(id)).toBeUndefined();
         expect(
           (await workEventsFor(host).list(id)).some(
@@ -744,9 +739,7 @@ function Third() {
       );
     const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
     const steps = await host.begin({
-      dialog,
       principal: ALICE_OWNER,
-      inbound: { content: "go" },
       activationPolicy: "choose",
       projectDialog: projectorFor(dialog),
     });
@@ -1846,8 +1839,6 @@ function Main() {
     );
     const requested: string[] = [];
     const steps = await arcHost.begin({
-      dialog: DEFAULT_VIEW,
-      inbound: { content: "hello" },
       principal: ALICE_OWNER,
       projectDialog: async ({ roleId }) => {
         requested.push(roleId);
@@ -1856,7 +1847,7 @@ function Main() {
     });
 
     const step = expectSoleDriver(steps);
-    expect(requested).toEqual(["reviewer"]);
+    expect(requested).toEqual([DEFAULT_WORKER_ROLE, "reviewer"]);
     expect(step.frontier.tasks).toEqual([
       expect.objectContaining({
         kind: "instruction",
@@ -1870,8 +1861,6 @@ function Main() {
     const arcHost = await makeArcHostWithSource("review", VIEW_SOURCE);
     const requested: string[] = [];
     const steps = await arcHost.begin({
-      dialog: DEFAULT_VIEW,
-      inbound: { content: "hello" },
       principal: ALICE_OWNER,
       projectDialog: async ({ roleId }) => {
         requested.push(roleId);
@@ -1900,8 +1889,6 @@ function Main() {
   it("projects the stationary report-time view for the run's current position", async () => {
     const arcHost = await makeArcHostWithSource("review", VIEW_SOURCE);
     const steps = await arcHost.begin({
-      dialog: DEFAULT_VIEW,
-      inbound: { content: "hello" },
       principal: ALICE_OWNER,
       projectDialog: async ({ roleId }) =>
         roleId === "reviewer" ? REVIEWER_VIEW : DEFAULT_VIEW,
@@ -1948,8 +1935,6 @@ function Main() {
     );
     const begun = expectSoleDriver(
       await first.begin({
-        dialog: DEFAULT_VIEW,
-        inbound: { content: "hello" },
         principal: ALICE_OWNER,
         projectDialog: projectorFor(DEFAULT_VIEW),
       }),
@@ -1996,8 +1981,6 @@ function Main() {
     const arcHost = await makeArcHostWithSource("corridor", corridorSource(20));
     const dialog = DEFAULT_VIEW;
     const steps = await arcHost.begin({
-      dialog,
-      inbound: { content: "hello" },
       principal: ALICE_OWNER,
       projectDialog: async () => dialog,
     });
@@ -2018,8 +2001,6 @@ function Main() {
     const arcHost = await makeArcHostWithSource("runaway", corridorSource(130));
     const dialog = DEFAULT_VIEW;
     const steps = await arcHost.begin({
-      dialog,
-      inbound: { content: "hello" },
       principal: ALICE_OWNER,
       projectDialog: async () => dialog,
     });
@@ -2037,8 +2018,6 @@ function Main() {
   it("poisons the frontier when the projector fails at a transition", async () => {
     const arcHost = await makeArcHostWithSource("review", VIEW_SOURCE);
     const steps = await arcHost.begin({
-      dialog: DEFAULT_VIEW,
-      inbound: { content: "hello" },
       principal: ALICE_OWNER,
       projectDialog: async ({ roleId }) => {
         if (roleId === "reviewer") {

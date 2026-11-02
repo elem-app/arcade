@@ -108,6 +108,18 @@ export class ModuleExecution {
     const batches = new Map<HostModule, HostCallRecord[]>();
     for (const record of state.calls) {
       if (this.#submitted.has(record.call.hostCallId)) continue;
+      // Unanswered trigger calls abandoned by selection have no live occurrence
+      // to restore. Their recorded facts remain available for replay.
+      if (
+        record.context.arcRunId === undefined &&
+        record.runtimeCallId === undefined &&
+        !record.effects.some(
+          (effect) =>
+            effect.hostCallOutcome.kind === "resolution" ||
+            effect.hostCallOutcome.kind === "failure",
+        )
+      )
+        continue;
       const module = this.modules.get(record.call.module);
       if (!module?.submit)
         throw new Error(

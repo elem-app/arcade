@@ -1,5 +1,6 @@
 import { createArcadeLogger } from "../../src/logging.js";
 import { WorkEventService } from "../../src/service/work-events.js";
+import { ownedSubmissionEvents } from "../submission-events.js";
 /**
  * Claude Agent SDK eval for Arcade instruction workers.
  *
@@ -38,6 +39,7 @@ import { FileRoutineDiagnosticsStore } from "../../src/storage/routine-diagnosti
 import type { RoutineState } from "../../src/types/hub.js";
 import { asJsonObject } from "../../src/types/json.js";
 import type { OutboundMessage } from "../../src/types/messaging.js";
+import { trackClaudePreparedStarts } from "../claude-prepared-starts.js";
 import {
   contextVisibilityEvalArc,
   NO_PRIOR_PROVIDER_CONTEXT,
@@ -118,7 +120,7 @@ defineManagedEvalGroup(
     // The record payload lives only in the inbound message; the Arc tells the
     // writer to copy it from the latest user message without repeating it.
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: `Store the record payload. The exact payload is: ${sentinel}`,
         metadata: { principal: "eval-user" },
       }),
@@ -140,13 +142,13 @@ defineManagedEvalGroup(
     expect(routineDetails(sdkRoutines[0]!)).toMatchObject({
       sessionCacheEnabled: true,
       liveSessionReused: false,
-      preparedStartUsed: true,
+      preparedStartUsed: false,
       cwd: workspace,
     });
     expect(routineDetails(sdkRoutines[1]!)).toMatchObject({
       sessionCacheEnabled: true,
-      liveSessionReused: false,
-      preparedStartUsed: true,
+      liveSessionReused: true,
+      preparedStartUsed: false,
       cwd: workspace,
     });
     const secondMetadata = routineDetails(sdkRoutines[1]!);
@@ -219,7 +221,7 @@ defineManagedEvalGroup(
       );
 
       const arcRunId = await firstActivation(
-        workerHub.submitInbound({
+        ownedSubmissionEvents(workerHub, {
           content: "Run the context visibility check.",
           metadata: { principal: "eval-user" },
         }),
@@ -251,7 +253,7 @@ defineManagedEvalGroup(
       );
       expect(
         routines.map((routine) => routineDetails(routine).liveSessionReused),
-      ).toEqual([false, false]);
+      ).toEqual([false, contextIsolation === "role"]);
       await workerHub.stop();
     }
   },
@@ -269,7 +271,10 @@ defineManagedEvalGroup(
       "arcade-claude-sdk-prepared-start-",
     );
     const sentinel = `echo-${randomUUID()}`;
+    const workspace = join(root, "workspace");
+    await mkdir(workspace, { recursive: true });
     const logger = createEvalLogger();
+    const preparedStarts = trackClaudePreparedStarts(logger);
     const emitted: OutboundMessage[] = [];
     const routineStore = new InMemoryWorkerHubStore();
     const workEvents = new WorkEventService(
@@ -293,12 +298,14 @@ defineManagedEvalGroup(
       ),
       piAgentOptions: {},
       bindings: { roles: { writer: "claude-sdk" } },
+      claudeSdkStartup: preparedStarts.startup,
       claudeSdkOptions: {
         model: EVAL_CLAUDE_SDK_MODEL,
         timeoutMs: 120_000,
         sessionCache: {
           enabled: true,
           maxPreparedStarts: 1,
+          maxIdleSessions: 0,
         },
       },
       logger,
@@ -312,36 +319,67 @@ defineManagedEvalGroup(
     await arcHost.registerArc(
       "claude-sdk-prepared-eval",
       parse(preparedStartEvalArc(sentinel)),
+      { workspaceScope: "arc", bundle: {}, contextIsolation: "role" },
+      { workspacePath: workspace },
     );
 
-    const arcRunId = await firstActivation(
-      workerHub.submitInbound({
-        content: `Run the reply task.`,
-        metadata: { principal: "eval-user" },
-      }),
-    );
-
-    const sdkRoutine = await waitForFinishedRoutine(routineStore, arcRunId);
-    expect(sdkRoutine.error).toBeUndefined();
-    expect(sdkRoutine?.backendDetails).toMatchObject({
-      backend: "claude-sdk",
-      sessionCacheEnabled: true,
-      liveSessionReused: false,
-      preparedStartUsed: true,
+    const questions = trackUnexpectedQuestions(workerHub);
+    expect(preparedStarts.snapshot()).toEqual({
+      started: 0,
+      ready: 0,
+      consumed: 0,
+      failed: 0,
     });
-    const outbounds = emitted.filter(
-      (message) => message.arcRunId === arcRunId,
-    );
-    expect(outbounds).toEqual([
-      expect.objectContaining({
-        situation: {
-          role: "writer",
-          audience: "originator",
-          cause: "reply",
-        },
-        content: sentinel,
-      }),
-    ]);
+    const sessionIds = new Set<string>();
+    // Fresh runs share the workspace and task-independent pool. Each receives
+    // its own provider session; the latter two must consume replenished starts.
+    for (const [index, label] of [
+      "cold",
+      "prepared",
+      "replenished",
+    ].entries()) {
+      if (index > 0) await preparedStarts.waitForReady(1);
+      const arcRunId = await firstActivation(
+        ownedSubmissionEvents(workerHub, {
+          content: "Run the reply task.",
+          metadata: { principal: `eval-user-${label}` },
+        }),
+      );
+      const sdkRoutine = await waitForFinishedRoutine(routineStore, arcRunId);
+      expect(sdkRoutine.error).toBeUndefined();
+      expect(sdkRoutine.backendDetails).toMatchObject({
+        backend: "claude-sdk",
+        sessionCacheEnabled: true,
+        liveSessionReused: false,
+        preparedStartUsed: index > 0,
+        cwd: workspace,
+      });
+      const sessionId = routineDetails(sdkRoutine).sessionId;
+      expect(sessionId).toEqual(expect.any(String));
+      if (typeof sessionId === "string") sessionIds.add(sessionId);
+      expect(
+        emitted.filter((message) => message.arcRunId === arcRunId),
+      ).toEqual([
+        expect.objectContaining({
+          situation: {
+            role: "writer",
+            audience: "originator",
+            cause: "reply",
+          },
+          content: sentinel,
+        }),
+      ]);
+      expect(preparedStarts.snapshot().consumed).toBe(index);
+    }
+    await preparedStarts.waitForReady(1);
+    expect(preparedStarts.snapshot()).toEqual({
+      started: 3,
+      ready: 1,
+      consumed: 2,
+      failed: 0,
+    });
+    expect(sessionIds.size).toBe(3);
+    expect(questions).toHaveLength(0);
   },
 );
 
@@ -401,7 +439,7 @@ defineManagedEvalGroup(
       );
 
       const arcRunId = await firstActivation(
-        workerHub.submitInbound({
+        ownedSubmissionEvents(workerHub, {
           content: item.inbound,
           metadata: { principal: "eval-user" },
         }),
@@ -499,7 +537,7 @@ defineManagedEvalGroup(
     );
 
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: "Run the audience question case.",
         metadata: { principal: "eval-user" },
       }),
@@ -598,7 +636,7 @@ defineManagedEvalGroup(
     );
 
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: "Run the freeform question case.",
         metadata: { principal: "eval-user" },
       }),
@@ -679,7 +717,7 @@ defineManagedEvalGroup(
     );
 
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: "Run the feedback pause case.",
         metadata: { principal: "eval-user" },
       }),
@@ -760,7 +798,7 @@ defineManagedEvalGroup(
     );
 
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: "Run the staged file task.",
         metadata: { principal: "eval-user" },
       }),
@@ -866,7 +904,7 @@ defineManagedEvalGroup(
       );
 
       const arcRunId = await firstActivation(
-        workerHub.submitInbound({
+        ownedSubmissionEvents(workerHub, {
           content: scenario.inbound,
           metadata: { principal: "eval-user" },
         }),
@@ -971,7 +1009,7 @@ defineManagedEvalGroup(
       );
 
       const arcRunId = await firstActivation(
-        workerHub.submitInbound({
+        ownedSubmissionEvents(workerHub, {
           content: item.inbound,
           metadata: { principal: "eval-user" },
         }),

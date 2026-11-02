@@ -210,7 +210,7 @@ async function advanceStep(
   };
   const next =
     step.kind === "trigger"
-      ? await host.advanceTrigger(step.arcRunId, dialog, input)
+      ? await host.advanceTrigger(step.arcRunId, input)
       : [
           await host.advanceAction(
             step.arcRunId,
@@ -235,8 +235,6 @@ export async function runToCompletion(
     await drainModuleEffects(
       host,
       await host.begin({
-        dialog,
-        inbound: { content: message },
         principal: REPLAY_OWNER,
         projectDialog: async () => dialog,
       }),
@@ -273,8 +271,6 @@ export async function runAnsweringJudgments(
     await drainModuleEffects(
       host,
       await host.begin({
-        dialog,
-        inbound: { content: message },
         principal: REPLAY_OWNER,
         projectDialog: async () => dialog,
       }),

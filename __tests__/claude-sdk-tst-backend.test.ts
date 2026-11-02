@@ -10,6 +10,7 @@ import {
   DEFAULT_CLAUDE_SDK_TST_MODEL,
   createFileRoutineDiagnostics,
   noopRoutineEffects,
+  probeRetention,
   routinePathSegment,
   type ClaudeSdkTstQueryFn,
   type ClaudeSdkTstStartupFn,
@@ -27,6 +28,106 @@ import {
 import { deferred } from "./helpers.js";
 
 describe("ClaudeSdkTstWorker", () => {
+  it("aborts an active Claude TST query on stop and closes its transport", async () => {
+    const entered = deferred();
+    const close = vi.fn();
+    const worker = new ClaudeSdkTstWorker({
+      fastStarts: { enabled: false },
+      query: ((params: Parameters<ClaudeSdkTstQueryFn>[0]) => {
+        const stream = (async function* () {
+          await new Promise<void>((resolve, reject) => {
+            params.options!.abortController!.signal.addEventListener(
+              "abort",
+              () => reject(new Error("query aborted")),
+              { once: true },
+            );
+            entered.resolve();
+          });
+        })();
+        return Object.assign(stream, { close });
+      }) as unknown as ClaudeSdkTstQueryFn,
+    });
+    const running = runSemantic(worker, judgmentTask());
+    const rejected = expect(running).resolves.toMatchObject({
+      cancellation: "superseded",
+    });
+    await entered.promise;
+    await worker.stop();
+    await rejected;
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a fresh Claude TST controller after a prepared query throws and closes consumed resources", async () => {
+    const close = vi.fn();
+    const query = vi.fn((params: Parameters<ClaudeSdkTstQueryFn>[0]) => {
+      expect(params.options?.abortController?.signal.aborted).toBe(false);
+      return semanticMessages(true);
+    });
+    const worker = new ClaudeSdkTstWorker({
+      query: query as unknown as ClaudeSdkTstQueryFn,
+      startup: (async () => ({
+        close,
+        query: () => {
+          throw new Error("prepared query failed");
+        },
+      })) as unknown as ClaudeSdkTstStartupFn,
+      fastStarts: { enabled: true, maxPreparedStarts: 1 },
+    });
+    await primePoolByRunning(worker);
+    await flushMicrotasks();
+    await expect(runSemantic(worker, judgmentTask())).resolves.toMatchObject({
+      outcome: "completed",
+      backendDetails: { preparedStartUsed: false },
+    });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledTimes(1);
+    await worker.stop();
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
+  it("fences Claude TST provider entry and releases consumed starts when diagnostics fail or stop overlaps setup", async () => {
+    const entered = deferred();
+    const release = deferred();
+    const query = queryReturning({
+      outcome: "completed",
+      semantic: { judgments: { "judge:1": true } },
+    });
+    const close = vi.fn();
+    const worker = new ClaudeSdkTstWorker({
+      query,
+      startup: (async () => ({
+        close,
+        query: () => semanticMessages(true),
+      })) as unknown as ClaudeSdkTstStartupFn,
+      fastStarts: { enabled: true, maxPreparedStarts: 1 },
+    });
+    await primePoolByRunning(worker);
+    await flushMicrotasks();
+    const running = runBackend(
+      worker,
+      semanticRoutine(judgmentTask()),
+      context(),
+      noopRoutineEffects(),
+      {
+        ...noopDiagnostics,
+        writeText: async () => {
+          entered.resolve();
+          await release.promise;
+          throw new Error("diagnostics failed");
+        },
+      },
+    );
+    const rejected = expect(running).resolves.toMatchObject({
+      cancellation: "superseded",
+    });
+    await entered.promise;
+    await worker.stop();
+    release.resolve();
+    await rejected;
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
   it("preserves a consumed Claude trigger start across pool replenishment and expiry", async () => {
     const entered = deferred();
     const release = deferred();
@@ -68,13 +169,13 @@ describe("ClaudeSdkTstWorker", () => {
     });
     let pending: ReturnType<typeof runSemantic> | undefined;
     try {
-      warmBackend(worker);
+      await primePoolByRunning(worker);
       expect(startup).toHaveBeenCalledTimes(1);
       await flushMicrotasks();
       pending = runSemantic(worker, judgmentTask());
       await entered.promise;
       await vi.advanceTimersByTimeAsync(25);
-      expect(closes.length).toBeGreaterThan(2);
+      expect(closes.length).toBe(2);
       expect(closes[0]).not.toHaveBeenCalled();
       expect(
         closes.slice(1).some((close) => close.mock.calls.length === 1),
@@ -99,7 +200,7 @@ describe("ClaudeSdkTstWorker", () => {
         backendDetails: { preparedStartUsed: true },
       });
       expect(completed.has(0)).toBe(true);
-      expect(closes[0]).not.toHaveBeenCalled();
+      expect(closes[0]).toHaveBeenCalledTimes(1);
     } finally {
       release.resolve();
       await pending;
@@ -509,7 +610,7 @@ describe("ClaudeSdkTstWorker", () => {
       fastStarts: { enabled: true, maxPreparedStarts: 1 },
     });
     expect(startup).not.toHaveBeenCalled();
-    warmBackend(backend, "/first-hub-cwd");
+    await primePoolByRunning(backend, "/first-hub-cwd");
     await flushMicrotasks();
     expect(startup.mock.calls[0]![0]?.options?.cwd).toBe("/first-hub-cwd");
     const task = judgmentTask();
@@ -522,7 +623,7 @@ describe("ClaudeSdkTstWorker", () => {
     );
     expect(close).toHaveBeenCalledTimes(1);
     expect(startup.mock.calls[1]![0]?.options?.cwd).toBe("/second-hub-cwd");
-    expect(query.mock.calls[0]![0].options?.cwd).toBe("/second-hub-cwd");
+    expect(query.mock.calls[1]![0].options?.cwd).toBe("/second-hub-cwd");
     expect(report.backendDetails).toMatchObject({
       cwd: "/second-hub-cwd",
       preparedStartUsed: false,
@@ -530,27 +631,29 @@ describe("ClaudeSdkTstWorker", () => {
     backend.stop();
   });
 
-  it("starts a task-independent warm pool when fast trigger starts are enabled", async () => {
-    const query = vi.fn();
+  it("starts a task-independent fast-trigger pool from invocation admission", async () => {
+    const query = queryReturning({
+      report: {
+        outcome: "completed",
+        semantic: { judgments: { "judge:1": true } },
+      },
+    });
     const startup = vi.fn(
       async (_params: Parameters<ClaudeSdkTstStartupFn>[0]) =>
         warmQueryReturning(),
     );
     const backend = new ClaudeSdkTstWorker({
       cwd: "/fixed-semantic-cwd",
-      query: query as unknown as ClaudeSdkTstQueryFn,
+      query,
       startup: startup as unknown as ClaudeSdkTstStartupFn,
       fastStarts: { enabled: true, maxPreparedStarts: 2 },
     });
-
+    expect(startup).not.toHaveBeenCalled();
+    await runSemantic(backend, judgmentTask());
     expect(startup).toHaveBeenCalledTimes(2);
     expect(startup.mock.calls[0]![0]).toMatchObject({
-      initializeTimeoutMs: 30000,
       options: {
         cwd: "/fixed-semantic-cwd",
-        model: DEFAULT_CLAUDE_SDK_TST_MODEL,
-        maxTurns: 2,
-        permissionMode: "dontAsk",
         persistSession: false,
         tools: [],
         skills: [],
@@ -559,12 +662,16 @@ describe("ClaudeSdkTstWorker", () => {
     expect(
       String(startup.mock.calls[0]![0]?.options?.systemPrompt),
     ).not.toContain("Frontier:");
-    expect(query).not.toHaveBeenCalled();
-    backend.stop();
+    await backend.stop();
   });
 
   it("consumes a ready pooled fast trigger start and replenishes it", async () => {
-    const query = vi.fn();
+    const query = queryReturning({
+      report: {
+        outcome: "completed",
+        semantic: { judgments: { "judge:1": true } },
+      },
+    });
     const warmQuery = vi.fn((_prompt: string) => semanticMessages(true));
     const close = vi.fn();
     const startup = vi.fn(async () => ({ query: warmQuery, close }));
@@ -573,7 +680,7 @@ describe("ClaudeSdkTstWorker", () => {
       startup: startup as unknown as ClaudeSdkTstStartupFn,
       fastStarts: { enabled: true, maxPreparedStarts: 1 },
     });
-    warmBackend(backend);
+    await primePoolByRunning(backend);
     await flushMicrotasks();
     const task = judgmentTask();
     const ctx = context();
@@ -594,7 +701,7 @@ describe("ClaudeSdkTstWorker", () => {
     expect(startup.mock.calls.length).toBeGreaterThanOrEqual(1);
     expect(warmQuery).toHaveBeenCalledTimes(1);
     expect(warmQuery.mock.calls[0]![0]).toContain("<semantic-requests>");
-    expect(query).not.toHaveBeenCalled();
+    expect(query).toHaveBeenCalledTimes(1);
     expect(report.backendDetails).toMatchObject({
       backend: "claude-sdk-tst",
       preparedStartUsed: true,
@@ -665,7 +772,7 @@ describe("ClaudeSdkTstWorker", () => {
       startup: startup as unknown as ClaudeSdkTstStartupFn,
       fastStarts: { enabled: true, maxPreparedStarts: 1 },
     });
-    warmBackend(backend);
+    await primePoolByRunning(backend);
     await flushMicrotasks();
     const task = judgmentTask();
     const routine = semanticRoutine(task);
@@ -682,7 +789,7 @@ describe("ClaudeSdkTstWorker", () => {
       semantic: { judgments: { "judge:1": true } },
     });
 
-    expect(query).toHaveBeenCalledTimes(1);
+    expect(query).toHaveBeenCalledTimes(2);
     expect(report.backendDetails).toMatchObject({
       backend: "claude-sdk-tst",
       preparedStartUsed: false,
@@ -690,33 +797,31 @@ describe("ClaudeSdkTstWorker", () => {
     backend.stop();
   });
 
-  it("expires unused warm starts and refreshes the pool", async () => {
+  it("expires unused fast-trigger starts without refreshing an idle pool", async () => {
     vi.useFakeTimers();
-    try {
-      const close = vi.fn();
-      const startup = vi.fn(async () => ({
-        query: vi.fn((_prompt: string) => semanticMessages(true)),
-        close,
-      }));
-      const backend = new ClaudeSdkTstWorker({
-        query: vi.fn() as unknown as ClaudeSdkTstQueryFn,
-        startup: startup as unknown as ClaudeSdkTstStartupFn,
-        fastStarts: {
-          enabled: true,
-          maxPreparedStarts: 1,
-          idleTtlMs: 1,
+    const close = vi.fn();
+    const startup = vi.fn(async () => ({
+      query: () => semanticMessages(true),
+      close,
+    }));
+    const backend = new ClaudeSdkTstWorker({
+      query: queryReturning({
+        report: {
+          outcome: "completed",
+          semantic: { judgments: { "judge:1": true } },
         },
-      });
-      warmBackend(backend);
-      await flushMicrotasks();
-
-      await vi.advanceTimersByTimeAsync(1);
-      await flushMicrotasks();
-
+      }),
+      startup: startup as unknown as ClaudeSdkTstStartupFn,
+      fastStarts: { enabled: true, maxPreparedStarts: 1, idleTtlMs: 10 },
+    });
+    try {
+      await runSemantic(backend, judgmentTask());
+      await vi.advanceTimersByTimeAsync(100);
       expect(close).toHaveBeenCalledTimes(1);
-      expect(startup).toHaveBeenCalledTimes(2);
-      backend.stop();
+      expect(startup).toHaveBeenCalledTimes(1);
+      expect(probeRetention(backend).reserved).toBe(0);
     } finally {
+      await backend.stop();
       vi.useRealTimers();
     }
   });
@@ -728,11 +833,16 @@ describe("ClaudeSdkTstWorker", () => {
       close,
     }));
     const backend = new ClaudeSdkTstWorker({
-      query: vi.fn() as unknown as ClaudeSdkTstQueryFn,
+      query: queryReturning({
+        report: {
+          outcome: "completed",
+          semantic: { judgments: { "judge:1": true } },
+        },
+      }),
       startup: startup as unknown as ClaudeSdkTstStartupFn,
       fastStarts: { enabled: true, maxPreparedStarts: 1 },
     });
-    warmBackend(backend);
+    await primePoolByRunning(backend);
     await flushMicrotasks();
 
     backend.stop();
@@ -868,15 +978,16 @@ function instructionTask(): InstructionTask {
   };
 }
 
-function warmBackend(
+async function primePoolByRunning(
   backend: ClaudeSdkTstWorker,
   workspacePath = context().workspacePath,
 ) {
   const task = judgmentTask();
-  backend.warm({
-    arcRunId: task.arcRunId,
-    role: task.role,
-    contextKey: "semantic-test",
-    workspacePath,
-  });
+  await runBackend(
+    backend,
+    semanticRoutine(task),
+    { ...context(), workspacePath },
+    noopRoutineEffects(),
+    noopDiagnostics,
+  );
 }

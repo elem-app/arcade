@@ -146,7 +146,8 @@ export type OutboundMessageInput = {
 export type PermissionVerdict = {
   /**
    * `allow` approves this request once. `deny` rejects it. `allow_this_run`
-   * approves this request and matching later requests in the same run.
+   * approves this request and permits temporary reuse for matching later
+   * requests in the same run. Expiry or eviction may require approval again.
    */
   decision: "allow" | "deny" | "allow_this_run";
   /** Optional replacement tool input to use when the request is allowed. */

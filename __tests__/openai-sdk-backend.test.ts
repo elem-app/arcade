@@ -1,6 +1,7 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createContinuityPreparation } from "../src/backends/continuity.js";
 
 import { Agent, Runner, type Model } from "@openai/agents";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +11,7 @@ import type { JsonValue, RoutineInput, WorkerHost } from "../src/index.js";
 import {
   OpenAiSdkWorker,
   noopRoutineEffects,
+  probeRetention,
   workerContextKey,
   type InstructionTask,
   type OpenAiRunState,
@@ -37,6 +39,236 @@ afterEach(async () => {
 });
 
 describe("OpenAiSdkWorker", () => {
+  it.each(["paused", "transport-lost"] as const)(
+    "preserves a %s OpenAI continuation across repeated credential failures before provider entry",
+    async (initialSuspension) => {
+      const task = await firstTask();
+      const state = {} as OpenAiRunState;
+      const failure = Object.assign(new Error("Connection reset"), {
+        code: "ECONNRESET",
+      });
+      const getSecret = vi
+        .fn(async () => "test-key")
+        .mockResolvedValueOnce("test-key")
+        .mockRejectedValueOnce(failure)
+        .mockRejectedValueOnce(failure);
+      const host: WorkerHost = {
+        logger: createCapturingLogger().logger,
+        state: {
+          get: vi.fn(async () => undefined),
+          put: vi.fn(async () => {}),
+        },
+      };
+      const resolveContinuityIdentity = vi.fn(async () =>
+        openAiIdentity("test", "test"),
+      );
+      const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
+        if (run.mock.calls.length === 1)
+          return initialSuspension === "paused"
+            ? { signal: { kind: "pause" }, state }
+            : {
+                failureReport: {
+                  suspension: "transport-lost",
+                  reason: {
+                    reason: "connection reset",
+                    message: "Connection reset",
+                  },
+                },
+                state,
+              };
+        expect(input.resumeState).toBe(state);
+        expect(input.prompt).toBeUndefined();
+        await callOpenAiTool(input.agent, "report", { outcome: "completed" });
+        return { lastResponseId: "response-after-setup-retry" };
+      });
+      const backend = createOpenAiSdkBackendForTesting({
+        apiKeySecret: "test-ref",
+        secretResolver: { getSecret },
+        resolveContinuityIdentity,
+        run,
+      });
+      const worker = await backend.createWorker(host, {
+        kind: "default",
+        backend: "openai-sdk",
+      });
+      const input: RoutineInput = {
+        routine: routine(task),
+        context: context(),
+        effects: noopRoutineEffects(),
+        diagnostics: noopDiagnostics,
+      };
+      try {
+        await expect(worker.run(input)).resolves.toMatchObject({
+          suspension: initialSuspension,
+        });
+        await expect(
+          worker.run({
+            ...input,
+            context: {
+              ...input.context,
+              ...(initialSuspension === "paused"
+                ? { routineResume: { delivery: "continue" as const } }
+                : {}),
+            },
+          }),
+        ).resolves.toMatchObject({ suspension: "transport-lost" });
+        // The hub retries transport-lost work without routineResume, including
+        // work that originally reached this state through a manual pause.
+        await expect(worker.run(input)).resolves.toMatchObject({
+          suspension: "transport-lost",
+        });
+        expect(run).toHaveBeenCalledTimes(1);
+        await expect(worker.run(input)).resolves.toMatchObject({
+          outcome: "completed",
+        });
+        expect(run).toHaveBeenCalledTimes(2);
+        expect(resolveContinuityIdentity).toHaveBeenCalledTimes(1);
+        expect(host.state.get).toHaveBeenCalledTimes(1);
+        expect(host.state.put).toHaveBeenCalledWith(
+          task.arcRunId,
+          input.routine.contextKey,
+          expect.objectContaining({
+            responseId: "response-after-setup-retry",
+          }),
+        );
+      } finally {
+        await worker.disposeRoutine({
+          arcRunId: task.arcRunId,
+          routineId: input.routine.id,
+        });
+        await worker.stop?.();
+      }
+    },
+  );
+
+  it("releases OpenAI bundle copies with their last routine across worker slots", async () => {
+    const root = await mkdtemp(join(tmpdir(), "openai-bundle-ownership-"));
+    workspaces.push(root);
+    const bundle = join(root, "source");
+    await mkdir(bundle);
+    await writeFile(join(bundle, "data.txt"), "owned copy");
+    const task = await firstTask();
+    const workers = [0, 1].map(
+      () =>
+        new OpenAiSdkWorker({
+          apiKey: "mock",
+          run: async (input) => {
+            await callOpenAiTool(input.agent, "report", {
+              outcome: "completed",
+            });
+            return { lastResponseId: "response" };
+          },
+        }),
+    );
+    try {
+      for (let index = 0; index < 20; index++) {
+        const cwd = join(root, `workspace-${index}`);
+        await mkdir(cwd);
+        const ctx = {
+          workspacePath: cwd,
+          workspaceBundle: { library: bundle },
+        };
+        const inputs = workers.map((_, slot) => ({
+          routine: routine(task, {
+            id: `bundle-routine-${slot}-${index}`,
+            contextKey: `bundle-context-${slot}-${index}`,
+          }),
+          context: ctx,
+          effects: noopRoutineEffects(),
+          diagnostics: noopDiagnostics,
+        }));
+        for (const [slot, worker] of workers.entries())
+          await worker.run(inputs[slot]!);
+        const copy = join(cwd, ".arcade-bundles", "library", "data.txt");
+        await workers[0]!.disposeRoutine({
+          arcRunId: task.arcRunId,
+          routineId: inputs[0]!.routine.id,
+        });
+        expect(await readFile(copy, "utf8")).toBe("owned copy");
+        await workers[1]!.disposeRoutine({
+          arcRunId: task.arcRunId,
+          routineId: inputs[1]!.routine.id,
+        });
+        await expect(readFile(copy, "utf8")).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        for (const worker of workers)
+          expect(probeRetention(worker).bundleRoutines).toBe(0);
+        expect(await readFile(join(bundle, "data.txt"), "utf8")).toBe(
+          "owned copy",
+        );
+      }
+    } finally {
+      for (const worker of workers) await worker.stop();
+    }
+  });
+
+  it("reuses openai approvals within their deadline and asks again after expiry", async () => {
+    const task = await firstTask();
+    let asks = 0;
+    let sequence = 0;
+    const worker = new OpenAiSdkWorker({
+      apiKey: "sk-test",
+      run: async (input) => {
+        expect(
+          (
+            await input.resolveApproval({
+              toolName: "WebFetch",
+              input: { url: "https://example.com", prompt: "Read" },
+              callId: "grant-test",
+            })
+          ).decision,
+        ).not.toBe("deny");
+        await callOpenAiTool(input.agent, "report", { outcome: "completed" });
+        return { lastResponseId: "grant-response" };
+      },
+    });
+    const invoke = async (arcRunId: string, contextKey: string) => {
+      const input = {
+        routine: routine(
+          { ...task, arcRunId },
+          { id: `grant-routine:${++sequence}`, contextKey },
+        ),
+        context: context(),
+        effects: noopRoutineEffects({
+          requestPermission: async () => {
+            asks++;
+            return { decision: "allow_this_run" };
+          },
+        }),
+        diagnostics: noopDiagnostics,
+      };
+      expect(await worker.run(input)).toMatchObject({ outcome: "completed" });
+      await worker.disposeRoutine({ arcRunId, routineId: input.routine.id });
+    };
+    vi.useFakeTimers();
+    try {
+      await invoke("run:a", "context");
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      await invoke("run:a", "context");
+      expect(asks).toBe(1);
+      await invoke("run:b", "context");
+      expect(asks).toBe(2);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(probeRetention(worker)).toMatchObject({
+        grantContexts: 1,
+        grants: 1,
+      });
+      await invoke("run:b", "context");
+      expect(asks).toBe(2);
+      await invoke("run:a", "context");
+      expect(asks).toBe(3);
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(probeRetention(worker)).toMatchObject({
+        grantContexts: 0,
+        grants: 0,
+      });
+    } finally {
+      await worker.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("resumes the SDK after connection loss without repeating a delivered notification", async () => {
     const task: InstructionTask = {
       ...(await firstTask()),
@@ -443,7 +675,7 @@ describe("OpenAiSdkWorker", () => {
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return { lastResponseId: "resp-thread", rawResponses: [] };
     });
-    const backend = new OpenAiSdkWorker({
+    const backend = durableOpenAiWorker({
       model: "gpt-test",
       apiKey: "sk-test",
       run,
@@ -501,7 +733,7 @@ describe("OpenAiSdkWorker", () => {
         rawResponses: [],
       };
     });
-    const backend = new OpenAiSdkWorker({
+    const backend = durableOpenAiWorker({
       apiKey: "sk-test",
       run,
     });
@@ -763,7 +995,7 @@ describe("OpenAiSdkWorker", () => {
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return { lastResponseId: `resp-${runCount}` };
     });
-    const backend = new OpenAiSdkWorker({
+    const backend = durableOpenAiWorker({
       apiKey: "sk-test",
       run,
     });
@@ -1987,4 +2219,20 @@ function structuredQuestionFixture() {
     ],
     multiSelect: false,
   };
+}
+
+function durableOpenAiWorker(
+  options: ConstructorParameters<typeof OpenAiSdkWorker>[0],
+) {
+  return new OpenAiSdkWorker(
+    options,
+    createContinuityPreparation({
+      backend: "openai-sdk",
+      host: openAiContinuityHost(),
+      slot: { kind: "default", backend: "openai-sdk" },
+      configuredCwd: options.cwd,
+      continuityField: "responseId",
+      resolveIdentity: async () => openAiIdentity("test", "test"),
+    }),
+  );
 }

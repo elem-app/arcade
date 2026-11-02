@@ -108,6 +108,8 @@ export class OpenAiSdkTstWorker implements Worker {
   readonly #baseUrl?: string;
   readonly #apiKeySecret?: string;
   readonly #secretResolver?: SecretResolver;
+  readonly #activeControllers = new Set<AbortController>();
+  #stopped = false;
 
   constructor(options: OpenAiSdkTstBackendTestOptions = {}) {
     this.#model = options.model ?? DEFAULT_OPENAI_SDK_TST_MODEL;
@@ -120,6 +122,11 @@ export class OpenAiSdkTstWorker implements Worker {
     this.#secretResolver = options.secretResolver;
   }
 
+  async stop(): Promise<void> {
+    this.#stopped = true;
+    for (const controller of this.#activeControllers) controller.abort();
+  }
+
   async disposeRoutine(): Promise<void> {}
 
   async run(input: RoutineInput): Promise<RoutineReport> {
@@ -129,7 +136,10 @@ export class OpenAiSdkTstWorker implements Worker {
     if (task.kind !== "semantic") {
       throw new Error("OpenAI SDK tst backend can only run semantic tasks.");
     }
+    const prompt = buildSemanticPrompt(task, context);
+    if (this.#stopped) throw new Error("OpenAI SDK tst worker is stopped.");
     const abortController = new AbortController();
+    this.#activeControllers.add(abortController);
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -138,30 +148,32 @@ export class OpenAiSdkTstWorker implements Worker {
     timeout.unref?.();
 
     const startedAt = Date.now();
-    const prompt = buildSemanticPrompt(task, context);
-    await diagnostics.writeText("prompt", prompt);
     const backendDetails: JsonValue = {
       backend: "openai-sdk-tst",
       sessionKey: `${task.arcRunId}:${routine.role}:${task.batchId}`,
       cwd: context.workspacePath,
       model: this.#model,
     };
-    this.#logger.info("backend.openai_sdk_tst.started", {
-      arcRunId: task.arcRunId,
-      routineId: routine.id,
-      role: routine.role,
-      model: this.#model,
-      timeoutMs: this.#timeoutMs,
-      stage: task.stage,
-      requestCount: task.requests.length,
-    });
 
     let result: OpenAiSdkTstRunResult | undefined;
     try {
+      this.#logger.info("backend.openai_sdk_tst.started", {
+        arcRunId: task.arcRunId,
+        routineId: routine.id,
+        role: routine.role,
+        model: this.#model,
+        timeoutMs: this.#timeoutMs,
+        stage: task.stage,
+        requestCount: task.requests.length,
+      });
+      await diagnostics.writeText("prompt", prompt);
+      const apiKey = await this.#resolvedApiKey();
+      if (this.#stopped || (await effects.checkSignal())?.kind === "cancel")
+        throw new Error("OpenAI SDK tst invocation cancelled.");
       result = await this.#run({
         agent: this.#agent(task),
         prompt,
-        apiKey: await this.#resolvedApiKey(),
+        apiKey,
         baseUrl: this.#baseUrl,
         signal: abortController.signal,
         maxTurns: 2,
@@ -208,12 +220,19 @@ export class OpenAiSdkTstWorker implements Worker {
         error: previewLogValue(String(error)),
       });
       const failureError = timedOut ? new Error(message) : error;
+      if (this.#stopped && abortController.signal.aborted)
+        return withBackendDetails(
+          { cancellation: "superseded" },
+          backendDetails,
+        );
       const report = providerFailureReport(failureError, "openai-sdk-tst");
       if (report) return withBackendDetails(report, backendDetails);
       if (timedOut) throw failureError;
       throw error;
     } finally {
       clearTimeout(timeout);
+      this.#activeControllers.delete(abortController);
+      abortController.abort();
     }
   }
 

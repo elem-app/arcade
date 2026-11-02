@@ -629,7 +629,6 @@ function Main() {
       lastTurns: [{ role: "user", message: "research FIX" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -660,7 +659,6 @@ function Main() {
       lastTurns: [{ role: "user", message: "research FIX" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -925,9 +923,7 @@ describe("source registry transactions", () => {
       "Kept",
     );
     const steps = await host.begin({
-      dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
       principal: ALICE_OWNER,
-      inbound: { content: "start" },
       projectDialog: async () => ({
         cursor: { user: 0, self: 0 },
         lastTurns: [],
@@ -989,9 +985,7 @@ describe("source registry transactions", () => {
       ]);
       expect(
         await host.begin({
-          dialog: { cursor: { user: 0, self: 0 }, lastTurns: [] },
           principal: ALICE_OWNER,
-          inbound: { content: "start" },
           projectDialog: async () => ({
             cursor: { user: 0, self: 0 },
             lastTurns: [],

@@ -1,5 +1,6 @@
 import { createArcadeLogger } from "../../src/logging.js";
 import { WorkEventService } from "../../src/service/work-events.js";
+import { ownedSubmissionEvents } from "../submission-events.js";
 /**
  * OpenAI Agents SDK eval for Arcade fast trigger resolution.
  *
@@ -109,7 +110,7 @@ defineManagedEvalGroup(
     evalLog("registered arc");
 
     const negativeEvents = await collectLifecycle(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content:
           "Please start the research check. The required token is not present.",
         metadata: { principal: "eval-user-negative" },
@@ -120,7 +121,7 @@ defineManagedEvalGroup(
     const outboundPromise = waitForReply(workerHub, routineStore);
     evalLog("submitting inbound message");
     const arcRunId = await firstActivation(
-      workerHub.submitInbound({
+      ownedSubmissionEvents(workerHub, {
         content: `Please start the research check. The required token is ${sentinel}.`,
         metadata: { principal: "eval-user" },
       }),

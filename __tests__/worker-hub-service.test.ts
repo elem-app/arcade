@@ -377,7 +377,10 @@ function workerBackend(
 ): Backend {
   return {
     supportedSlotKinds: new Set(kinds),
-    createWorker: () => ({ disposeRoutine: async () => {}, run: run as never }),
+    createWorker: () => ({
+      disposeRoutine: async () => {},
+      run: run as never,
+    }),
   };
 }
 

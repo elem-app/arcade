@@ -18,7 +18,8 @@ export type {
 } from "./types/handshake.js";
 export type { HostModule } from "./types/host-module.js";
 export type {
-  AdvanceInput,
+  AdvanceActionInput,
+  AdvanceTriggerInput,
   ArcDocumentRecord,
   ArcDocumentRecordId,
   ArcDocumentSnapshot,
@@ -265,3 +266,11 @@ export type {
   HostModuleEffect,
   HostModuleState,
 } from "./types/host-module.js";
+
+export { probeRetention } from "./utils/retention-probe.js";
+export type {
+  ArcHostRetention,
+  RetentionCounts,
+  ServiceRetention,
+  WorkerHubRetention,
+} from "./utils/retention-registry.js";

@@ -6,6 +6,7 @@ import {
   type WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { PreparedStartPool } from "./prepared-start-pool.js";
 
 import {
   createArcadeLogger,
@@ -19,17 +20,17 @@ import {
 } from "../service/semantic-resolver.js";
 import { routineTokenUsageFromClaudeSdkMessages } from "../service/token-usage.js";
 import { isRecord, validateAgentRoutineReport } from "../service/utils.js";
-import {
-  defineBackend,
-  type Backend,
-  type Worker,
-  type WorkerWarmupInput,
-} from "../types/backend.js";
+import { defineBackend, type Backend, type Worker } from "../types/backend.js";
 import type { JsonValue } from "../types/json.js";
 import type { RoutineInput, RoutineReport } from "../types/routine.js";
 import type { SemanticTask } from "../types/task.js";
 import type { WorkerSlotKind } from "../types/worker-slot.js";
 import { createWorkerSlotSchema } from "../types/worker-slot.js";
+import {
+  readRetention,
+  registerRetentionProbe,
+  type PreparedStartPoolRetention,
+} from "../utils/retention-registry.js";
 import {
   backendRoutine,
   providerFailureReport,
@@ -131,71 +132,52 @@ export function createClaudeSdkTstBackendForTesting(
   });
 }
 
-type PreparedTstStart = {
-  id: number;
-  cwd: string;
-  abortController: AbortController;
-  createdAt: number;
-  closed: boolean;
-  warm?: WarmQuery;
-  promise: Promise<WarmQuery>;
-};
+type PreparedTstStart = { value: WarmQuery; abortController: AbortController };
 
 /** Trigger stage-only backend backed by bounded Claude Agent SDK queries. */
 export class ClaudeSdkTstWorker implements Worker {
   readonly #model: string;
   readonly #timeoutMs: number;
   readonly #configuredCwd: string | undefined;
-  #poolCwd: string | undefined;
   readonly #query: ClaudeSdkTstQueryFn;
   readonly #startup: ClaudeSdkTstStartupFn;
   readonly #fastStarts: NormalizedFastStartsOptions;
-  readonly #preparedStarts = new Map<number, PreparedTstStart>();
+  readonly #preparedStarts: PreparedStartPool<WarmQuery>;
   readonly #logger: ArcadeLogger;
-  #nextPreparedStartId = 0;
   #stopped = false;
-  #replenishTimer: ReturnType<typeof setTimeout> | undefined;
-  #maintenanceTimer: ReturnType<typeof setTimeout> | undefined;
+  readonly #activeControllers = new Set<AbortController>();
 
   constructor(options: ClaudeSdkTstBackendTestOptions = {}) {
     this.#model = options.model ?? DEFAULT_CLAUDE_SDK_TST_MODEL;
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_CLAUDE_SDK_TST_TIMEOUT_MS;
     this.#configuredCwd = options.cwd;
-    this.#poolCwd = options.cwd;
     this.#query = options.query ?? query;
     this.#startup = options.startup ?? startup;
     this.#fastStarts = normalizeFastStarts(options.fastStarts);
     this.#logger = options.logger ?? createArcadeLogger();
-    this.#replenishPreparedStarts();
+    this.#preparedStarts = new PreparedStartPool({
+      max: this.#fastStarts.enabled ? this.#fastStarts.maxPreparedStarts : 0,
+      idleTtlMs: this.#fastStarts.idleTtlMs,
+      start: (cwd, abortController) =>
+        this.#startup({
+          options: this.#buildOptions(abortController, cwd),
+          initializeTimeoutMs: this.#fastStarts.initializeTimeoutMs,
+        }),
+      close: (warm) => warm.close(),
+      failed: (error) =>
+        this.#logger.info("backend.claude_sdk_tst.prepared_start_failed", {
+          message: String(error),
+        }),
+    });
+    registerRetentionProbe(this, () =>
+      readRetention<PreparedStartPoolRetention>(this.#preparedStarts),
+    );
   }
 
-  async warm(input: WorkerWarmupInput): Promise<void> {
-    this.#preparePool(this.#configuredCwd ?? input.workspacePath);
-  }
-
-  #preparePool(cwd: string): void {
-    if (this.#stopped) return;
-    if (this.#poolCwd !== cwd) {
-      for (const entry of this.#preparedStarts.values())
-        this.#closePreparedStart(entry);
-      this.#preparedStarts.clear();
-      if (this.#maintenanceTimer) clearTimeout(this.#maintenanceTimer);
-      this.#maintenanceTimer = undefined;
-      this.#poolCwd = cwd;
-    }
-    this.#replenishPreparedStarts();
-  }
-
-  stop(): void {
+  async stop(): Promise<void> {
     this.#stopped = true;
-    if (this.#replenishTimer) clearTimeout(this.#replenishTimer);
-    if (this.#maintenanceTimer) clearTimeout(this.#maintenanceTimer);
-    this.#replenishTimer = undefined;
-    this.#maintenanceTimer = undefined;
-    for (const entry of this.#preparedStarts.values()) {
-      this.#closePreparedStart(entry);
-    }
-    this.#preparedStarts.clear();
+    for (const controller of this.#activeControllers) controller.abort();
+    await this.#preparedStarts.stop();
   }
 
   async disposeRoutine(): Promise<void> {}
@@ -208,12 +190,20 @@ export class ClaudeSdkTstWorker implements Worker {
     if (task.kind !== "semantic") {
       throw new Error("Claude SDK tst backend can only run semantic tasks.");
     }
+    const prompt = buildSemanticPrompt(task, context);
     const cwd = this.#configuredCwd ?? context.workspacePath;
-    this.#preparePool(cwd);
-    this.#sweepPreparedStarts();
-    const prepared = this.#consumeReadyPreparedStart(cwd);
-    if (!prepared) this.#scheduleReplenish();
-    const abortController = prepared?.abortController ?? new AbortController();
+    if (this.#stopped) throw new Error("Claude SDK tst worker is stopped.");
+    const prepared = this.#preparedStarts.take(cwd);
+    let abortController = prepared?.abortController ?? new AbortController();
+    this.#activeControllers.add(abortController);
+    let preparedClosed = false;
+    const closePrepared = () => {
+      if (!prepared || preparedClosed) return;
+      preparedClosed = true;
+      prepared.abortController.abort();
+      prepared.value.close();
+    };
+    let closeQuery: (() => void) | undefined;
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -222,19 +212,7 @@ export class ClaudeSdkTstWorker implements Worker {
     timeout.unref?.();
 
     const startedAt = Date.now();
-    const prompt = buildSemanticPrompt(task, context);
-    await diagnostics.writeText("prompt", prompt);
     let backendDetails = this.#backendDetails(routine, false, cwd);
-    this.#logger.info("backend.claude_sdk_tst.started", {
-      arcRunId: task.arcRunId,
-      routineId: routine.id,
-      role: routine.role,
-      model: this.#model,
-      timeoutMs: this.#timeoutMs,
-      cwd,
-      stage: task.stage,
-      requestCount: task.requests.length,
-    });
 
     let messages: SDKMessage[] = [];
     let tokenUsageRecorded = false;
@@ -246,13 +224,35 @@ export class ClaudeSdkTstWorker implements Worker {
       tokenUsageRecorded = true;
     };
     try {
+      this.#logger.info("backend.claude_sdk_tst.started", {
+        arcRunId: task.arcRunId,
+        routineId: routine.id,
+        role: routine.role,
+        model: this.#model,
+        timeoutMs: this.#timeoutMs,
+        cwd,
+        stage: task.stage,
+        requestCount: task.requests.length,
+      });
+      await diagnostics.writeText("prompt", prompt);
+      if (this.#stopped || (await effects.checkSignal())?.kind === "cancel")
+        throw new Error("Claude SDK tst invocation cancelled.");
       const queried = await this.#queryMessages(
         prompt,
         task,
         abortController,
         prepared,
         cwd,
+        closePrepared,
+        () => {
+          this.#activeControllers.delete(abortController);
+          abortController = new AbortController();
+          if (this.#stopped || timedOut) abortController.abort();
+          this.#activeControllers.add(abortController);
+          return abortController;
+        },
       );
+      closeQuery = queried.close;
       backendDetails = this.#backendDetails(
         routine,
         queried.preparedStartUsed,
@@ -317,12 +317,24 @@ export class ClaudeSdkTstWorker implements Worker {
         error: previewLogValue(String(error)),
       });
       const failureError = timedOut ? new Error(message) : error;
+      if (this.#stopped && abortController.signal.aborted)
+        return withBackendDetails(
+          { cancellation: "superseded" },
+          backendDetails,
+        );
       const report = providerFailureReport(failureError, "claude-sdk-tst");
       if (report) return withBackendDetails(report, backendDetails);
       if (timedOut) throw failureError;
       throw error;
     } finally {
       clearTimeout(timeout);
+      this.#activeControllers.delete(abortController);
+      abortController.abort();
+      try {
+        closeQuery?.();
+      } finally {
+        closePrepared();
+      }
     }
   }
 
@@ -332,21 +344,22 @@ export class ClaudeSdkTstWorker implements Worker {
     abortController: AbortController,
     prepared: PreparedTstStart | undefined,
     cwd: string,
+    closePrepared: () => void,
+    replaceController: () => AbortController,
   ): Promise<{
+    close?: () => void;
     messages: AsyncIterable<SDKMessage>;
     preparedStartUsed: boolean;
   }> {
     if (prepared) {
       try {
-        const warm = prepared.warm;
+        const warm = prepared.value;
         if (!warm) throw new Error("Prepared semantic start is not ready.");
         const messages = warm.query(prompt);
-        prepared.closed = true;
-        this.#scheduleReplenish();
         return { messages, preparedStartUsed: true };
       } catch (error) {
-        this.#closePreparedStart(prepared);
-        this.#scheduleReplenish();
+        closePrepared();
+        abortController = replaceController();
         this.#logger.info(
           "backend.claude_sdk_tst.prepared_start_consume_failed",
           {
@@ -359,123 +372,15 @@ export class ClaudeSdkTstWorker implements Worker {
         );
       }
     }
+    const messages = this.#query({
+      prompt,
+      options: this.#buildOptions(abortController, cwd),
+    });
     return {
-      messages: this.#query({
-        prompt,
-        options: this.#buildOptions(abortController, cwd),
-      }),
+      messages,
+      close: () => messages.close?.(),
       preparedStartUsed: false,
     };
-  }
-
-  #consumeReadyPreparedStart(cwd: string): PreparedTstStart | undefined {
-    for (const [id, entry] of this.#preparedStarts) {
-      if (entry.closed || !entry.warm || entry.cwd !== cwd) continue;
-      this.#preparedStarts.delete(id);
-      return entry;
-    }
-    return undefined;
-  }
-
-  #replenishPreparedStarts(): void {
-    if (
-      this.#stopped ||
-      this.#poolCwd === undefined ||
-      !this.#fastStarts.enabled ||
-      this.#fastStarts.maxPreparedStarts === 0
-    ) {
-      return;
-    }
-    this.#sweepPreparedStarts();
-    while (this.#preparedStarts.size < this.#fastStarts.maxPreparedStarts) {
-      this.#startPreparedStart(this.#poolCwd);
-    }
-    this.#scheduleMaintenance();
-  }
-
-  #startPreparedStart(cwd: string): void {
-    const id = this.#nextPreparedStartId++;
-    const abortController = new AbortController();
-    const entry: PreparedTstStart = {
-      id,
-      cwd,
-      abortController,
-      createdAt: Date.now(),
-      closed: false,
-      promise: this.#startup({
-        options: this.#buildOptions(abortController, cwd),
-        initializeTimeoutMs: this.#fastStarts.initializeTimeoutMs,
-      }),
-    };
-    this.#preparedStarts.set(id, entry);
-    entry.promise.then(
-      (warm) => {
-        if (this.#stopped || entry.closed || !this.#preparedStarts.has(id)) {
-          warm.close();
-          return;
-        }
-        entry.warm = warm;
-        this.#logger.info("backend.claude_sdk_tst.prepared_start_ready", {
-          preparedStartId: id,
-          model: this.#model,
-          cwd,
-        });
-      },
-      (error) => {
-        if (!entry.closed) {
-          this.#logger.info("backend.claude_sdk_tst.prepared_start_failed", {
-            model: this.#model,
-            cwd,
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-        this.#preparedStarts.delete(id);
-        this.#scheduleReplenish(1000);
-      },
-    );
-  }
-
-  #scheduleReplenish(delayMs = 0): void {
-    if (this.#stopped || this.#replenishTimer) return;
-    this.#replenishTimer = setTimeout(() => {
-      this.#replenishTimer = undefined;
-      this.#replenishPreparedStarts();
-    }, delayMs);
-    this.#replenishTimer.unref?.();
-  }
-
-  #scheduleMaintenance(): void {
-    if (this.#stopped || this.#maintenanceTimer) return;
-    const nextExpiresAt = Math.min(
-      ...[...this.#preparedStarts.values()].map(
-        (entry) => entry.createdAt + this.#fastStarts.idleTtlMs,
-      ),
-    );
-    if (!Number.isFinite(nextExpiresAt)) return;
-    const delayMs = Math.max(0, nextExpiresAt - Date.now());
-    this.#maintenanceTimer = setTimeout(() => {
-      this.#maintenanceTimer = undefined;
-      this.#sweepPreparedStarts();
-      this.#replenishPreparedStarts();
-    }, delayMs);
-    this.#maintenanceTimer.unref?.();
-  }
-
-  #sweepPreparedStarts(): void {
-    const now = Date.now();
-    for (const [id, entry] of this.#preparedStarts) {
-      if (now - entry.createdAt >= this.#fastStarts.idleTtlMs) {
-        this.#closePreparedStart(entry);
-        this.#preparedStarts.delete(id);
-      }
-    }
-  }
-
-  #closePreparedStart(entry: PreparedTstStart): void {
-    if (entry.closed) return;
-    entry.closed = true;
-    entry.abortController.abort();
-    entry.warm?.close();
   }
 
   #backendDetails(

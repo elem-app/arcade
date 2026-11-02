@@ -437,8 +437,6 @@ it.each([
       const secondDialog = userDialog("second", 2);
       const handshake = expectSoleHandshake(
         await host.begin({
-          dialog: secondDialog,
-          inbound: { content: "second" },
           principal: REPLAY_OWNER,
           projectDialog: projectorFor(secondDialog),
         }),

@@ -8,8 +8,7 @@ import {
   createClaudeSdkBackendForTesting,
   type ClaudeSdkQueryFn,
 } from "../src/backends/claude-sdk-backend.js";
-import * as continuityModule from "../src/backends/continuity.js";
-import { createContinuityController } from "../src/backends/continuity.js";
+import { createContinuityPreparation } from "../src/backends/continuity.js";
 import {
   OpenAiSdkWorker,
   createOpenAiSdkBackendForTesting,
@@ -23,24 +22,62 @@ import {
   type RoutineSignal,
   type WorkerHost,
 } from "../src/index.js";
-import { noopRoutineEffects } from "../src/testing.js";
+import { noopRoutineEffects, probeRetention } from "../src/testing.js";
 import { noopDiagnostics, routine } from "./backend-helpers.js";
 import { createCapturingLogger, firstTask } from "./helpers.js";
 
 describe("Routine control contract", () => {
+  it.each(["routine", "worker"] as const)(
+    "releases Claude live ownership and sibling resources after a %s transport close failure",
+    async (boundary) => {
+      const input = await routineInput({ kind: "pause" });
+      const queries: ReturnType<typeof signalQuery>[] = [];
+      const worker = new ClaudeSdkWorker({
+        sessionCache: { maxPreparedStarts: 0 },
+        query: ((params) => {
+          const state = signalQuery();
+          queries.push(state);
+          if (queries.length === 1)
+            state.close.mockImplementation(() => {
+              throw new Error("transport close failed");
+            });
+          return state.query(params);
+        }) as ClaudeSdkQueryFn,
+      });
+      const inputs = [0, 1].map((index) => ({
+        ...input,
+        routine: {
+          ...input.routine,
+          id: `cleanup-routine-${index}`,
+          contextKey: `cleanup-context-${index}`,
+        },
+      }));
+      await Promise.all(inputs.map((item) => worker.run(item)));
+      expect(probeRetention(worker).liveRoutines).toBe(2);
+      if (boundary === "routine") {
+        await expect(
+          worker.disposeRoutine(disposal(inputs[0]!)),
+        ).rejects.toThrow("Claude routine cleanup failed");
+        expect(probeRetention(worker).liveRoutines).toBe(1);
+        await worker.stop();
+      } else
+        await expect(worker.stop()).rejects.toThrow(
+          "Claude worker cleanup failed",
+        );
+      expect(probeRetention(worker)).toMatchObject({
+        liveRoutines: 0,
+        retryRoutines: 0,
+        grantContexts: 0,
+        preparedStarts: 0,
+      });
+      for (const query of queries) expect(query.close).toHaveBeenCalledTimes(1);
+      await worker.stop();
+    },
+  );
+
   it.each(["openai", "claude"] as const)(
-    "delegates %s routine disposal through the factory and releases continuity after failure",
+    "delegates %s routine disposal through the factory and preserves cleanup failure",
     async (provider) => {
-      const original = continuityModule.createContinuityController;
-      let disposedIdentity = vi.fn<(routineId: string) => void>();
-      const controllerSpy = vi
-        .spyOn(continuityModule, "createContinuityController")
-        .mockImplementation((options) => {
-          const controller = original(options);
-          disposedIdentity = vi.fn(controller.disposeRoutine);
-          controller.disposeRoutine = disposedIdentity;
-          return controller;
-        });
       const prototype =
         provider === "openai"
           ? OpenAiSdkWorker.prototype
@@ -65,12 +102,10 @@ describe("Routine control contract", () => {
           "release failed",
         );
         expect(release).toHaveBeenCalledWith(disposal(input));
-        expect(disposedIdentity).toHaveBeenCalledWith(input.routine.id);
         await worker.disposeRoutine(disposal(input));
-        expect(disposedIdentity).toHaveBeenCalledTimes(2);
+        expect(release).toHaveBeenCalledTimes(2);
       } finally {
         release.mockRestore();
-        controllerSpy.mockRestore();
         await worker.stop?.();
       }
     },
@@ -148,14 +183,11 @@ describe("Routine control contract", () => {
       logger: createCapturingLogger().logger,
       state: { get: async () => undefined, put: writes },
     };
-    const clear = vi.fn();
-    const continuity = createContinuityController({
+    const continuity = createContinuityPreparation({
       backend: "openai-sdk",
       host,
       slot: { kind: "role", backend: "openai-sdk", role: input.routine.role },
       continuityField: "responseId",
-      seed: vi.fn(),
-      clear,
       resolveIdentity: async () => ({
         schema: 1,
         provider: "openai",
@@ -163,19 +195,17 @@ describe("Routine control contract", () => {
         credentialScope: "test",
       }),
     });
-    await continuity.prepareRun(input);
-    continuity.finish(input.routine.id, true);
-    clear.mockClear();
-    continuity.disposeRoutine(input.routine.id);
-    continuity.disposeRoutine(input.routine.id);
-    await continuity.persistObserved(
-      input.routine,
+    const preparation = await continuity(input);
+    await preparation.observe("accepted");
+    await preparation.close();
+    await preparation.close();
+    await preparation.observe("response-after-disposal");
+    expect(writes).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveBeenCalledWith(
+      input.routine.arcRunId,
       input.routine.contextKey,
-      "response-after-disposal",
-      tmpdir(),
+      expect.objectContaining({ responseId: "accepted" }),
     );
-    expect(writes).not.toHaveBeenCalled();
-    expect(clear).not.toHaveBeenCalled();
   });
 
   it("disposes only the owning OpenAI routine parked and retry states", async () => {
@@ -222,6 +252,10 @@ describe("Routine control contract", () => {
 
   it("preserves cancellation through the OpenAI SDK streaming abort", async () => {
     const input = await routineInput({ kind: "cancel" });
+    input.effects.checkSignal = vi
+      .fn<() => Promise<RoutineSignal | undefined>>()
+      .mockResolvedValue({ kind: "cancel" })
+      .mockResolvedValueOnce(undefined);
     const model: Model = {
       getResponse: async () => {
         throw new Error("Unexpected non-streaming request");
@@ -272,6 +306,7 @@ describe("Routine control contract", () => {
         cancellation: "superseded",
       });
       expect(worker.hasRetryState(input.routine.id)).toBe(false);
+      input.effects.checkSignal = async () => undefined;
       await expect(worker.run(input, { delivery: "native" })).rejects.toThrow(
         "has no parked RunState",
       );
@@ -299,16 +334,20 @@ describe("Routine control contract", () => {
       suspension: "paused",
     });
     await worker.disposeRoutine(disposal(first));
-    expect(close).not.toHaveBeenCalled();
-    await worker.disposeRoutine(disposal(second));
-    await worker.disposeRoutine(disposal(second));
     expect(close).toHaveBeenCalledTimes(1);
+    await worker.disposeRoutine(disposal(second));
+    await worker.disposeRoutine(disposal(second));
+    expect(close).toHaveBeenCalledTimes(2);
     await worker.stop();
-    expect(close).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(2);
   });
 
   it("preserves cancellation through the Claude SDK interrupt and closes its continuation", async () => {
     const input = await routineInput({ kind: "cancel" });
+    input.effects.checkSignal = vi
+      .fn<() => Promise<RoutineSignal | undefined>>()
+      .mockResolvedValue({ kind: "cancel" })
+      .mockResolvedValueOnce(undefined);
     const { query, close, interrupt } = signalQuery();
     const worker = new ClaudeSdkWorker({
       query,
@@ -429,3 +468,135 @@ function signalQuery() {
   }) as unknown as ClaudeSdkQueryFn;
   return { query, close, interrupt };
 }
+
+describe("Invocation continuity ownership", () => {
+  it("orders accepted continuity writes and awaits them while fencing callbacks after disposal", async () => {
+    const input = await routineInput();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started: string[] = [];
+    const put = vi.fn(async (_run: string, _key: string, value: unknown) => {
+      started.push((value as { responseId: string }).responseId);
+      if (started.length === 1) await held;
+    });
+    const prepare = createContinuityPreparation({
+      backend: "openai-sdk",
+      host: {
+        logger: createCapturingLogger().logger,
+        state: { get: async () => undefined, put },
+      },
+      slot: { backend: "openai-sdk", kind: "default" },
+      continuityField: "responseId",
+      resolveIdentity: async () => ({
+        schema: 1,
+        provider: "openai",
+        endpoint: "test",
+        credentialScope: "scope",
+      }),
+    });
+    const preparation = await prepare(input);
+    const first = preparation.observe("first");
+    const second = preparation.observe("second");
+    let closed = false;
+    const closing = preparation.close().then(() => {
+      closed = true;
+    });
+    await preparation.observe("late");
+    expect(started).toEqual(["first"]);
+    expect(closed).toBe(false);
+    release();
+    await Promise.all([first, second, closing]);
+    expect(started).toEqual(["first", "second"]);
+    expect(closed).toBe(true);
+    await preparation.observe("after-close");
+    expect(put).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves continuity write failures through invocation disposal without accepting later writes", async () => {
+    const input = await routineInput();
+    const failure = new Error("state unavailable");
+    const put = vi.fn(async () => {
+      throw failure;
+    });
+    const prepare = createContinuityPreparation({
+      backend: "claude-sdk",
+      host: {
+        logger: createCapturingLogger().logger,
+        state: { get: async () => undefined, put },
+      },
+      slot: { backend: "claude-sdk", kind: "default" },
+      continuityField: "sessionId",
+      resolveIdentity: async () => ({
+        schema: 1,
+        provider: "claude",
+        endpoint: "test",
+        credentialScope: "scope",
+      }),
+    });
+    const preparation = await prepare(input);
+    await expect(preparation.observe("first")).rejects.toBe(failure);
+    await expect(preparation.close()).rejects.toBe(failure);
+    await preparation.observe("late");
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["openai", "claude"] as const)(
+    "fences %s provider admission when stop overlaps durable continuity preparation",
+    async (provider) => {
+      const input = await routineInput();
+      let release!: () => void;
+      let entered!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const entering = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const host: WorkerHost = {
+        logger: createCapturingLogger().logger,
+        state: {
+          get: async () => {
+            entered();
+            await held;
+            return undefined;
+          },
+          put: vi.fn(),
+        },
+      };
+      const resolveContinuityIdentity = async () => ({
+        schema: 1 as const,
+        provider,
+        endpoint: "test",
+        credentialScope: "scope",
+      });
+      const run = vi.fn();
+      const query = vi.fn();
+      const backend =
+        provider === "openai"
+          ? createOpenAiSdkBackendForTesting({
+              run,
+              apiKey: "test",
+              resolveContinuityIdentity,
+            })
+          : createClaudeSdkBackendForTesting({
+              query: query as unknown as ClaudeSdkQueryFn,
+              sessionCache: { enabled: false },
+              resolveContinuityIdentity,
+            });
+      const worker = await backend.createWorker(host, {
+        backend: `${provider}-sdk`,
+        kind: "default",
+      });
+      const running = worker.run(input);
+      await entering;
+      await worker.stop?.();
+      release();
+      await expect(running).resolves.toEqual({ cancellation: "superseded" });
+      expect(run).not.toHaveBeenCalled();
+      expect(query).not.toHaveBeenCalled();
+      expect(host.state.put).not.toHaveBeenCalled();
+    },
+  );
+});

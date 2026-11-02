@@ -614,8 +614,6 @@ describe("handshake-activated runs are trigger-replayable", () => {
 
     const dialog = userDialog("hi");
     const begun = await env.host.begin({
-      dialog,
-      inbound: { content: "hi" },
       principal: REPLAY_OWNER,
       projectDialog: async () => dialog,
     });
@@ -681,8 +679,6 @@ describe("a semantic fan-out replicates its trigger stream and survives a rename
 
     const dialog = userDialog("go");
     const begun = await env.host.begin({
-      dialog,
-      inbound: { content: "go" },
       principal: REPLAY_OWNER,
       activationPolicy: "all",
       projectDialog: async () => dialog,
@@ -692,8 +688,7 @@ describe("a semantic fan-out replicates its trigger stream and survives a rename
     const trig = triggers[0];
     if (trig?.kind !== "trigger") return;
 
-    const advanced = await env.host.advanceTrigger(trig.arcRunId, dialog, {
-      instructionCoverage: {},
+    const advanced = await env.host.advanceTrigger(trig.arcRunId, {
       projectDialog: async () => dialog,
       reports: [
         {
@@ -780,16 +775,13 @@ describe("a fanned-out run diverges mid-body against an edited arc", () => {
 
     const dialog = userDialog("go");
     const begun = await env.host.begin({
-      dialog,
-      inbound: { content: "go" },
       principal: REPLAY_OWNER,
       activationPolicy: "all",
       projectDialog: async () => dialog,
     });
     const trig = begun.find((step) => step.kind === "trigger");
     if (trig?.kind !== "trigger") throw new Error("expected a trigger step");
-    const advanced = await env.host.advanceTrigger(trig.arcRunId, dialog, {
-      instructionCoverage: {},
+    const advanced = await env.host.advanceTrigger(trig.arcRunId, {
       projectDialog: async () => dialog,
       reports: [
         {
@@ -1036,8 +1028,6 @@ function Never() {
     );
 
     const outcome = await env.host.begin({
-      dialog: userDialog("nope"),
-      inbound: { content: "nope" },
       principal: REPLAY_OWNER,
       projectDialog: async () => userDialog("nope"),
     });

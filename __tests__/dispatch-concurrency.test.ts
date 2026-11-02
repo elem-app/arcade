@@ -15,6 +15,7 @@ import {
   JsonFileHistoryStore,
   JsonFileWorkerHubStore,
   JsonFileWorkEventStore,
+  probeRetention,
   WorkEventService,
   type OutboundMessage,
   type RoleWorker,
@@ -204,7 +205,7 @@ describe("Concurrent production dispatch", () => {
       await workerHub.stop();
       expect(settled.size).toBe(6);
       expect(disposed).toEqual(settled);
-      expect(workerHub.getLiveWorkCounts()).toEqual({
+      expect(probeRetention(workerHub).transient).toMatchObject({
         scopes: 0,
         routines: 0,
         continuations: 0,
@@ -342,7 +343,7 @@ describe("Concurrent production dispatch", () => {
         expect(answers.size).toBe(count);
         for (const run of runs) expect(answers.get(run)).toBe(`answer:${run}`);
         await expect
-          .poll(() => workerHub.getLiveWorkCounts().routines, {
+          .poll(() => probeRetention(workerHub).transient.routines, {
             timeout: 10000,
           })
           .toBe(0);

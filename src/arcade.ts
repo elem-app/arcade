@@ -118,7 +118,7 @@ export async function startArcade(
     await workerHub.start({ workers: config.workers });
   } catch (error) {
     workEvents.close();
-    await arcHost.stop();
+    await stopWorkerHub(workerHub, arcHost, logger);
     throw error;
   }
 
@@ -165,17 +165,22 @@ async function stopWorkerHub(
   logger: ArcadeLogger,
 ): Promise<unknown[]> {
   try {
-    const results = await Promise.allSettled([
-      arcHost.stop(),
-      workerHub.stop(),
-    ]);
-    const errors = results.flatMap((result) =>
-      result.status === "rejected"
-        ? result.reason instanceof AggregateError
-          ? result.reason.errors
-          : [result.reason]
-        : [],
-    );
+    // Both fences run before awaiting storage, providers, or routine disposal.
+    const hubStop = workerHub.stop();
+    const fenceErrors: unknown[] = [];
+    try {
+      arcHost.beginStop();
+    } catch (error) {
+      fenceErrors.push(error);
+    }
+    const results = await Promise.allSettled([hubStop]);
+    results.push(...(await Promise.allSettled([arcHost.stop()])));
+    const errors = [
+      ...fenceErrors,
+      ...results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      ),
+    ].flatMap(flattenCleanupErrors);
     if (errors.length)
       throw new AggregateError(errors, "Arcade shutdown failed.");
     return [];
@@ -188,6 +193,12 @@ async function stopWorkerHub(
     });
     return failures;
   }
+}
+
+function flattenCleanupErrors(error: unknown): unknown[] {
+  return error instanceof AggregateError
+    ? error.errors.flatMap(flattenCleanupErrors)
+    : [error];
 }
 
 function logArcadeCleanupFailures(

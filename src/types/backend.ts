@@ -58,15 +58,16 @@ export interface WorkerHost {
 /**
  * Configured live instance of one backend implementation.
  * The hub serializes preparation, invocation, and continuity writes for each
- * worker/run/context. Distinct contexts may warm and run concurrently, including
+ * worker/run/context. Distinct contexts may prepare and run concurrently, including
  * in the same workspace. Each invocation owns its handlers and execution state;
  * shared workspace files remain subject to concurrent modification.
  */
 export interface Worker {
-  warm?(input: WorkerWarmupInput): Promise<void>;
   run(input: RoutineInput): Promise<RoutineReport>;
   /**
-   * Idempotently release this routine's resources after its invocation settles.
+   * Idempotently release this routine's ownership after its invocation settles.
+   * Backends may retain reusable resources in bounded idle caches, detached
+   * from the routine's handlers and payloads.
    * Disposal may overlap another context's invocation or a successor in the
    * same context, and must preserve resources owned by those routines.
    */
@@ -76,11 +77,3 @@ export interface Worker {
   }): Promise<void>;
   stop?(): void | Promise<void>;
 }
-
-/** Preparation awaited under the worker context admission before invocation. */
-export type WorkerWarmupInput = {
-  arcRunId: ArcRunId;
-  role: string;
-  contextKey: string;
-  workspacePath: string;
-};

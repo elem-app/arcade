@@ -12,8 +12,9 @@ import {
   InMemoryArcHostStore,
   JsonFileArcHostStore,
   arcRunKey,
+  probeRetention,
   taskId,
-  type AdvanceInput,
+  type AdvanceTriggerInput,
   type Dialog,
 } from "../src/testing.js";
 import type { HandshakeResolution } from "../src/types/handshake.js";
@@ -26,7 +27,6 @@ import {
   expectSoleDriver,
   expectSoleHandshake,
   expectSoleTrigger,
-  inboundFromDialog,
   projectorFor,
   type HandshakeStep,
   type TriggerStep,
@@ -40,6 +40,55 @@ import {
 } from "./helpers.js";
 
 describe("Activation handshakes", () => {
+  it("owns handshake storage through invalid answers consumption release and host stop", async () => {
+    const handshakes = new HandshakeStore();
+    const host = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+      handshakes,
+    });
+    await host.registerArc(
+      "owned-handshakes",
+      parse(`"arc";
+function One() { this.trigger = () => true; $instruct("One"); }
+function Two() { this.trigger = () => true; $instruct("Two"); }`),
+    );
+    const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+    const input = {
+      principal: ALICE_OWNER,
+      activationPolicy: "choose" as const,
+      projectDialog: projectorFor(dialog),
+    };
+    try {
+      const [first, second] = await host.begin(input);
+      if (first?.kind !== "handshake" || second?.kind !== "handshake")
+        throw new Error("Expected choices.");
+      await expect(
+        host.resolveHandshake(
+          first.handshakeId,
+          {},
+          { projectDialog: input.projectDialog },
+        ),
+      ).resolves.toMatchObject({ status: "invalid" });
+      expect(probeRetention(handshakes)).toEqual({ pending: 2 });
+      await expect(
+        host.resolveHandshake(
+          first.handshakeId,
+          { decline: true },
+          { projectDialog: input.projectDialog },
+        ),
+      ).resolves.toMatchObject({ status: "ok" });
+      expect(probeRetention(handshakes)).toEqual({ pending: 1 });
+      await host.releaseTrigger(second.arcRunId);
+      await host.releaseTrigger(second.arcRunId);
+      expect(probeRetention(handshakes)).toEqual({ pending: 0 });
+      await host.begin(input);
+      expect(probeRetention(handshakes)).toEqual({ pending: 2 });
+    } finally {
+      await host.stop();
+    }
+    expect(probeRetention(handshakes)).toEqual({ pending: 0 });
+  });
+
   it.each(["join", "workspace", "decline"] as const)(
     "serializes host resolutions of one %s handshake through its decision",
     async (kind) => {
@@ -57,7 +106,6 @@ describe("Activation handshakes", () => {
       const gate = expectSoleHandshake(
         await beginActivation(host, dialog, {
           principal: ALICE_OWNER,
-          inbound: { content: "start" },
         }),
       );
       const values: HandshakeResolution =
@@ -100,8 +148,6 @@ describe("Activation handshakes", () => {
     const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
     const gates = await host.begin({
       principal: ALICE_OWNER,
-      dialog,
-      inbound: { content: "start" },
       activationPolicy: "all",
       projectDialog: projectorFor(dialog),
     });
@@ -148,9 +194,9 @@ describe("Activation handshakes", () => {
     }
   });
 
-  it("returns missing when a handshake expires during asynchronous validation", async () => {
+  it("returns missing when pending-run release wins asynchronous handshake validation", async () => {
     const store = new InMemoryArcHostStore();
-    const handshakes = new HandshakeStore({ ttlMs: 1_000 });
+    const handshakes = new HandshakeStore();
     const host = await createTestArcHost({ store, handshakes });
     await host.registerArc("expiring", parse(GREET_SOURCE));
     const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
@@ -158,7 +204,6 @@ describe("Activation handshakes", () => {
     const gate = expectSoleHandshake(
       await beginActivation(host, dialog, {
         principal: ALICE_OWNER,
-        inbound: { content: "start" },
       }),
     );
     const entered = deferred();
@@ -177,9 +222,11 @@ describe("Activation handshakes", () => {
       { projectDialog: projectorFor(dialog) },
     );
     await entered.promise;
-    handshakes.get(gate.handshakeId)!.createdAt = new Date(0).toISOString();
+    const retirement = host.releaseTrigger(gate.arcRunId);
+    expect(probeRetention(handshakes).pending).toBe(0);
     release.resolve();
     await expect(resolution).resolves.toEqual({ status: "missing" });
+    await retirement;
     expect(await host.getRunView(gate.arcRunId)).toBeUndefined();
     expect(await host.getRunView(existing.arcRunId)).toMatchObject({
       lifecycle: "active",
@@ -230,9 +277,7 @@ describe("Activation handshakes", () => {
         ),
       );
       const steps = await host.begin({
-        dialog,
         principal: ALICE_OWNER,
-        inbound: { content: "start" },
         activationPolicy: kind === "arc-choice" ? "choose" : "all",
         projectDialog: projectorFor(dialog),
       });
@@ -314,7 +359,6 @@ describe("Activation handshakes", () => {
       const gate = expectSoleHandshake(
         await beginActivation(host, dialog, {
           principal: ALICE_OWNER,
-          inbound: { content: "start" },
         }),
       );
       const opts = { projectDialog: projectorFor(dialog) };
@@ -361,7 +405,6 @@ describe("Activation handshakes", () => {
     const next = expectSoleHandshake(
       await beginActivation(host, dialog, {
         principal: ALICE_OWNER,
-        inbound: { content: "go" },
       }),
     );
     const second = await host.resolveHandshake(
@@ -382,7 +425,6 @@ describe("Activation handshakes", () => {
     const choice = expectSoleHandshake(
       await beginActivation(host, dialog, {
         principal: ALICE_OWNER,
-        inbound: { content: "go" },
       }),
     );
     expect(choice.requirement).toMatchObject({
@@ -433,8 +475,8 @@ describe("Activation handshakes", () => {
     expect(committed.at(-1)).toMatchObject({ kind: "run:deflected" });
   });
 
-  it("releases declined and expired handshake views while retaining their event histories", async () => {
-    const handshakes = new HandshakeStore({ ttlMs: 1000 });
+  it("releases declined and abandoned handshake views while retaining their event histories", async () => {
+    const handshakes = new HandshakeStore();
     const host = await createTestArcHost({
       store: new InMemoryArcHostStore(),
       handshakes,
@@ -444,9 +486,7 @@ describe("Activation handshakes", () => {
     await host.registerArc("decline-b", parse(source));
     const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
     const steps = await host.begin({
-      dialog,
       principal: ALICE_OWNER,
-      inbound: { content: "go" },
       activationPolicy: "choose",
       projectDialog: projectorFor(dialog),
     });
@@ -466,7 +506,7 @@ describe("Activation handshakes", () => {
     });
     const pending = handshakes.get(second.handshakeId)!;
     const expiredId = pending.triggerSelection.arcRunId;
-    pending.createdAt = "2000-01-01T00:00:00.000Z";
+    await host.releaseTrigger(second.arcRunId);
     expect(await host.getRunView(expiredId)).toBeUndefined();
     expect(await workEventsFor(host).list(expiredId)).toHaveLength(1);
   });
@@ -492,7 +532,6 @@ function Main() {
     const first = await beginActivatedDriver(arcHost, dialog);
 
     const second = await beginActivation(arcHost, dialog, {
-      inbound: inboundFromDialog(dialog),
       principal: ALICE_OWNER,
     });
 
@@ -520,7 +559,6 @@ function Main() {
     };
 
     const begun = await beginActivation(arcHost, dialog, {
-      inbound,
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -542,7 +580,6 @@ function Main() {
     expect(relative.status).toBe("invalid");
 
     const rebegun = await beginActivation(arcHost, dialog, {
-      inbound,
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -559,7 +596,6 @@ function Main() {
     const firstRunId = resolved.step.arcRunId;
 
     const again = await beginActivation(arcHost, dialog, {
-      inbound,
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -593,7 +629,6 @@ function Main() {
     await expect(collectArcRunStates(store)).resolves.toEqual([firstRunId]);
 
     const freshHandshake = await beginActivation(arcHost, dialog, {
-      inbound,
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -619,7 +654,6 @@ function Main() {
     );
 
     const bob = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: "bob",
     });
@@ -642,14 +676,12 @@ function Main() {
       lastTurns: [{ role: "user", message: "research FIX" }],
     };
     const first = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
     const firstRunId = expectSoleDriver(first).arcRunId;
 
     const again = await beginActivation(arcHost, dialog, {
-      inbound: { content: "research FIX" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -723,7 +755,6 @@ function Jazz() {
         lastTurns: [{ role: "user", message: content }],
       };
       const begun = await beginActivation(arcHost, dialog, {
-        inbound: { content },
         clientId: "client-1",
         principal: ALICE_OWNER,
       });
@@ -750,7 +781,6 @@ function Jazz() {
       lastTurns: [{ role: "user", message: "continue metal notes" }],
     };
     const again = await beginActivation(arcHost, againDialog, {
-      inbound: { content: "continue metal notes" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -810,14 +840,12 @@ function Stock() {
       lastTurns: [{ role: "user", message: "start stock research" }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound: { content: "start stock research" },
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
     const trig = expectSoleTrigger(begun);
 
-    const advanced = await arcHost.advanceTrigger(trig.arcRunId, dialog, {
-      instructionCoverage: {},
+    const advanced = await arcHost.advanceTrigger(trig.arcRunId, {
       projectDialog: projectorFor(dialog),
       reports: [
         {
@@ -898,15 +926,13 @@ function StockResearch() {
     };
 
     const begun = await beginActivation(arcHost, dialog, {
-      inbound,
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
     const trig = expectSoleTrigger(begun);
     expect(trig.frontier.briefs.judgments).toHaveLength(1);
 
-    const selected = await arcHost.advanceTrigger(trig.arcRunId, dialog, {
-      instructionCoverage: {},
+    const selected = await arcHost.advanceTrigger(trig.arcRunId, {
       projectDialog: projectorFor(dialog),
       reports: [
         {
@@ -985,7 +1011,6 @@ function StockResearch() {
       lastTurns: [{ role: "user", message: inbound.content }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound,
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -1018,7 +1043,6 @@ function StockResearch() {
       lastTurns: [{ role: "user", message: inbound.content }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound,
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
@@ -1058,14 +1082,10 @@ function StockResearch() {
     ).resolves.toEqual({ status: "missing" });
   });
 
-  it("garbage collects an unresolved handshake on the next store access", async () => {
+  it("removes an unresolved handshake through explicit pending-run release", async () => {
     const store = new InMemoryArcHostStore();
-    const arcHost = await createTestArcHost({
-      store,
-      // A zero TTL makes any already-staged handshake eligible for the
-      // opportunistic sweep that every later store access runs.
-      handshakes: new HandshakeStore({ ttlMs: 0 }),
-    });
+    const handshakes = new HandshakeStore();
+    const arcHost = await createTestArcHost({ store, handshakes });
     await arcHost.registerArc("stock-research", parse(GREET_SOURCE), {
       workspaceScope: "arc",
       bundle: {},
@@ -1080,14 +1100,14 @@ function StockResearch() {
       lastTurns: [{ role: "user", message: inbound.content }],
     };
     const begun = await beginActivation(arcHost, dialog, {
-      inbound,
       clientId: "client-1",
       principal: ALICE_OWNER,
     });
-    const { handshakeId } = expectSoleHandshake(begun);
-
-    // Let the staged handshake age past the TTL, then touch the store.
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    const { handshakeId, arcRunId } = expectSoleHandshake(begun);
+    await arcHost.releaseTrigger(arcRunId);
+    expect(probeRetention(handshakes)).toMatchObject({
+      pending: 0,
+    });
     await expect(
       arcHost.resolveHandshake(
         handshakeId,
@@ -1098,7 +1118,7 @@ function StockResearch() {
         },
       ),
     ).resolves.toEqual({ status: "missing" });
-    // Expiry strands nothing: no run was created for the client to recover.
+    // Release strands nothing: no run was created for the client to recover.
     expect(await collectArcRunStates(store)).toEqual([]);
   });
 
@@ -1121,7 +1141,6 @@ function Main() {
     const first = await beginActivatedDriver(arcHost, dialog);
     const secondChoice = expectSoleHandshake(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -1135,7 +1154,6 @@ function Main() {
 
     const thirdChoice = expectSoleHandshake(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -1169,7 +1187,6 @@ function Main() {
     const existing = await beginActivatedDriver(arcHost, dialog);
     const handshake = expectSoleHandshake(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -1211,7 +1228,6 @@ function Main() {
     await beginActivatedDriver(arcHost, dialog);
     const handshake = expectSoleHandshake(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -1263,7 +1279,6 @@ function ChoiceA() {
     };
     const freshChoice = expectSoleHandshake(
       await beginActivation(arcHost, activeDialog, {
-        inbound: inboundFromDialog(activeDialog),
         principal: ALICE_OWNER,
       }),
     );
@@ -1287,8 +1302,6 @@ function ChoiceB() {
 }`),
     );
     const choiceSteps = await arcHost.begin({
-      dialog: activeDialog,
-      inbound: inboundFromDialog(activeDialog),
       principal: ALICE_OWNER,
       activationPolicy: "choose",
       projectDialog: projectorFor(activeDialog),
@@ -1349,8 +1362,6 @@ function ChoiceB() {
 
     // Under "choose" each match stages its own arc-choice handshake.
     const steps = await arcHost.begin({
-      dialog,
-      inbound: inboundFromDialog(dialog),
       principal: ALICE_OWNER,
       activationPolicy: "choose",
       projectDialog: projectorFor(dialog),
@@ -1426,40 +1437,32 @@ function Main() {
     };
     const firstTrigger = expectSoleTrigger(
       await beginActivation(arcHost, dialog, {
-        inbound: inboundFromDialog(dialog),
         principal: ALICE_OWNER,
       }),
     );
-    const firstStarted = await arcHost.advanceTrigger(
-      firstTrigger.arcRunId,
-      dialog,
-      {
-        instructionCoverage: {},
-        projectDialog: projectorFor(dialog),
-        reports: [
-          {
-            outcome: "completed",
-            semantic: {
-              judgments: {
-                [firstTrigger.frontier.briefs.judgments[0]!.id]: true,
-              },
+    const firstStarted = await arcHost.advanceTrigger(firstTrigger.arcRunId, {
+      projectDialog: projectorFor(dialog),
+      reports: [
+        {
+          outcome: "completed",
+          semantic: {
+            judgments: {
+              [firstTrigger.frontier.briefs.judgments[0]!.id]: true,
             },
           },
-        ],
-      },
-    );
+        },
+      ],
+    });
     const first = expectSoleDriver(firstStarted);
 
     const probes = await beginActivation(arcHost, dialog, {
-      inbound: inboundFromDialog(dialog),
       principal: ALICE_OWNER,
     });
     expect(probes).toHaveLength(2);
     expect(probes.every((step) => step.kind === "trigger")).toBe(true);
     const [left, right] = probes as [TriggerStep, TriggerStep];
-    const reportFor = (step: TriggerStep): AdvanceInput => ({
+    const reportFor = (step: TriggerStep): AdvanceTriggerInput => ({
       projectDialog: projectorFor(dialog),
-      instructionCoverage: {},
       reports: [
         {
           outcome: "completed",
@@ -1473,11 +1476,10 @@ function Main() {
     });
 
     await expect(
-      arcHost.advanceTrigger(left.arcRunId, dialog, reportFor(left)),
+      arcHost.advanceTrigger(left.arcRunId, reportFor(left)),
     ).resolves.toEqual([]);
     const settled = await arcHost.advanceTrigger(
       right.arcRunId,
-      dialog,
       reportFor(right),
     );
     const handshake = expectSoleHandshake(settled);

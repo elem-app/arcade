@@ -131,8 +131,6 @@ describe("replay end-to-end via the hub + a testing operator connector", () => {
     const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
     const input = {
       principal: REPLAY_OWNER,
-      dialog,
-      inbound: { content: "start" },
       projectDialog: async () => dialog,
     };
     try {

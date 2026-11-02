@@ -10,13 +10,12 @@ import { expect, vi } from "vitest";
 
 import {
   ArcHostService,
-  type AdvanceInput,
+  type AdvanceActionInput,
   type ArcHostStep,
   type ArcHostStore,
   type ArcRunId,
   type Dialog,
   type DialogProjector,
-  type InboundMessage,
   type RunFrontier,
 } from "../src/testing.js";
 import { ALICE_OWNER } from "./helpers.js";
@@ -86,7 +85,10 @@ export class StepDriver {
   }
   async advance(args: {
     dialog: Dialog;
-    input: Omit<Extract<AdvanceInput, { reports: unknown }>, "projectDialog">;
+    input: Omit<
+      Extract<AdvanceActionInput, { reports: unknown }>,
+      "projectDialog"
+    >;
   }): Promise<{ kind: "action"; driver: StepDriver }> {
     const next = await this.host.advanceAction(
       this.step.arcRunId,
@@ -103,13 +105,6 @@ export class StepDriver {
       driver: new StepDriver(this.host, expectSoleDriver(settled)),
     };
   }
-}
-
-export function inboundFromDialog(dialog: Dialog): InboundMessage {
-  const userTurn = [...dialog.lastTurns]
-    .reverse()
-    .find((turn) => turn.role === "user");
-  return { content: userTurn?.message ?? "" };
 }
 
 /** Begin a targeted re-entry; expect a single action driver. */
@@ -132,13 +127,11 @@ export async function beginActivatedDriver(
   arcHost: ArcHostService,
   dialog: Dialog,
   request: {
-    inbound?: InboundMessage;
     principal?: string;
     clientId?: string;
   } = {},
 ): Promise<StepDriver> {
   const steps = await beginActivation(arcHost, dialog, {
-    inbound: request.inbound ?? inboundFromDialog(dialog),
     principal: request.principal ?? ALICE_OWNER,
     clientId: request.clientId,
   });
@@ -197,10 +190,9 @@ export async function beginActivatedView(
 export async function beginActivation(
   arcHost: ArcHostService,
   dialog: Dialog,
-  request: { inbound: InboundMessage; principal: string; clientId?: string },
+  request: { principal: string; clientId?: string },
 ): Promise<ArcHostStep[]> {
   const steps = await arcHost.begin({
-    dialog,
     ...request,
     projectDialog: projectorFor(dialog),
   });
@@ -210,7 +202,10 @@ export async function beginActivation(
 export async function advanceView(
   driver: StepDriver,
   dialog: Dialog,
-  input: Omit<Extract<AdvanceInput, { reports: unknown }>, "projectDialog">,
+  input: Omit<
+    Extract<AdvanceActionInput, { reports: unknown }>,
+    "projectDialog"
+  >,
 ): Promise<RunFrontier> {
   return (await driver.advance({ dialog, input })).driver.frontier;
 }
@@ -262,7 +257,7 @@ export async function drainModuleEffects(
                 { ...delivery.effect, projectDialog: projectorFor(dialog) },
               ),
             ]
-          : await host.advanceTrigger(step.arcRunId, dialog, {
+          : await host.advanceTrigger(step.arcRunId, {
               ...delivery.effect,
               projectDialog: projectorFor(dialog),
             });

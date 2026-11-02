@@ -1,5 +1,6 @@
 import { createArcadeLogger } from "../../src/logging.js";
 import { WorkEventService } from "../../src/service/work-events.js";
+import { ownedSubmissionEvents } from "../submission-events.js";
 /**
  * Claude Agent SDK eval for Arcade fast trigger warm-pool behavior.
  *
@@ -18,7 +19,6 @@ import {
   expect,
 } from "../case-runtime.js";
 
-import type { ArcadeLogger } from "../../src/logging.js";
 import { ArcHostService } from "../../src/service/arc-host.js";
 import { WorkerHubService } from "../../src/service/worker-hub.js";
 import {
@@ -32,6 +32,7 @@ import type { ArcRunId } from "../../src/types/core.js";
 import type { RoutineState } from "../../src/types/hub.js";
 import { asJsonObject } from "../../src/types/json.js";
 import type { OutboundMessage } from "../../src/types/messaging.js";
+import { trackClaudePreparedStarts } from "../claude-prepared-starts.js";
 import {
   createWorkerHubEvalRuntime,
   firstActivation,
@@ -53,7 +54,8 @@ defineManagedEvalGroup(
       "arcade-claude-sdk-semantic-",
     );
     const sentinel = `research-token-${randomUUID()}`;
-    const warmStarts = warmStartTracker();
+    const logger = createEvalLogger();
+    const preparedStarts = trackClaudePreparedStarts(logger);
     const routineStore = new InMemoryWorkerHubStore();
     evalLog("starting", { root, sentinel });
 
@@ -67,7 +69,7 @@ defineManagedEvalGroup(
       workEvents,
       store: new InMemoryArcHostStore(),
       artifactRoot: join(root, "artifacts"),
-      logger: warmStarts.logger,
+      logger,
     });
     await arcHost.registerArc(
       "claude-sdk-fast-trigger",
@@ -83,8 +85,9 @@ defineManagedEvalGroup(
       ),
       bindings: { roles: { responder: "in-process" } },
       fastTriggerBackend: "claude-sdk-tst",
+      claudeSdkTstStartup: preparedStarts.startup,
       claudeSdkTstOptions: {
-        // This case waits for a ready pool before dispatch supplies a workspace.
+        // Keep all probe invocations on the same preparation pool cwd.
         cwd: root,
         model: EVAL_CLAUDE_TST_MODEL,
         timeoutMs: 75_000,
@@ -100,7 +103,7 @@ defineManagedEvalGroup(
           return { outcome: "completed" };
         },
       },
-      logger: warmStarts.logger,
+      logger,
     });
     const replies: OutboundMessage[] = [];
     const questions = trackUnexpectedQuestions(workerHub);
@@ -112,11 +115,25 @@ defineManagedEvalGroup(
     );
 
     try {
-      evalLog("waiting for initial semantic warm starts");
-      await warmStarts.waitForReadyCount(2);
-      evalLog("initial semantic warm starts ready", {
-        readyCount: warmStarts.readyCount(),
+      expect(preparedStarts.snapshot()).toEqual({
+        started: 0,
+        ready: 0,
+        consumed: 0,
+        failed: 0,
       });
+      const bootstrapArcRunId = await submitResearchCheck(
+        workerHub,
+        "bootstrap",
+        sentinel,
+      );
+      const bootstrapRoutines = await waitForTriggerRoutines(routineStore, 1);
+      expect(bootstrapRoutines.map(preparedStartUsed)).toEqual([false]);
+      await expectReplies(replies, [bootstrapArcRunId], sentinel);
+      const bootstrapIds = new Set(
+        bootstrapRoutines.map((routine) => routine.id),
+      );
+      await preparedStarts.waitForReady(2);
+      const consumedBeforeOverflow = preparedStarts.snapshot().consumed;
 
       const overflowLabels = ["warm-a", "warm-b", "cold-overflow"];
       evalLog("dispatching overflow semantic batch", {
@@ -128,14 +145,11 @@ defineManagedEvalGroup(
         ),
       );
 
-      // A trigger turn is a volatile correlation distinct from each activated
-      // run, so trigger routines can't be joined by activated arcRunId. Scope
-      // them by distinct trigger turn instead: each turn resolves as an
-      // `observe` then a `judge` routine sharing one volatile id, and
-      // `waitForTriggerRoutines` keeps the first (the `observe`, whose prepared
-      // start reflects the initial concurrent overflow). Exactly this batch's
-      // three trigger turns exist until the replenished submission below.
-      const overflowRoutines = await waitForTriggerRoutines(routineStore, 3);
+      // The first observation owns the initial pool acquisition for each turn.
+      // Exclude the bootstrap turn before checking the concurrent overflow.
+      const overflowRoutines = (
+        await waitForTriggerRoutines(routineStore, 4)
+      ).filter((routine) => !bootstrapIds.has(routine.id));
       expect(overflowRoutines).toHaveLength(3);
       expect(overflowRoutines.map(preparedStartUsed).sort()).toEqual([
         false,
@@ -147,23 +161,24 @@ defineManagedEvalGroup(
       }
       await expectReplies(replies, overflowArcRunIds, sentinel);
 
-      evalLog("waiting for replenished semantic warm start");
-      await warmStarts.waitForReadyCount(3);
-      evalLog("replenished semantic warm start ready", {
-        readyCount: warmStarts.readyCount(),
-      });
+      await preparedStarts.waitForReady(2);
+      expect(
+        preparedStarts.snapshot().consumed - consumedBeforeOverflow,
+      ).toBeGreaterThan(1);
+      const consumedBeforeReplenished = preparedStarts.snapshot().consumed;
 
       const replenishedArcRunId = await submitResearchCheck(
         workerHub,
         "replenished",
         sentinel,
       );
-      const allRoutines = await waitForTriggerRoutines(routineStore, 4);
+      const allRoutines = await waitForTriggerRoutines(routineStore, 5);
       const overflowRoutineIds = new Set(
         overflowRoutines.map((routine) => routine.id),
       );
       const replenishedRoutine = allRoutines.find(
-        (routine) => !overflowRoutineIds.has(routine.id),
+        (routine) =>
+          !bootstrapIds.has(routine.id) && !overflowRoutineIds.has(routine.id),
       );
       expect(replenishedRoutine?.backendDetails).toMatchObject({
         backend: "claude-sdk-tst",
@@ -171,6 +186,11 @@ defineManagedEvalGroup(
       });
       expectTriggerSemanticTask(replenishedRoutine?.task);
       await expectReplies(replies, [replenishedArcRunId], sentinel);
+      await preparedStarts.waitForReady(2);
+      expect(preparedStarts.snapshot().consumed).toBeGreaterThan(
+        consumedBeforeReplenished,
+      );
+      expect(preparedStarts.snapshot().failed).toBe(0);
       expect(questions).toHaveLength(0);
     } finally {
       unsubscribeReplies();
@@ -212,7 +232,7 @@ async function submitResearchCheck(
   sentinel: string,
 ): Promise<ArcRunId> {
   return firstActivation(
-    workerHub.submitInbound({
+    ownedSubmissionEvents(workerHub, {
       content: `Please start the research check. The required token is ${sentinel}. Use route=expedite. Case ${label}.`,
       metadata: { principal: `eval-user-${label}` },
     }),
@@ -309,64 +329,6 @@ async function waitFor<T>(
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error("Timed out waiting for eval condition.");
-}
-
-function warmStartTracker(timeoutMs = 90_000): {
-  logger: ArcadeLogger;
-  readyCount: () => number;
-  waitForReadyCount: (count: number) => Promise<void>;
-} {
-  const base = createEvalLogger();
-  let readyCount = 0;
-  const waiters = new Set<{
-    count: number;
-    resolve: () => void;
-    reject: (error: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
-
-  function settleWaiters(): void {
-    for (const waiter of [...waiters]) {
-      if (readyCount < waiter.count) continue;
-      clearTimeout(waiter.timer);
-      waiters.delete(waiter);
-      waiter.resolve();
-    }
-  }
-
-  return {
-    logger: {
-      ...base,
-      info: (event, fields) => {
-        base.info(event, fields);
-        if (event === "backend.claude_sdk_tst.prepared_start_ready") {
-          readyCount += 1;
-          settleWaiters();
-        }
-      },
-    },
-    readyCount: () => readyCount,
-    waitForReadyCount: (count) => {
-      if (readyCount >= count) return Promise.resolve();
-      return new Promise<void>((resolve, reject) => {
-        const waiter = {
-          count,
-          resolve,
-          reject,
-          timer: setTimeout(() => {
-            waiters.delete(waiter);
-            reject(
-              new Error(
-                `Timed out waiting for ${count} Claude semantic warm start(s); saw ${readyCount}.`,
-              ),
-            );
-          }, timeoutMs),
-        };
-        waiter.timer.unref?.();
-        waiters.add(waiter);
-      });
-    },
-  };
 }
 
 function evalLog(message: string, fields: Record<string, unknown> = {}): void {

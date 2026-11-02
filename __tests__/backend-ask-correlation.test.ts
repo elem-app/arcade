@@ -776,7 +776,10 @@ async function makeAskHub(
   });
   const backend: Backend = {
     supportedSlotKinds: new Set(["role"]),
-    createWorker: () => ({ disposeRoutine: async () => {}, run }),
+    createWorker: () => ({
+      disposeRoutine: async () => {},
+      run,
+    }),
   };
   workerHub.addBackend("custom-agent", backend);
   await workerHub.start({

@@ -60,7 +60,6 @@ export {
   type Worker,
   type WorkerHost,
   type WorkerStateStore,
-  type WorkerWarmupInput,
 } from "./types/backend.js";
 export type { Connector } from "./types/connector.js";
 export type {
@@ -86,7 +85,8 @@ export type {
   HostModuleState,
 } from "./types/host-module.js";
 export type {
-  AdvanceInput,
+  AdvanceActionInput,
+  AdvanceTriggerInput,
   ArcHostStep,
   ArcRunView,
   BeginInput,

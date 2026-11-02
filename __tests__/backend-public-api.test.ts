@@ -433,7 +433,7 @@ describe("backend authoring public API", () => {
       claudeSchema?.safeParse({
         backend: "claude-sdk",
         kind: "default",
-        sessionCache: { maxPreparedStarts: 0 },
+        sessionCache: { maxPreparedStarts: 0, maxIdleSessions: 0 },
       }).success,
     ).toBe(true);
 
@@ -442,6 +442,14 @@ describe("backend authoring public API", () => {
         backend: "claude-sdk",
         kind: "default",
         sessionCache: { maxLiveSessions: 16 },
+      }).success,
+    ).toBe(false);
+
+    expect(
+      claudeSchema?.safeParse({
+        backend: "claude-sdk",
+        kind: "default",
+        sessionCache: { maxIdleSessions: -1 },
       }).success,
     ).toBe(false);
 

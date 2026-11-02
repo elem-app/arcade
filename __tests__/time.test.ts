@@ -17,6 +17,7 @@ import {
   InMemoryReplayStore,
   JsonFileArcHostStore,
   JsonFileReplayStore,
+  probeRetention,
   taskId,
   type ArcHostStep,
   type HostCall,
@@ -1068,8 +1069,6 @@ describe("host:time caller-driven advancement", () => {
       try {
         let step = expectSoleDriver(
           await env.host.begin({
-            dialog,
-            inbound: { content: "go" },
             principal: "owner",
             projectDialog: projectorFor(dialog),
           }),
@@ -1191,8 +1190,6 @@ describe("host:time caller-driven advancement", () => {
     try {
       const step = expectSoleDriver(
         await env.host.begin({
-          dialog,
-          inbound: { content: "go" },
           principal: "owner",
           projectDialog: projectorFor(dialog),
         }),
@@ -1644,7 +1641,7 @@ describe("host:time hub delivery", () => {
       );
       await entered.promise;
       expect(advance).toHaveBeenCalledTimes(1);
-      expect(advance.mock.calls[0]?.[2]).toMatchObject({
+      expect(advance.mock.calls[0]?.[1]).toMatchObject({
         hostCallId: expect.any(String),
         hostCallOutcome: { kind: "resolution", value: 1000 },
       });
@@ -1691,8 +1688,6 @@ describe("host:time replay and cancellation", () => {
         );
         let step = expectSoleDriver(
           await host.begin({
-            dialog,
-            inbound: { content: "go" },
             principal: "owner",
             projectDialog: projectorFor(dialog),
           }),
@@ -1800,8 +1795,6 @@ describe("host:time replay and cancellation", () => {
         );
         let step = expectSoleDriver(
           await host.begin({
-            dialog,
-            inbound: { content: "go" },
             principal: "owner",
             projectDialog: projectorFor(dialog),
           }),
@@ -1842,7 +1835,7 @@ describe("host:time replay and cancellation", () => {
         )!;
         expect(removal.acknowledged).toBe(boundary === "resolution");
         expect(removal.effects).toEqual([]);
-        expect(host.getLiveSessionCounts().actioning).toBe(0);
+        expect(probeRetention(host).transient.actioning).toBe(0);
         expect(clock.pendingCount).toBe(0);
         expect(takeModuleEffects(host)).toEqual([]);
         await host.stop();
@@ -2181,7 +2174,7 @@ describe("host:time replay and cancellation", () => {
       await expect(beginActivatedDriver(env.host, dialog)).rejects.toThrow(
         "ack commit failed",
       );
-      expect(env.host.getLiveSessionCounts().actioning).toBe(0);
+      expect(probeRetention(env.host).transient.actioning).toBe(0);
       expect(env.clock.pendingCount).toBe(0);
       expect(takeModuleEffects(env.host)).toEqual([]);
       const saved = (await env.store.getState(arcRunKey(runId!)))!;
@@ -2212,8 +2205,6 @@ describe("host:time operation failure and execution control", () => {
       try {
         let step = expectSoleDriver(
           await env.host.begin({
-            dialog,
-            inbound: { content: "go" },
             principal: "owner",
             projectDialog: projectorFor(dialog),
           }),
@@ -2240,7 +2231,7 @@ describe("host:time operation failure and execution control", () => {
         }
         expect(step.frontier.status).toBe("poisoned");
         expect(step.frontier.tasks).toEqual([]);
-        expect(env.host.getLiveSessionCounts().actioning).toBe(1);
+        expect(probeRetention(env.host).transient.actioning).toBe(1);
         expect(env.clock.pendingCount).toBe(0);
         expect(takeModuleEffects(env.host)).toEqual([]);
         const state = (await env.store.getState(arcRunKey(step.arcRunId)))!;
@@ -2287,7 +2278,7 @@ describe("host:time operation failure and execution control", () => {
         expect(next.frontier).toBe(step.frontier);
         expect(await env.replayStore.listSteps(step.arcRunId)).toEqual(replay);
         await env.host.releaseAction(step.arcRunId, step.frontier.frontierId);
-        expect(env.host.getLiveSessionCounts().actioning).toBe(0);
+        expect(probeRetention(env.host).transient.actioning).toBe(0);
         expect(await env.store.getState(arcRunKey(step.arcRunId))).toEqual(
           state,
         );
@@ -2337,7 +2328,7 @@ describe("host:time operation failure and execution control", () => {
       expect(release).toHaveBeenCalledWith(state.arcRunId, expect.any(String));
       expect(worker).not.toHaveBeenCalled();
       expect(env.clock.pendingCount).toBe(0);
-      expect(env.host.getLiveSessionCounts().actioning).toBe(0);
+      expect(probeRetention(env.host).transient.actioning).toBe(0);
     } finally {
       await workerHub.stop();
       await env.host.stop();
@@ -2356,13 +2347,11 @@ describe("host:time operation failure and execution control", () => {
       );
       expect(
         await env.host.begin({
-          dialog,
-          inbound: { content: "go" },
           principal: "owner",
           projectDialog: projectorFor(dialog),
         }),
       ).toEqual([]);
-      expect(env.host.getLiveSessionCounts()).toEqual({
+      expect(probeRetention(env.host).transient).toMatchObject({
         preparing: 0,
         triggering: 0,
         actioning: 0,
@@ -2605,7 +2594,7 @@ describe("host:time recording boundaries", () => {
           "result commit failed",
         );
         expect(await store.getState(arcRunKey(first.arcRunId))).toEqual(before);
-        expect(host.getLiveSessionCounts().actioning).toBe(0);
+        expect(probeRetention(host).transient.actioning).toBe(0);
         await host.stop();
         store.putState = put;
         host = await createTestArcHost({ store, replayStore, ...clock });
@@ -3088,8 +3077,6 @@ it.each(["accepted", "rejected"] as const)(
       const selection = await drainModuleEffects(
         host,
         await host.begin({
-          dialog: secondDialog,
-          inbound: { content: "second" },
           principal: "owner",
           projectDialog: projectorFor(secondDialog),
         }),

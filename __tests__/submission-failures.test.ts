@@ -6,6 +6,7 @@ import {
   type RoleWorker,
   type RoutineReport,
   type Task,
+  probeRetention,
 } from "../src/testing.js";
 import {
   ALICE_OWNER,
@@ -88,6 +89,99 @@ function Main() {
 }
 
 describe("Submission failure settlement and executor boundaries", () => {
+  it("preserves a successor action lap while failed predecessor cleanup is held", async () => {
+    const cleanup = barrier();
+    const work = barrier();
+    let started = false;
+    let disposing = false;
+    const setup = await fixture("action", async (task) => completed(task), {
+      backends: {
+        controlled: {
+          supportedSlotKinds: new Set(["default"]),
+          createWorker: () => ({
+            disposeRoutine: async () => {
+              if (!disposing) {
+                disposing = true;
+                await cleanup.promise;
+              }
+            },
+            run: async (input) => {
+              started = true;
+              await work.promise;
+              return completed(input.routine.task);
+            },
+          }),
+        },
+      },
+    });
+    vi.spyOn(setup.routineStore, "putRoutine").mockRejectedValueOnce(
+      new Error("First routine persistence failed."),
+    );
+    try {
+      const events = await collectAsync(setup.workerHub.submitInbound(inbound));
+      const activation = events.find((event) => event.kind === "activated");
+      if (activation?.kind !== "activated")
+        throw new Error("Expected activation.");
+      await waitFor(
+        () =>
+          disposing && probeRetention(setup.workerHub).transient.scopes === 0,
+      );
+      expect(probeRetention(setup.workerHub).transient.lapFailures).toBe(1);
+      expect(probeRetention(setup.workerHub).transient.laps).toBe(0);
+      await expect(
+        setup.workerHub.resume(activation.arcRunId),
+      ).resolves.toMatchObject({
+        outcome: "resumed",
+      });
+      await waitFor(() => started);
+      cleanup.resolve();
+      await waitFor(
+        () => probeRetention(setup.workerHub).transient.retiringRoutines === 0,
+      );
+      expect(probeRetention(setup.workerHub).transient).toMatchObject({
+        laps: 1,
+        lapFailures: 0,
+        scopes: 1,
+      });
+      work.resolve();
+      await waitFor(
+        () => probeRetention(setup.workerHub).transient.scopes === 0,
+      );
+      expect(probeRetention(setup.workerHub).transient).toMatchObject({
+        laps: 0,
+        lapFailures: 0,
+      });
+    } finally {
+      cleanup.resolve();
+      work.resolve();
+      await setup.workerHub.stop();
+    }
+  });
+
+  it("retires lap and failure bookkeeping after repeated trigger persistence failures before stop", async () => {
+    const setup = await fixture("trigger", async (task) => completed(task));
+    const error = new Error("Trigger routine store unavailable.");
+    vi.spyOn(setup.routineStore, "putRoutine").mockRejectedValue(error);
+    try {
+      for (let round = 0; round < 20; round++) {
+        const submission = setup.workerHub.submitInbound(inbound);
+        await expect(collectAsync(submission)).rejects.toBe(error);
+        await waitFor(
+          () => probeRetention(setup.workerHub).transient.taskInvocations === 0,
+        );
+        expect(probeRetention(setup.workerHub).transient).toMatchObject({
+          laps: 0,
+          lapFailures: 0,
+          submissions: 0,
+          triggerProbes: 0,
+          scopes: 0,
+        });
+      }
+    } finally {
+      await setup.workerHub.stop();
+    }
+  });
+
   it("propagates required executor storage errors without converting them to queue exhaustion", async () => {
     for (const stage of ["trigger", "action"] as const) {
       for (const boundary of [
@@ -695,6 +789,10 @@ function Scoped() { this.trigger = () => true; $instruct("Work in the selected w
       expect((await iterator.next()).value).toMatchObject({
         kind: "activated",
       });
+      expect((await iterator.next()).value).toMatchObject({
+        kind: "handshake-settled",
+        outcome: "proceeded",
+      });
       expect(await iterator.next()).toEqual({ done: true, value: undefined });
       expect(injected).toBe(true);
     } finally {
@@ -702,69 +800,104 @@ function Scoped() { this.trigger = () => true; $instruct("Work in the selected w
     }
   });
 
-  it("discards late parked results at the closed submission boundary", async () => {
-    const host = await makeArcHostWithSource(
-      "late-infrastructure-result",
-      `"arc";
+  it.each(["completed", "parked", "failed"] as const)(
+    "discards late %s results without recreating retired probe bookkeeping",
+    async (outcome) => {
+      const host = await makeArcHostWithSource(
+        "late-infrastructure-result",
+        `"arc";
 function Main() { this.trigger = () => judge("start"); $enter(Wait); function Wait() { this.guard = () => State.DEFLECTED; } }`,
-    );
-    let seed = true;
-    let calls = 0;
-    let siblingId = "";
-    const failGate = barrier();
-    const parkGate = barrier();
-    const cancel = vi.fn();
-    const setup = makeWorkerHub({
-      arcHost: host,
-
-      workers: {
-        [DEFAULT_WORKER_ROLE]: async (task) => {
-          if (seed) return completed(task);
-          if (++calls === 1) {
-            await failGate.promise;
-            return failure;
-          }
-          siblingId = task.arcRunId;
-          await parkGate.promise;
-          return capacity;
-        },
-      },
-      capacityRetry: { enabled: true, schedule: () => cancel },
-    });
-    try {
-      await collectAsync(setup.workerHub.submitInbound(inbound));
-      seed = false;
-      const error = new Error("Routine store unavailable.");
-      const put = setup.routineStore.putRoutine.bind(setup.routineStore);
-      vi.spyOn(setup.routineStore, "putRoutine").mockImplementation(
-        async (routine) => {
-          if (routine.status === "finished" && routine.error) throw error;
-          await put(routine);
-        },
       );
-      const pending = collectAsync(setup.workerHub.submitInbound(inbound));
-      const rejected = expect(pending).rejects.toBe(error);
-      await waitFor(() => calls === 2);
-      failGate.resolve();
-      await rejected;
-      parkGate.resolve();
-      // In-flight work may finish and persist its result; publication discards
-      // the continuation because its submission no longer exists.
-      await waitFor(() => cancel.mock.calls.length > 0);
-      expect(
-        (await collectAsync(setup.routineStore.listRoutines(siblingId)))[0]
-          ?.status,
-      ).toBe("capacity-limited");
-      await expect(setup.workerHub.resume(siblingId)).resolves.toMatchObject({
-        outcome: "missing",
+      let seed = true;
+      let calls = 0;
+      let siblingId = "";
+      const failGate = barrier();
+      const parkGate = barrier();
+      const cancel = vi.fn();
+      const setup = makeWorkerHub({
+        arcHost: host,
+
+        workers: {
+          [DEFAULT_WORKER_ROLE]: async (task) => {
+            if (seed) return completed(task);
+            if (++calls === 1) {
+              await failGate.promise;
+              return failure;
+            }
+            siblingId = task.arcRunId;
+            await parkGate.promise;
+            return outcome === "parked"
+              ? capacity
+              : outcome === "failed"
+                ? failure
+                : completed(task);
+          },
+        },
+        capacityRetry: { enabled: true, schedule: () => cancel },
       });
-      expect(calls).toBe(2);
-    } finally {
-      failGate.resolve();
-      parkGate.resolve();
-      await setup.workerHub.stop();
-    }
-  });
+      try {
+        await collectAsync(setup.workerHub.submitInbound(inbound));
+        seed = false;
+        const error = new Error("Routine store unavailable.");
+        const put = setup.routineStore.putRoutine.bind(setup.routineStore);
+        vi.spyOn(setup.routineStore, "putRoutine").mockImplementation(
+          async (routine) => {
+            if (routine.status === "finished" && routine.error) throw error;
+            await put(routine);
+          },
+        );
+        const pending = collectAsync(setup.workerHub.submitInbound(inbound));
+        const rejected = expect(pending).rejects.toBe(error);
+        await waitFor(() => calls === 2);
+        let terminated = false;
+        void pending.then(
+          () => {
+            terminated = true;
+          },
+          () => {
+            terminated = true;
+          },
+        );
+        failGate.resolve();
+        await waitFor(
+          () => probeRetention(setup.workerHub).transient.triggerProbes === 0,
+        );
+        expect(terminated).toBe(false);
+        parkGate.resolve();
+        await rejected;
+        // Stream failure joins the retired invocation; its late result cannot
+        // publish a continuation or recreate probe bookkeeping.
+        await waitFor(
+          () => probeRetention(setup.workerHub).transient.taskInvocations === 0,
+        );
+        if (outcome === "parked") {
+          expect(cancel).not.toHaveBeenCalled();
+          expect(
+            (await collectAsync(setup.routineStore.listRoutines(siblingId)))[0]
+              ?.status,
+          ).toBe("skipped");
+        }
+        await expect(setup.workerHub.resume(siblingId)).resolves.toMatchObject({
+          outcome: "missing",
+        });
+        expect(calls).toBe(2);
+        await waitFor(
+          () => probeRetention(setup.workerHub).transient.taskInvocations === 0,
+        );
+        expect(probeRetention(setup.workerHub).transient).toMatchObject({
+          laps: 0,
+          lapFailures: 0,
+          submissions: 0,
+          triggerProbes: 0,
+          scopes: 0,
+        });
+      } finally {
+        failGate.resolve();
+        parkGate.resolve();
+        await setup.workerHub.stop();
+      }
+    },
+  );
 
   it("dispatches successful sibling activation when the last probe fails", async () => {
     const host = await makeArcHostWithSource(

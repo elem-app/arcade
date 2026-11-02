@@ -6,6 +6,7 @@ import {
   InMemoryHistoryStore,
   type OutboundMessage,
   type RoleWorker,
+  probeRetention,
 } from "../src/testing.js";
 import { makeControlledTime } from "./controlled-time.js";
 import {
@@ -19,6 +20,52 @@ import { createTestArcHost } from "./work-event-fixtures.js";
 import { drainLifecycle, submitActivation } from "./worker-hub-helpers.js";
 
 describe("Outbound situations and delivery", () => {
+  it("prunes retired outbound situations without removing shared or replacement handlers", async () => {
+    const host = await makeArcHostWithSource("outbound-pruning", WATCH_SOURCE);
+    const { workerHub } = makeWorkerHub({ arcHost: host });
+    try {
+      const baseline = probeRetention(workerHub).registrations.outboundNodes;
+      const keep = workerHub.registerOutboundHandler(
+        { role: "*", audience: "originator", cause: "reply" },
+        () => {},
+      );
+      const kept = probeRetention(workerHub).registrations.outboundNodes;
+      for (let i = 0; i < 1000; i++) {
+        const situation = {
+          role: `role-${i}`,
+          audience: "originator",
+          cause: "reply",
+        };
+        const remove = workerHub.registerOutboundHandler(situation, () => {});
+        const sibling = workerHub.registerOutboundHandler(situation, () => {});
+        remove();
+        expect(
+          probeRetention(workerHub).registrations.outboundNodes,
+        ).toBeGreaterThan(kept);
+        sibling();
+        expect(probeRetention(workerHub).registrations.outboundNodes).toBe(
+          kept,
+        );
+        const replacement = workerHub.registerOutboundHandler(
+          situation,
+          () => {},
+        );
+        remove();
+        expect(
+          probeRetention(workerHub).registrations.outboundNodes,
+        ).toBeGreaterThan(kept);
+        replacement();
+      }
+      keep();
+      expect(probeRetention(workerHub).registrations.outboundNodes).toBe(
+        baseline,
+      );
+    } finally {
+      await workerHub.stop();
+      await host.stop();
+    }
+  });
+
   it("stamps situation.role from the task and defaults audience to originator", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const emitted: OutboundMessage[] = [];

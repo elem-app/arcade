@@ -1,3 +1,4 @@
+import { ownedSubmissionEvents } from "../submission-events.js";
 /**
  * Claude Agent SDK eval for Arcade artifact filesystem access.
  *
@@ -290,7 +291,7 @@ class EvalConnector implements Connector {
   }
 
   submit(message: InboundMessage) {
-    return firstActivation(this.#workerHub.submitInbound(message));
+    return firstActivation(ownedSubmissionEvents(this.#workerHub, message));
   }
 
   waitForOutbound(timeoutMs = 240_000): Promise<OutboundMessage> {
@@ -403,7 +404,7 @@ class PermissionEvalConnector implements Connector {
   }
 
   submit(message: InboundMessage) {
-    return firstActivation(this.#workerHub.submitInbound(message));
+    return firstActivation(ownedSubmissionEvents(this.#workerHub, message));
   }
 
   waitForReply(timeoutMs = 240_000): Promise<OutboundMessage> {
