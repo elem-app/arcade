@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fromJSONSchema } from "zod/v4";
 import { createContinuityPreparation } from "../src/backends/continuity.js";
 
 import { Agent, Runner, type Model } from "@openai/agents";
@@ -317,7 +318,7 @@ describe("OpenAiSdkWorker", () => {
                     type: "function_call" as const,
                     callId: "finish",
                     name: "report",
-                    arguments: '{"outcome":"completed"}',
+                    arguments: '{"report":{"outcome":"completed"}}',
                   },
                 ]
               : [
@@ -577,32 +578,22 @@ describe("OpenAiSdkWorker", () => {
       ),
     ).resolves.toMatchObject({ outcome: "completed" });
 
-    expect(parameters).toEqual({
-      oneOf: [
-        {
-          type: "object",
-          properties: {
-            outcome: { const: "completed" },
-            semantic: {
-              type: "object",
-              additionalProperties: true,
-            },
-          },
-          required: ["outcome"],
-          additionalProperties: false,
-        },
-        {
-          type: "object",
-          properties: {
-            error: { const: "failed" },
-            code: { type: "string", minLength: 1 },
-            message: { type: "string" },
-          },
-          required: ["error", "message"],
-          additionalProperties: false,
-        },
-      ],
-    });
+    const schema = fromJSONSchema(parameters as Record<string, unknown>);
+    expect(schema.safeParse({ report: { outcome: "completed" } }).success).toBe(
+      true,
+    );
+    expect(
+      schema.safeParse({
+        report: { error: "failed", code: "failed", message: "failed" },
+      }).success,
+    ).toBe(true);
+    expect(
+      schema.safeParse({ report: { outcome: "completed", semantic: {} } })
+        .success,
+    ).toBe(false);
+    expect(schema.safeParse({ report: { outcome: "deflected" } }).success).toBe(
+      false,
+    );
   });
 
   it("preserves an authored interaction prohibition in the OpenAI prompt", async () => {
@@ -1157,7 +1148,7 @@ describe("OpenAiSdkWorker", () => {
     expect(run.mock.calls[1]![0].prompt).toContain("required report tool");
     expect(run.mock.calls[1]![0].prompt).toContain("private worker memory");
     expect(run.mock.calls[1]![0].prompt).toContain(
-      'pass exactly {"outcome":"completed"}',
+      "Use the report tool schema for this assignment.",
     );
     expect(run.mock.calls[1]![0].prompt).toContain(
       'Do not include code or message with outcome "completed"',
@@ -2179,7 +2170,11 @@ async function callOpenAiToolRaw(
     .tools;
   const fn = tools.find((tool) => tool.name === name);
   if (!fn) throw new Error(`tool not found: ${name}`);
-  return await fn.invoke({} as any, JSON.stringify(input), {});
+  return await fn.invoke(
+    {} as any,
+    JSON.stringify(name === "report" ? { report: input } : input),
+    {},
+  );
 }
 
 /**

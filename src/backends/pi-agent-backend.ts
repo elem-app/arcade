@@ -1,4 +1,8 @@
-import { Agent, type AgentOptions } from "@earendil-works/pi-agent-core";
+import {
+  Agent,
+  type AgentOptions,
+  type AgentTool,
+} from "@earendil-works/pi-agent-core";
 import { z } from "zod";
 
 import {
@@ -12,6 +16,7 @@ import {
   extractLastPiAgentAssistantText,
   parseAgentJsonOutput,
 } from "../service/semantic-resolver.js";
+import { modelReportContract } from "../service/semantic-schema.js";
 import {
   buildInstructionPrompt,
   buildInstructionSystemPrompt,
@@ -252,12 +257,35 @@ export class PiAgentWorker implements Worker {
         ? buildSemanticPrompt(task, context)
         : buildInstructionPrompt(task, context);
       await diagnostics.writeText("prompt", prompt);
+      let semanticReport: RoutineReport | undefined;
+      const tools = agentOptions.initialState?.tools ?? [];
+      if (isSemantic && tools.some((tool) => tool.name === "report"))
+        throw new Error(
+          "PI report tool is reserved for the current assignment.",
+        );
+      const contract = modelReportContract(task);
+      const reportTool: AgentTool = {
+        name: "report",
+        label: "Report",
+        description:
+          "Submit the result of the current semantic assignment using its declared schema.",
+        parameters: contract.jsonSchema as AgentTool["parameters"],
+        execute: async (_id, args) => {
+          semanticReport = contract.parse(args);
+          return {
+            content: [{ type: "text", text: "Report accepted." }],
+            details: {},
+            terminate: true,
+          };
+        },
+      };
       const agent = new Agent({
         ...agentOptions,
         initialState: {
           ...agentOptions.initialState,
+          ...(isSemantic ? { tools: [...tools, reportTool] } : {}),
           systemPrompt: isSemantic
-            ? buildSemanticSystemPrompt(task.stage, systemBase)
+            ? buildSemanticSystemPrompt(task.stage, systemBase, "tool")
             : buildInstructionSystemPrompt(task, systemBase),
         },
       });
@@ -267,11 +295,15 @@ export class PiAgentWorker implements Worker {
       );
       if (tokenUsage) await effects.recordTokenUsage(tokenUsage);
       await diagnostics.writeJson("messages", agent.state.messages);
-      const report = await parseAgentJsonOutput(
-        extractLastPiAgentAssistantText(agent.state.messages),
-        effects,
-        "PI agent output",
-      );
+      if (isSemantic && !semanticReport)
+        throw new Error("PI worker did not call the required report tool.");
+      const report =
+        semanticReport ??
+        (await parseAgentJsonOutput(
+          extractLastPiAgentAssistantText(agent.state.messages),
+          effects,
+          "PI agent output",
+        ));
       await diagnostics.writeJson("result", report);
       this.#logger.info("backend.pi_agent.finished", {
         arcRunId: task.arcRunId,

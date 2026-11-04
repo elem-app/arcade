@@ -25,6 +25,7 @@ import {
 export function buildSemanticSystemPrompt(
   stage: SemanticTask["stage"],
   base?: string,
+  reporting: "json" | "tool" = "json",
 ): string {
   const parts = [
     base,
@@ -36,10 +37,12 @@ export function buildSemanticSystemPrompt(
     stage === "action"
       ? "Apply each request's standing guidance when interpreting its question and resolving its value; use active-instruction guidance when assessing that instruction. Guidance applies only to its associated work in the current assignment."
       : undefined,
-    'Return ONLY one JSON object: {"report": {"outcome": "completed", "semantic": {"judgments": {...}, "observations": {...}}}}.',
-    "Include a key for every request id under judgments (boolean) or observations. A single observation maps to {status, value?}; a grouped observation maps to {fields: {<cell>: {status, value?}}} with an entry for every listed cell.",
-    'For observations, status is "resolved" (with value), "unknown" (cannot determine), or "needs-user" (observeOrAsk only; user reply would help).',
-    "Do not write any text outside the JSON object.",
+    "Resolve every requested judgment or observation using the supplied report schema.",
+    'Use "resolved" when the complete cell value can be determined, "unknown" when it cannot, and "needs-user" only for observeOrAsk when a user reply would help.',
+    "Interpret each observed field using its question and metadata. Preserve the requested array order.",
+    reporting === "tool"
+      ? "Submit the result by calling report with its declared schema."
+      : "Return only the JSON object required by the response schema.",
   ];
   return parts.filter((part): part is string => Boolean(part)).join("\n\n");
 }
@@ -79,7 +82,7 @@ export function buildSemanticPrompt(
     "",
     xmlBlock(
       "rules",
-      "Return only the JSON object described in the system prompt.",
+      "Resolve this assignment using the reporting contract supplied by the system.",
     ),
   );
   return parts.join("\n");

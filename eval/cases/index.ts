@@ -4,3 +4,4 @@ import "./claude-sdk.js";
 import "./openai-sdk-fast-trigger.js";
 import "./openai-sdk.js";
 import "./standing-guidance-trigger.js";
+import "./struct-trigger-observations.js";

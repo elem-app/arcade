@@ -38,6 +38,7 @@ import {
   type ArcadeLogger,
 } from "../logging.js";
 import type { SecretResolver } from "../service/secrets.js";
+import { modelReportContract } from "../service/semantic-schema.js";
 import {
   SANDBOX_BUNDLE_ROOT,
   sandboxBundleRoot,
@@ -50,14 +51,12 @@ import {
   renderInstructionAudienceReferencesForPrompt,
   renderInstructionTaskTextForPrompt,
   renderSemanticRequestForPrompt,
-  semanticReportExample,
   xmlBlock,
 } from "../service/task-renderer.js";
 import { routineTokenUsageFromOpenAiRun } from "../service/token-usage.js";
 import {
   normalizeQuestionAudience,
   normalizeReplyAudience,
-  validateAgentRoutineReport,
 } from "../service/utils.js";
 import { defineBackend, type Backend, type Worker } from "../types/backend.js";
 import type { ExternalWorkerTool } from "../types/external-worker-tool.js";
@@ -104,7 +103,6 @@ import {
   EmitOutboundInputSchema,
   emitWorkerQuestion,
   invalidToolInputError,
-  normalizeRoutineReportInput,
   OUTBOUND_TOOL_NAME,
   outboundQuestionForm,
   parseAskAudienceInput,
@@ -138,7 +136,7 @@ const MISSING_REPORT_RECOVERY_PROMPT = [
   "",
   "Continue the same assigned work:",
   "",
-  '- If every obligation is complete, call report. For instruction work, pass exactly {"outcome":"completed"}. For semantic work, also include the required semantic object.',
+  "- If every obligation is complete, call report. Use the report tool schema for this assignment.",
   "- If work remains, continue it before reporting completion.",
   "- If required audience input has not been received, follow the shared audience-interaction policy and continue after the interaction tool returns its result.",
   '- If an error makes the work impossible to complete, call report with error "failed" and include the error message.',
@@ -331,18 +329,9 @@ function buildSemanticPrompt(
   appendResumeMessage(parts, resume);
   const rules = [
     `Resolve this ${task.stage} semantic work.`,
-    "Semantic report:",
-    'Call report with outcome "completed" and a semantic object covering every request id.',
-    "Put judgment answers under semantic.judgments as booleans keyed by request id.",
-    "Put observation answers under semantic.observations as {status, value?} keyed by request id.",
-    "A grouped observation id maps to {fields: {<cell>: {status, value?}}} instead, with an entry for every listed cell resolved together.",
-    'Observation status is "resolved", "unknown", or "needs-user".',
-    'Do not call report with bare {"outcome":"completed"} for semantic work.',
-    "Example:",
-    JSON.stringify({
-      outcome: "completed",
-      semantic: semanticReportExample(task),
-    }),
+    "Call report using its declared schema to submit the completed semantic assignment.",
+    'Use "resolved" when the complete cell value can be determined, "unknown" when it cannot, and "needs-user" only for observeOrAsk when a user reply would help.',
+    "Interpret each observed field using its question and metadata. Preserve the requested array order.",
   ];
   parts.push("", xmlBlock("rules", rules.join("\n")));
   return parts.join("\n");
@@ -522,9 +511,9 @@ function buildOpenAiSdkTools(
     tool({
       name: REPORT_TOOL_NAME,
       description:
-        'Finalize the current assigned task. For completed instruction work, pass exactly {"outcome":"completed"}; include semantic only for semantic work. For a terminal failure, pass {"error":"failed","code":"...","message":"..."}.',
-      parameters: openAiToolParameters(REPORT_PARAMETERS),
-      strict: false,
+        "Finalize the current assigned task using the declared report schema. Report a completed outcome or a terminal failure.",
+      parameters: modelReportContract(routine.task).schema,
+      strict: true,
       async execute(raw) {
         // Pausing before finalizing the report is intentionally disabled.
         // A safe between-tool pause must halt after a tool result is
@@ -532,10 +521,7 @@ function buildOpenAiSdkTools(
         // no dangling tool call — via the SDK's cooperative interrupt in streaming
         // mode (streamed-run cancel + responseId resume), not a swallowed throw or
         // a blunt abort. Pause stays honored at the routine boundary.
-        const report = validateAgentRoutineReport(
-          normalizeRoutineReportInput(raw, routine.task),
-          "report tool input",
-        );
+        const report = modelReportContract(routine.task).parse(raw);
         onReport(report);
         return { ok: true };
       },
@@ -580,33 +566,6 @@ function buildOpenAiSdkTools(
     ),
   ];
 }
-
-const REPORT_PARAMETERS = {
-  oneOf: [
-    {
-      type: "object",
-      properties: {
-        outcome: { const: "completed" },
-        semantic: {
-          type: "object",
-          additionalProperties: true,
-        },
-      },
-      required: ["outcome"],
-      additionalProperties: false,
-    },
-    {
-      type: "object",
-      properties: {
-        error: { const: "failed" },
-        code: { type: "string", minLength: 1 },
-        message: { type: "string" },
-      },
-      required: ["error", "message"],
-      additionalProperties: false,
-    },
-  ],
-};
 
 /** Derive the SDK declaration from Arcade's canonical runtime schema. */
 function openAiToolParametersFromSchema(

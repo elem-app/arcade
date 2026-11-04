@@ -4,7 +4,6 @@ import type { SemanticText } from "@elem-app/arc/runtime";
 import { describe, expect, it } from "vitest";
 
 import {
-  exampleObservationValue,
   renderActiveInstructionForPrompt,
   renderDialogPriming,
   renderInstructionTaskText,
@@ -326,22 +325,91 @@ describe("task renderer", () => {
       }
     }
   });
-  it("seeds prompt example values that are admissible for each cell type", () => {
-    // A wrong-typed example (e.g. a boolean for a string cell) would teach a
-    // worker to emit values the runtime rejects, looping the observation back.
-    expect(exampleObservationValue({ type: "boolean" })).toBe(true);
-    expect(typeof exampleObservationValue({ type: "string" })).toBe("string");
-    expect(
-      exampleObservationValue({ type: "enum", values: ["cold", "warm"] }),
-    ).toBe("cold");
-    const ranged = exampleObservationValue({
-      type: "rangedInt",
-      min: 3,
-      max: 9,
+  it("renders Struct field questions in observation metadata for each target", () => {
+    const request: SemanticRequest = {
+      kind: "observation",
+      briefId: "observe:trip",
+      role: "researcher",
+      cell: "trip",
+      mode: "observe",
+      question: "the trip",
+      currentValue: { brief: "two nights", plan: [{ note: "ok" }] },
+      meta: {
+        type: "struct",
+        fields: {
+          brief: {
+            question: [
+              { kind: "text", value: "summarize " },
+              { kind: "artifact", path: "trip.md" },
+            ],
+            meta: { type: "string" },
+          },
+          plan: {
+            question: "the plan",
+            meta: {
+              type: "array",
+              element: {
+                type: "struct",
+                fields: {
+                  note: {
+                    question: [
+                      { kind: "text", value: "a note for " },
+                      { kind: "entity", name: "user" },
+                    ],
+                    meta: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      tool: {
+        type: "function",
+        name: "resolve",
+        description: "Resolve.",
+        parameters: {},
+        strict: true,
+      },
+      sourceRef: "node:test:Main",
+    };
+    const rendered = renderSemanticRequestForPrompt(
+      request,
+      context(),
+      { kind: "sandbox", sandboxRoot: "/workspace" },
+      "action",
+    );
+    expect(rendered).toMatchObject({
+      currentValue: { brief: "two nights", plan: [{ note: "ok" }] },
+      meta: {
+        type: "struct",
+        fields: {
+          brief: {
+            question: "summarize /workspace/trip.md",
+            meta: { type: "string" },
+          },
+          plan: {
+            question: "the plan",
+            meta: {
+              type: "array",
+              element: {
+                type: "struct",
+                fields: { note: { meta: { type: "string" } } },
+              },
+            },
+          },
+        },
+      },
     });
-    expect(Number.isInteger(ranged)).toBe(true);
-    expect(ranged).toBeGreaterThanOrEqual(3);
-    expect(ranged).toBeLessThanOrEqual(9);
+    if (rendered.kind !== "observation" || rendered.meta.type !== "struct") {
+      throw new Error("expected a rendered Struct observation");
+    }
+    const plan = rendered.meta.fields.plan!.meta;
+    if (plan.type !== "array" || plan.element.type !== "struct") {
+      throw new Error("expected a Struct-element array");
+    }
+    expect(typeof plan.element.fields.note!.question).toBe("string");
+    expect(plan.element.fields.note!.question).toMatch(/^a note for /);
   });
 });
 

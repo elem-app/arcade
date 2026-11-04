@@ -106,6 +106,22 @@ export const CASES = {
     "array-observation",
     "commits ordered array observation values",
   ),
+  structObservation: definition(
+    "struct-observation",
+    "commits a nested Struct observation and branches on its fields",
+  ),
+  structArrayObservation: definition(
+    "struct-array-observation",
+    "commits ordered Struct-array observations with nested records",
+  ),
+  structTriggerObservation: definition(
+    "struct-trigger-observation",
+    "selects a trigger from a nested Struct and persists its complete value",
+  ),
+  structArrayTriggerObservation: definition(
+    "struct-array-trigger-observation",
+    "selects a trigger from an ordered Struct array and persists its complete value",
+  ),
   groupedObserveOrAsk: definition(
     "grouped-observe-or-ask",
     "commits observed and asked values together",
@@ -163,5 +179,7 @@ export const OBSERVATION_CASES = [
   CASES.standingGuidanceObservation,
   CASES.groupedObservation,
   CASES.arrayObservation,
+  CASES.structObservation,
+  CASES.structArrayObservation,
   CASES.groupedObserveOrAsk,
 ] as const;

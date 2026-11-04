@@ -18,8 +18,8 @@ importers:
         specifier: 0.80.6
         version: 0.80.6(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.0)(zod@4.4.3)
       '@elem-app/arc':
-        specifier: git+ssh://git@github.com/elem-app/arc.git#v0.10.0
-        version: https://codeload.github.com/elem-app/arc/tar.gz/73d9d91164dbcf71417e5f95ce27484e3433705f
+        specifier: git+ssh://git@github.com/elem-app/arc.git#v0.11.0
+        version: https://codeload.github.com/elem-app/arc/tar.gz/2bf38672b32720883aa532673c291f076e4e3e9f
       '@js-temporal/polyfill':
         specifier: ^0.5.1
         version: 0.5.1
@@ -288,9 +288,9 @@ packages:
     engines: {node: '>=22.19.0'}
     hasBin: true
 
-  '@elem-app/arc@https://codeload.github.com/elem-app/arc/tar.gz/73d9d91164dbcf71417e5f95ce27484e3433705f':
-    resolution: {gitHosted: true, integrity: sha512-uZKprmtQwJ6ek+154VwnUPkIOeW8oWvn0j1y5V/TqVlTI8hk2DEivaIJLKeN8tDG27U76meQ4Hk2a+OqdUqqIg==, tarball: https://codeload.github.com/elem-app/arc/tar.gz/73d9d91164dbcf71417e5f95ce27484e3433705f}
-    version: 0.10.0
+  '@elem-app/arc@https://codeload.github.com/elem-app/arc/tar.gz/2bf38672b32720883aa532673c291f076e4e3e9f':
+    resolution: {gitHosted: true, integrity: sha512-7XSvv3GaKTDSNdwH9gmrtm/Lhg8eKE/rd0QSyCsjcPsU7fyrJuT+kWFtMnPEHjq8obnVkMLSCNwlUh9FQ7oZxQ==, tarball: https://codeload.github.com/elem-app/arc/tar.gz/2bf38672b32720883aa532673c291f076e4e3e9f}
+    version: 0.11.0
 
   '@emnapi/core@1.10.0':
     resolution: {integrity: sha512-yq6OkJ4p82CAfPl0u9mQebQHKPJkY7WrIuk205cTYnYe+k2Z8YBh11FrbRG/H6ihirqcacOgl2BIO8oyMQLeXw==}
@@ -2215,7 +2215,7 @@ snapshots:
       - ws
       - zod
 
-  '@elem-app/arc@https://codeload.github.com/elem-app/arc/tar.gz/73d9d91164dbcf71417e5f95ce27484e3433705f':
+  '@elem-app/arc@https://codeload.github.com/elem-app/arc/tar.gz/2bf38672b32720883aa532673c291f076e4e3e9f':
     dependencies:
       acorn: 8.16.0
       acorn-walk: 8.3.5

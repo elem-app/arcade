@@ -1470,7 +1470,11 @@ async function callOpenAiTool(
     .tools;
   const fn = tools.find((tool) => tool.name === name);
   if (!fn) throw new Error(`tool not found: ${name}`);
-  return await fn.invoke({} as never, JSON.stringify(input), {});
+  return await fn.invoke(
+    {} as never,
+    JSON.stringify(name === "report" ? { report: input } : input),
+    {},
+  );
 }
 
 describe("Run work event publication", () => {

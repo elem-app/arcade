@@ -22,6 +22,7 @@ import {
   previewLogValue,
   type ArcadeLogger,
 } from "../logging.js";
+import { modelReportContract } from "../service/semantic-schema.js";
 import {
   INSTRUCTION_EXECUTION_BOUNDARY_RULES,
   renderActiveInstructionForPrompt,
@@ -29,7 +30,6 @@ import {
   renderInstructionAudienceReferencesForPrompt,
   renderInstructionTaskTextForPrompt,
   renderSemanticRequestForPrompt,
-  semanticReportExample,
   xmlBlock,
 } from "../service/task-renderer.js";
 import { routineTokenUsageFromClaudeSdkMessages } from "../service/token-usage.js";
@@ -37,7 +37,6 @@ import {
   normalizeNonOriginatorQuestionAudience,
   normalizeQuestionAudience,
   normalizeReplyAudience,
-  validateAgentRoutineReport,
 } from "../service/utils.js";
 import { defineBackend, type Backend, type Worker } from "../types/backend.js";
 import type { ExternalWorkerTool } from "../types/external-worker-tool.js";
@@ -81,7 +80,6 @@ import {
   EmitOutboundInputSchema,
   emitWorkerQuestion,
   invalidToolInputError,
-  normalizeRoutineReportInput,
   OUTBOUND_TOOL_NAME,
   outboundQuestionForm,
   parseAskAudienceInput,
@@ -109,7 +107,7 @@ const MISSING_REPORT_RECOVERY_PROMPT = [
   "",
   "Continue the same assigned work:",
   "",
-  `- If every obligation is complete, call mcp__${WORKER_MCP_SERVER_NAME}__${REPORT_TOOL_NAME}. For instruction work, pass exactly {"outcome":"completed"}. For semantic work, also include the required semantic object.`,
+  `- If every obligation is complete, call mcp__${WORKER_MCP_SERVER_NAME}__${REPORT_TOOL_NAME}. Use the report tool schema for this assignment.`,
   "- If work remains, continue it before reporting completion.",
   "- If required audience input has not been received, follow the shared audience-interaction policy and continue after the interaction tool returns its result.",
   `- If an error makes the work impossible to complete, call mcp__${WORKER_MCP_SERVER_NAME}__${REPORT_TOOL_NAME} with error "failed" and include the error message.`,
@@ -251,18 +249,9 @@ function buildSemanticPrompt(
   const rules = [
     `Resolve this ${task.stage} semantic work.`,
     "Use workspace and Claude Code tools as needed.",
-    "Semantic report:",
-    'Call report with outcome "completed" and a semantic object covering every request id.',
-    "Put judgment answers under semantic.judgments as booleans keyed by request id.",
-    "Put observation answers under semantic.observations as {status, value?} keyed by request id.",
-    "A grouped observation id maps to {fields: {<cell>: {status, value?}}} instead, with an entry for every listed cell resolved together.",
-    'Observation status is "resolved", "unknown", or "needs-user".',
-    'Do not call report with bare {"outcome":"completed"} for semantic work.',
-    "Example:",
-    JSON.stringify({
-      outcome: "completed",
-      semantic: semanticReportExample(task),
-    }),
+    "Call report using its declared schema to submit the completed semantic assignment.",
+    'Use "resolved" when the complete cell value can be determined, "unknown" when it cannot, and "needs-user" only for observeOrAsk when a user reply would help.',
+    "Interpret each observed field using its question and metadata. Preserve the requested array order.",
   ];
   parts.push("", xmlBlock("rules", rules.join("\n")));
   return parts.join("\n");
@@ -341,6 +330,7 @@ class ClaudeSdkLiveSession {
   readonly #query: Query;
   readonly #iterator: AsyncIterator<SDKMessage>;
   #model: string;
+  #reportSchemaKey: string;
   #closed = false;
   #tail: Promise<void> = Promise.resolve();
   signal: RoutineSignal | undefined;
@@ -359,6 +349,7 @@ class ClaudeSdkLiveSession {
     query: Query;
     model: string;
     owner: Parameters<Worker["disposeRoutine"]>[0];
+    task?: Task;
   }) {
     this.sessionKey = input.sessionKey;
     this.cwd = input.cwd;
@@ -368,7 +359,38 @@ class ClaudeSdkLiveSession {
     this.#query = input.query;
     this.#iterator = input.query[Symbol.asyncIterator]();
     this.#model = input.model;
+    this.#reportSchemaKey = JSON.stringify(
+      modelReportContract(input.task).jsonSchema,
+    );
     this.owner = input.owner;
+  }
+
+  async bindReportSchema(
+    task: Task,
+    externalTools: readonly ExternalWorkerTool[],
+  ): Promise<void> {
+    const key = JSON.stringify(modelReportContract(task).jsonSchema);
+    if (key === this.#reportSchemaKey) return;
+    // The SDK retains an existing in-process server by name. Disconnect it
+    // before installing the current assignment's schema on the same session.
+    this.#reportSchemaKey = "";
+    const removed = await this.#query.setMcpServers({});
+    if (Object.keys(removed.errors).length)
+      throw new Error(
+        `Claude report schema removal failed: ${JSON.stringify(removed.errors)}`,
+      );
+    const result = await this.#query.setMcpServers({
+      [WORKER_MCP_SERVER_NAME]: buildClaudeSdkMcpServer(
+        this.holder,
+        externalTools,
+        task,
+      ),
+    });
+    if (Object.keys(result.errors).length)
+      throw new Error(
+        `Claude report schema binding failed: ${JSON.stringify(result.errors)}`,
+      );
+    this.#reportSchemaKey = key;
   }
 
   async setModel(model: string): Promise<void> {
@@ -459,6 +481,7 @@ function isClaudeToolResultBoundary(message: SDKMessage): boolean {
 function buildClaudeSdkMcpServer(
   ctx: ManagedWorkerToolContextSource,
   externalTools: readonly ExternalWorkerTool[],
+  task?: Task,
 ) {
   return createSdkMcpServer({
     name: WORKER_MCP_SERVER_NAME,
@@ -604,20 +627,11 @@ function buildClaudeSdkMcpServer(
       ),
       tool(
         REPORT_TOOL_NAME,
-        'Finalize the current assigned task. For completed instruction work, pass exactly {"outcome":"completed"}; include semantic only for semantic work. For a terminal failure, pass {"error":"failed","code":"...","message":"..."}.',
-        {
-          outcome: z.literal("completed").optional(),
-          error: z.literal("failed").optional(),
-          code: z.string().optional(),
-          message: z.string().optional(),
-          semantic: z.unknown().optional(),
-        },
+        "Finalize the current assigned task using the declared report schema. Report a completed outcome or a terminal failure.",
+        modelReportContract(task).schema.shape,
         async (raw) => {
           const currentCtx = currentManagedWorkerToolContext(ctx);
-          const report = validateAgentRoutineReport(
-            normalizeRoutineReportInput(raw, currentCtx.task),
-            "report tool input",
-          );
+          const report = modelReportContract(currentCtx.task).parse(raw);
           await appendManagedWorkerToolDiagnostic(currentCtx, {
             kind: "report",
             reportKind: report.outcome ?? report.error,
@@ -848,6 +862,7 @@ function claudeSessionResume(
 }
 
 type ClaudeSdkRunInput = {
+  task: Task;
   reuseKey?: string;
   owner: Parameters<Worker["disposeRoutine"]>[0];
   sessionKey: string;
@@ -1230,6 +1245,10 @@ export class ClaudeSdkWorker implements Worker {
       await session.runExclusive(async () => {
         session!.holder.current = workerCtx;
         try {
+          await session!.bindReportSchema(
+            routine.task,
+            this.#options.externalTools ?? [],
+          );
           await session!.setModel(model);
           if (this.#stopped) {
             signal = { kind: "cancel" };
@@ -1453,6 +1472,7 @@ export class ClaudeSdkWorker implements Worker {
     const model = selected?.model ?? this.#options.model;
     const timeoutMs = selected?.timeoutMs ?? this.#options.timeoutMs;
     return {
+      task: routine.task,
       owner: { arcRunId: routine.arcRunId, routineId: routine.id },
       reuseKey: this.prepareContinuity ? preparation?.reuseKey : "worker",
       sessionKey,
@@ -1576,6 +1596,7 @@ export class ClaudeSdkWorker implements Worker {
         cwd: input.cwd,
         model: input.model,
         resume: input.resume,
+        task: input.task,
         workerCtx: holder,
       }),
     }) as Query;
@@ -1588,6 +1609,7 @@ export class ClaudeSdkWorker implements Worker {
       prompt,
       query: sdkQuery,
       model: input.model,
+      task: input.task,
     });
   }
 
@@ -1659,6 +1681,7 @@ export class ClaudeSdkWorker implements Worker {
     model: string;
     resume?: string;
     workerCtx: ManagedWorkerToolContextSource;
+    task?: Task;
   }): ClaudeSdkOptions {
     return {
       abortController: input.abortController,
@@ -1668,6 +1691,7 @@ export class ClaudeSdkWorker implements Worker {
         [WORKER_MCP_SERVER_NAME]: buildClaudeSdkMcpServer(
           input.workerCtx,
           this.#options.externalTools ?? [],
+          input.task,
         ),
       },
       model: input.model,

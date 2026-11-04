@@ -20,65 +20,43 @@ import {
 } from "./worker-hub-helpers.js";
 
 describe("Worker hub TST report validation", () => {
-  it("records and removes Claude TST semantic drift at the worker hub boundary", async () => {
-    const { workerHub, advanceInputs, records } = await makeClaudeHubWithReport(
-      (id) => ({
+  it.each(["Claude", "OpenAI"] as const)(
+    "rejects %s TST semantic drift as a backend failure",
+    async (backend) => {
+      const makeHub =
+        backend === "Claude"
+          ? makeClaudeHubWithReport
+          : makeOpenAiHubWithReport;
+      const { workerHub, advanceInputs, records } = await makeHub((id) => ({
         outcome: "completed",
         semantic: { judgments: { [id]: true, "judge:extra": false } },
-      }),
-    );
-
-    await submitActivation(workerHub, "Is it ready?");
-    expect(advanceInputs).toEqual([
-      expect.objectContaining({
-        reports: [
-          expect.objectContaining({
-            outcome: "completed",
-            semantic: { judgments: { [onlyJudgmentId(advanceInputs)]: true } },
-          }),
-        ],
-      }),
-    ]);
-    expect(records).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          event: "worker_hub.semantic_report_drift",
-          backend: "claude-sdk-tst",
-          unrequestedJudgments: ["judge:extra"],
+      }));
+      const events = await collectAsync(
+        workerHub.submitInbound({
+          content: "Is it ready?",
+          metadata: { principal: ALICE_OWNER },
         }),
-      ]),
-    );
-  });
-
-  it("records and removes OpenAI TST semantic drift at the worker hub boundary", async () => {
-    const { workerHub, advanceInputs, records } = await makeOpenAiHubWithReport(
-      (id) => ({
-        outcome: "completed",
-        semantic: { judgments: { [id]: true, "judge:extra": false } },
-      }),
-    );
-
-    await submitActivation(workerHub, "Is it ready?");
-    expect(advanceInputs).toEqual([
-      expect.objectContaining({
-        reports: [
-          expect.objectContaining({
-            outcome: "completed",
-            semantic: { judgments: { [onlyJudgmentId(advanceInputs)]: true } },
-          }),
-        ],
-      }),
-    ]);
-    expect(records).toEqual(
-      expect.arrayContaining([
+      );
+      expect(events).toEqual([
         expect.objectContaining({
-          event: "worker_hub.semantic_report_drift",
-          backend: "openai-sdk-tst",
-          unrequestedJudgments: ["judge:extra"],
+          kind: "failed",
+          reason: expect.stringContaining("judge:extra"),
         }),
-      ]),
-    );
-  });
+      ]);
+      expect(advanceInputs).toEqual([
+        expect.objectContaining({
+          reports: [
+            expect.objectContaining({ error: "failed", code: "backend-error" }),
+          ],
+        }),
+      ]);
+      expect(
+        records.some(
+          (record) => record.event === "worker_hub.semantic_report_drift",
+        ),
+      ).toBe(false);
+    },
+  );
 
   it("writes no drift evidence for a complete TST report", async () => {
     const diagnosticsDir = await mkdtemp(
@@ -105,7 +83,7 @@ describe("Worker hub TST report validation", () => {
     );
   });
 
-  it("rejects an incomplete TST semantic report at the worker hub boundary", async () => {
+  it("rejects an incomplete TST semantic report before host advancement", async () => {
     const { workerHub } = await makeClaudeHubWithReport(() => ({
       outcome: "completed",
       semantic: { judgments: {} },
@@ -120,7 +98,7 @@ describe("Worker hub TST report validation", () => {
     expect(events).toEqual([
       expect.objectContaining({
         kind: "failed",
-        reason: expect.stringContaining("is required"),
+        reason: expect.stringContaining("expected boolean"),
       }),
     ]);
   });
@@ -128,16 +106,6 @@ describe("Worker hub TST report validation", () => {
 
 const TRIGGER_SOURCE =
   '"arc"; function Main() { this.trigger = () => judge("Is it ready?"); }';
-
-/** The single judgment id the recorded trigger report answered. */
-function onlyJudgmentId(advanceInputs: unknown[]): string {
-  const input = advanceInputs[0] as {
-    reports: [{ semantic: { judgments: Record<string, boolean> } }];
-  };
-  const ids = Object.keys(input.reports[0].semantic.judgments);
-  expect(ids).toHaveLength(1);
-  return ids[0]!;
-}
 
 async function makeClaudeHubWithReport(
   report: (judgmentId: string) => unknown,

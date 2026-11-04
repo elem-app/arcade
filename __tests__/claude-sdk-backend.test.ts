@@ -117,6 +117,110 @@ describe("ClaudeSdkWorker", () => {
     }
   });
 
+  it("rebinds the Claude report schema before reusing a session for a different brief", async () => {
+    const instruction = await firstTask();
+    const semantic: Task = {
+      kind: "semantic",
+      arcRunId: instruction.arcRunId,
+      batchId: "batch:schema",
+      role: instruction.role,
+      stage: "action",
+      contextIsolation: "role",
+      dialog: instruction.dialog,
+      allowedDispositions: [],
+      requests: [
+        {
+          kind: "observation",
+          briefId: "observe:record",
+          role: instruction.role,
+          cell: "record",
+          mode: "observe",
+          question: "record?",
+          sourceRef: "node:test:Main",
+          tool: {
+            type: "function",
+            name: "observe",
+            description: "observe",
+            parameters: {},
+            strict: true,
+          },
+          meta: {
+            type: "struct",
+            fields: {
+              ready: { question: "ready?", meta: { type: "boolean" } },
+            },
+          },
+        },
+      ],
+    };
+    const completed: RoutineReport = {
+      outcome: "completed",
+      semantic: {
+        observations: {
+          "observe:record": { status: "resolved", value: { ready: true } },
+        },
+      },
+    };
+    const { query, states } = streamingQueryReturning(
+      [{ outcome: "completed" }, completed, { outcome: "completed" }],
+      async (params, index) => {
+        const server = params.options!.mcpServers!
+          .arcade_internal as unknown as {
+          instance: {
+            _registeredTools: {
+              report: {
+                inputSchema: {
+                  safeParse(value: unknown): { success: boolean };
+                };
+              };
+            };
+          };
+        };
+        const schema = server.instance._registeredTools.report.inputSchema;
+        expect(schema.safeParse({ report: completed }).success).toBe(
+          index === 1,
+        );
+        expect(
+          schema.safeParse({ report: { outcome: "completed" } }).success,
+        ).toBe(index !== 1);
+      },
+    );
+    const worker = new ClaudeSdkWorker({
+      query,
+      sessionCache: { maxPreparedStarts: 0 },
+    });
+    try {
+      for (const [index, task] of [
+        instruction,
+        semantic,
+        instruction,
+      ].entries()) {
+        await runBackend(
+          worker,
+          routine(task, {
+            id: `schema:${index}`,
+            contextKey: "schema-session",
+          }),
+          context(),
+          noopRoutineEffects(),
+          noopDiagnostics,
+        );
+        await worker.disposeRoutine({
+          arcRunId: task.arcRunId,
+          routineId: `schema:${index}`,
+        });
+      }
+      expect(query).toHaveBeenCalledOnce();
+      expect(
+        states[0]!.setMcpServers.mock.calls.map(([servers]) =>
+          Object.keys(servers),
+        ),
+      ).toEqual([[], ["arcade_internal"], [], ["arcade_internal"]]);
+    } finally {
+      await worker.stop();
+    }
+  });
+
   it("closes a completed Claude query when cancellation arrives before idle handoff", async () => {
     const task = await firstTask();
     let cancelled = false;
@@ -2610,7 +2714,7 @@ describe("ClaudeSdkWorker", () => {
     );
     expect(states[0]!.prompts[1]).toContain("private worker memory");
     expect(states[0]!.prompts[1]).toContain(
-      'pass exactly {"outcome":"completed"}',
+      "Use the report tool schema for this assignment.",
     );
     expect(states[0]!.prompts[1]).toContain(
       'Do not include code or message with outcome "completed"',
@@ -2816,13 +2920,7 @@ describe("ClaudeSdkWorker", () => {
     expect(prompt).toContain("<rules>");
     expect(prompt).toContain("</rules>");
     expect(prompt).toContain("Resolve this action semantic work.");
-    expect(prompt).toContain("Semantic report:");
-    expect(prompt).toContain(
-      'Do not call report with bare {"outcome":"completed"} for semantic work.',
-    );
-    expect(prompt).toContain(
-      '"observe:isNew":{"status":"resolved","value":true}',
-    );
+    expect(prompt).toContain("Call report using its declared schema");
     expect(prompt).not.toContain("Dialog:");
     const call = query.mock.calls[0]![0];
     expect(call.options?.cwd).toBe(workspace);
@@ -2960,6 +3058,114 @@ describe("ClaudeSdkWorker", () => {
         },
       },
     });
+  });
+
+  it("carries Struct and Struct-array observation values through a complete semantic report", async () => {
+    const workspace = join(tmpdir(), "arcade-sdk-struct-semantic");
+    await mkdir(workspace, { recursive: true });
+    const tool = {
+      type: "function" as const,
+      name: "arc_observation_1",
+      description: "Resolve observation.",
+      parameters: { type: "object" },
+      strict: true as const,
+    };
+    const stop = {
+      type: "struct" as const,
+      fields: {
+        city: { question: "which city?", meta: { type: "string" as const } },
+        nights: {
+          question: "how many nights?",
+          meta: { type: "number" as const },
+        },
+      },
+    };
+    const task: Task = {
+      kind: "semantic",
+      allowedDispositions: [],
+      batchId: "semantic:struct",
+      role: "researcher",
+      stage: "action",
+      contextIsolation: "role",
+      arcRunId: ARC_RUN_ID,
+      dialog: {
+        cursor: { user: 1, self: 0 },
+        lastTurns: [
+          { role: "user", message: "Kyoto, with two nights in Osaka." },
+        ],
+      },
+      requests: [
+        {
+          kind: "observation",
+          briefId: "observe:trip",
+          role: "researcher",
+          cell: "trip",
+          mode: "observe",
+          question: "the trip",
+          meta: {
+            type: "struct",
+            fields: {
+              destination: {
+                question: "where to?",
+                meta: { type: "string" },
+              },
+              stops: {
+                question: "which stops?",
+                meta: { type: "array", element: stop },
+              },
+            },
+          },
+          tool,
+          sourceRef: "node:test:Action",
+        },
+        {
+          kind: "observation",
+          briefId: "observe:stops",
+          role: "researcher",
+          cell: "stops",
+          mode: "observe",
+          question: "which stops?",
+          meta: { type: "array", element: stop },
+          tool: { ...tool, name: "arc_observation_2" },
+          sourceRef: "node:test:Action",
+        },
+      ],
+    };
+    const observations = {
+      "observe:trip": {
+        status: "resolved" as const,
+        value: {
+          destination: "Kyoto",
+          stops: [{ city: "Osaka", nights: 2 }],
+        },
+      },
+      "observe:stops": {
+        status: "resolved" as const,
+        value: [{ city: "Osaka", nights: 2 }],
+      },
+    };
+    const { query } = streamingQueryReturning([
+      { outcome: "completed", semantic: { observations } },
+    ]);
+    const backend = new ClaudeSdkWorker({
+      sessionCache: { enabled: false },
+      query: query as unknown as ClaudeSdkQueryFn,
+    });
+
+    await expect(
+      runBackend(
+        backend,
+        routine(task),
+        context({ workspacePath: workspace }),
+        noopRoutineEffects(),
+        noopDiagnostics,
+      ),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        outcome: "completed",
+        semantic: { observations },
+      }),
+    );
   });
 
   it("routes instruction tasks through the default worker slot", async () => {
@@ -3501,6 +3707,7 @@ async function* sdkMessages(
 type StreamingQueryState = {
   prompts: string[];
   setModel: ReturnType<typeof vi.fn>;
+  setMcpServers: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
 };
 
@@ -3519,6 +3726,10 @@ function streamingQueryReturning(
     const state: StreamingQueryState = {
       prompts: [],
       setModel: vi.fn(async () => undefined),
+      setMcpServers: vi.fn(async (servers) => {
+        params.options!.mcpServers = servers;
+        return { added: Object.keys(servers), removed: [], errors: {} };
+      }),
       close: vi.fn(),
     };
     states.push(state);
@@ -3529,9 +3740,11 @@ function streamingQueryReturning(
       beforeReport,
     ) as AsyncGenerator<unknown, void> & {
       setModel: StreamingQueryState["setModel"];
+      setMcpServers: StreamingQueryState["setMcpServers"];
       close: StreamingQueryState["close"];
     };
     generator.setModel = state.setModel;
+    generator.setMcpServers = state.setMcpServers;
     generator.close = state.close;
     return generator;
   }) as unknown as ClaudeSdkQueryFn & ReturnType<typeof vi.fn>;

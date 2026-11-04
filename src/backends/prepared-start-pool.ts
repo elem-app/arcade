@@ -1,6 +1,6 @@
 import { registerRetentionProbe } from "../utils/retention-registry.js";
 
-/** A bounded pool of task-independent provider starts, including in-flight reservations. */
+/** A bounded pool of provider starts sharing a preparation key, including in-flight reservations. */
 export class PreparedStartPool<T> {
   readonly #entries = new Set<Entry<T>>();
   #stopped = false;
@@ -10,7 +10,7 @@ export class PreparedStartPool<T> {
     private readonly options: {
       max: number;
       idleTtlMs: number;
-      start(cwd: string, abortController: AbortController): Promise<T>;
+      start(key: string, abortController: AbortController): Promise<T>;
       close(value: T): void;
       failed(error: unknown): void;
     },
@@ -25,12 +25,12 @@ export class PreparedStartPool<T> {
 
   /** Transfer one ready start to the invocation and reserve replacement capacity. */
   take(
-    cwd: string,
+    key: string,
   ): { value: T; abortController: AbortController } | undefined {
     if (this.#stopped) throw new Error("Prepared start pool is stopped.");
     let taken: { value: T; abortController: AbortController } | undefined;
     for (const entry of this.#entries) {
-      if (entry.cwd !== cwd) {
+      if (entry.key !== key) {
         this.#retire(entry);
       } else if (!taken && !entry.closed && entry.ready) {
         taken = {
@@ -44,7 +44,7 @@ export class PreparedStartPool<T> {
       }
     }
     while (this.#entries.size < Math.min(4, this.options.max))
-      this.#reserve(cwd);
+      this.#reserve(key);
     return taken;
   }
 
@@ -56,9 +56,9 @@ export class PreparedStartPool<T> {
     if (this.#cleanupFailure) throw this.#cleanupFailure;
   }
 
-  #reserve(cwd: string): void {
+  #reserve(key: string): void {
     const entry: Entry<T> = {
-      cwd,
+      key,
       abortController: new AbortController(),
       closed: false,
       settled: Promise.resolve(),
@@ -71,7 +71,7 @@ export class PreparedStartPool<T> {
     entry.settled = Promise.resolve()
       .then(() => {
         if (entry.closed) return undefined;
-        return this.options.start(cwd, entry.abortController);
+        return this.options.start(key, entry.abortController);
       })
       .then((value) => {
         if (value === undefined) return;
@@ -124,7 +124,7 @@ export class PreparedStartPool<T> {
 }
 
 type Entry<T> = {
-  cwd: string;
+  key: string;
   abortController: AbortController;
   closed: boolean;
   ready?: { value: T };

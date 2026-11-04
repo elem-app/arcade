@@ -79,13 +79,20 @@ OpenAI targets require `ARCADE_OPENAI_API_KEY`. Claude SDK targets use ambient C
 
 The `standing-guidance-instruction` and `standing-guidance-observation` cases check guidance-dependent reply formatting, audience selection, and record extraction on both general SDKs; their distinguishing policies appear only in `this.guidance`. The `standing-guidance-trigger` case checks both fast-trigger backends against conflicting action guidance: selection follows the authored trigger questions while node guidance stays outside the prompts.
 
+The `struct-observation` and `struct-array-observation` cases run on both general SDKs. They extract a complete nested record or ordered record array, branch on nested enum, boolean, numeric, and array values, write the observed fields into the selected branch's artifact, and compare the complete committed cells with the expected values. The `struct-trigger-observation` and `struct-array-trigger-observation` cases run on both fast-trigger backends, reject a nonmatching input, activate on matching nested values, and compare the complete committed cell with the expected record after activation. All four cases are in the extended tier. Their shared fixtures include Structs containing Struct arrays and Struct arrays containing nested Structs; the original field questions remain the source of extraction semantics.
+
+```sh
+pnpm eval --dry-run --targets=all --cases=struct-observation,struct-array-observation,struct-trigger-observation,struct-array-trigger-observation
+pnpm eval --targets=all --cases=struct-observation,struct-array-observation,struct-trigger-observation,struct-array-trigger-observation
+```
+
 ### Behavioral eval rules
 
 Live evals are black-box behavioral checks. Every fact that distinguishes success lives in exactly one source — the inbound message, the Arc instruction, standing guidance, or an output artifact — and the Arc source never repeats an inbound-only fact. A worker that reaches for a missing fact by asking a question is answered with a fixed non-secret answer (`FIXED_UNEXPECTED_QUESTION_ANSWER` in `eval/eval-config.ts`) that carries no task fact, so the run terminates; `trackUnexpectedQuestions` records the question and the case fails afterward. Permission asks are not questions and do not count against a case's zero-question requirement.
 
 Interaction cases state audience intent in ordinary Arc-author language. They do not name managed-worker tools, reproduce tool argument shapes, or use tool-specific trigger phrases to force the expected behavior; selecting the correct interaction tool is part of the behavior under evaluation.
 
-The deterministic unit and integration suites continue to own input integrity, prompt rendering, provider adapter mechanics, and context topology. Live cases assert observable questions, replies, selected branches, lifecycle state, and artifacts. Structured logs, routines, Work events, outbound messages, diagnostics, and artifacts are retained as failure evidence, not used to manufacture a behavioral pass.
+The deterministic unit and integration suites continue to own input integrity, prompt rendering, provider adapter mechanics, and context topology. Live cases assert observable questions, replies, selected branches, lifecycle state, committed observation values, and artifacts. Structured logs, routines, Work events, outbound messages, diagnostics, and artifacts are retained as failure evidence, not used to manufacture a behavioral pass.
 
 ### Results and evidence
 

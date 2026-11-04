@@ -1,4 +1,4 @@
-import type { ArcRef } from "@elem-app/arc/runtime";
+import type { ArcRef, ObservedStructValue, ObservedValue } from "@elem-app/arc/runtime";
 import { isArcRef } from "@elem-app/arc/runtime";
 import type { PrimitiveValue } from "@elem-app/arc/types";
 import { z } from "zod";
@@ -169,16 +169,23 @@ const PrimitiveValueSchema: z.ZodType<PrimitiveValue> = z.union([
   z.number(),
   z.boolean(),
 ]);
-const ObservedValueSchema = z.union([
-  PrimitiveValueSchema,
-  z.array(PrimitiveValueSchema),
+// A Struct record and a list of records nest observed values, so the two
+// schemas refer to each other lazily.
+const ObservedValueSchema: z.ZodType<ObservedValue> = z.lazy(() =>
+  z.union([
+    PrimitiveValueSchema,
+    z.array(PrimitiveValueSchema),
+    ObservedStructValueSchema,
+    z.array(ObservedStructValueSchema),
+  ]),
+);
+const ObservedStructValueSchema: z.ZodType<ObservedStructValue> = z.lazy(() =>
+  z.record(z.string(), ObservedValueSchema),
+);
+const ObservationOutcomeSchema = z.union([
+  z.strictObject({ status: z.literal("resolved"), value: ObservedValueSchema }),
+  z.strictObject({ status: z.enum(["unknown", "needs-user"]) }),
 ]);
-const ObservationOutcomeSchema = z
-  .strictObject({
-    status: z.enum(["resolved", "unknown", "needs-user"]),
-    value: ObservedValueSchema.optional(),
-  })
-  .superRefine(rejectExplicitUndefined("value"));
 const ObservationGroupSchema = z.strictObject({
   fields: z.record(z.string(), ObservationOutcomeSchema),
 });

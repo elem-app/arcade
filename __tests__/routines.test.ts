@@ -349,6 +349,38 @@ function Watch() {
     });
   });
 
+  it("validates observation outcomes structurally by status", () => {
+    const report = (outcome: unknown) => ({
+      outcome: "completed",
+      semantic: { observations: { "observe:trip": outcome } },
+    });
+    for (const outcome of [
+      { status: "resolved", value: "Kyoto" },
+      { status: "resolved", value: ["a", "b"] },
+      {
+        status: "resolved",
+        value: { destination: "Kyoto", stops: [{ city: "Nara", nights: 1 }] },
+      },
+      { status: "unknown" },
+      { status: "needs-user" },
+      { fields: { trip: { status: "resolved", value: { city: "Nara" } } } },
+    ]) {
+      expect(validateRoutineReport(report(outcome))).toEqual(report(outcome));
+    }
+    for (const outcome of [
+      { status: "resolved" },
+      { status: "unknown", value: "Kyoto" },
+      { status: "needs-user", value: "Kyoto" },
+      { status: "resolved", value: { destination: null } },
+      { status: "resolved", value: [{ city: "Nara" }, "Osaka"] },
+      { status: "fields", fields: {} },
+    ]) {
+      expect(() => validateRoutineReport(report(outcome))).toThrow(
+        "failed validation",
+      );
+    }
+  });
+
   it("persists backendDetails for every report variant with deterministic resume overwrite", async () => {
     const arcHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const routineStore = executionControlFor(arcHost);

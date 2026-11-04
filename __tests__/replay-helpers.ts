@@ -1,4 +1,11 @@
-import { toArcRef } from "@elem-app/arc/runtime";
+import {
+  toArcRef,
+  type ObservationMeta,
+  type ObservedStructValue,
+  type ObservedValue,
+  type ScalarObservationMeta,
+  type StructObservationMeta,
+} from "@elem-app/arc/runtime";
 import type { Document } from "@elem-app/arc/types";
 import { drainModuleEffects } from "./arc-host-helpers.js";
 import { createTestArcHost } from "./work-event-fixtures.js";
@@ -21,15 +28,6 @@ import {
 } from "../src/testing.js";
 
 type RegisterPolicy = Parameters<ArcHostService["registerArc"]>[2];
-type ScalarObservationMeta = {
-  type: "enum" | "boolean" | "rangedInt" | "number" | "string";
-  values?: string[];
-  min?: number;
-  max?: number;
-};
-type ObservationMeta =
-  | ScalarObservationMeta
-  | { type: "array"; element: ScalarObservationMeta };
 
 export const REPLAY_OWNER = "replay-owner";
 
@@ -43,13 +41,8 @@ export const answeringWorker: RoleWorker = async (task) => {
   const judgments: Record<string, boolean> = {};
   const observations: Record<
     string,
-    | { status: "resolved"; value: PrimitiveValue | PrimitiveValue[] }
-    | {
-        fields: Record<
-          string,
-          { status: "resolved"; value: PrimitiveValue | PrimitiveValue[] }
-        >;
-      }
+    | { status: "resolved"; value: ObservedValue }
+    | { fields: Record<string, { status: "resolved"; value: ObservedValue }> }
   > = {};
   for (const request of task.requests) {
     if (request.kind === "judgment") {
@@ -76,11 +69,25 @@ export const answeringWorker: RoleWorker = async (task) => {
   return { outcome: "completed", semantic: { judgments, observations } };
 };
 
-function firstAdmissibleValue(
-  meta: ObservationMeta,
-): PrimitiveValue | PrimitiveValue[] {
-  if (meta.type === "array") return [firstAdmissibleScalarValue(meta.element)];
+function firstAdmissibleValue(meta: ObservationMeta): ObservedValue {
+  if (meta.type === "array") {
+    return meta.element.type === "struct"
+      ? [firstAdmissibleStructValue(meta.element)]
+      : [firstAdmissibleScalarValue(meta.element)];
+  }
+  if (meta.type === "struct") return firstAdmissibleStructValue(meta);
   return firstAdmissibleScalarValue(meta);
+}
+
+function firstAdmissibleStructValue(
+  meta: StructObservationMeta,
+): ObservedStructValue {
+  return Object.fromEntries(
+    Object.entries(meta.fields).map(([name, field]) => [
+      name,
+      firstAdmissibleValue(field.meta),
+    ]),
+  );
 }
 
 function firstAdmissibleScalarValue(

@@ -9,7 +9,12 @@
  * text. These DTOs are not runtime state or persistence records.
  */
 
-import type { DialogTurn } from "@elem-app/arc/runtime";
+import type {
+  DialogTurn,
+  ObservationMeta,
+  ScalarObservationMeta,
+  StructObservationMeta,
+} from "@elem-app/arc/runtime";
 
 import type { RoutineContext } from "../types/routine.js";
 import type {
@@ -45,7 +50,7 @@ export type RenderedObservationRequestForPrompt = {
     SemanticRequest,
     { kind: "observation" }
   >["currentValue"];
-  meta: Extract<SemanticRequest, { kind: "observation" }>["meta"];
+  meta: RenderedObservationMetaForPrompt;
 };
 
 export type RenderedObservationGroupFieldForPrompt = {
@@ -55,7 +60,28 @@ export type RenderedObservationGroupFieldForPrompt = {
     SemanticRequest,
     { kind: "observation" }
   >["currentValue"];
-  meta: Extract<SemanticRequest, { kind: "observation" }>["meta"];
+  meta: RenderedObservationMetaForPrompt;
+};
+
+/**
+ * Observation metadata as a worker prompt shows it: the brief's metadata with
+ * every Struct field question rendered to text.
+ */
+export type RenderedObservationMetaForPrompt =
+  | ScalarObservationMeta
+  | {
+      type: "array";
+      element: ScalarObservationMeta | RenderedStructObservationMetaForPrompt;
+    }
+  | RenderedStructObservationMetaForPrompt;
+
+/** Struct observation metadata with rendered field questions. */
+export type RenderedStructObservationMetaForPrompt = {
+  type: "struct";
+  fields: Record<
+    string,
+    { question: string; meta: RenderedObservationMetaForPrompt }
+  >;
 };
 
 export type RenderedObservationGroupRequestForPrompt = {
@@ -65,80 +91,6 @@ export type RenderedObservationGroupRequestForPrompt = {
   mode: Extract<SemanticRequest, { kind: "observation-group" }>["mode"];
   fields: RenderedObservationGroupFieldForPrompt[];
 };
-
-/**
- * An admissible example value for an observation's cell type. Worker prompts
- * seed a shape-correct example report; a wrong-typed example (a boolean for a
- * string or ranged-int cell) would teach the worker to emit values the runtime
- * rejects, looping the observation back as invalid.
- */
-export function exampleObservationValue(
-  meta: Extract<SemanticRequest, { kind: "observation" }>["meta"],
-): boolean | number | string | (boolean | number | string)[] {
-  if (meta.type === "array") {
-    return [exampleScalarObservationValue(meta.element)];
-  }
-  return exampleScalarObservationValue(meta);
-}
-
-function exampleScalarObservationValue(meta: {
-  type: "boolean" | "string" | "enum" | "rangedInt" | "number";
-  values?: string[];
-  min?: number;
-  max?: number;
-}): boolean | number | string {
-  switch (meta.type) {
-    case "boolean":
-      return true;
-    case "rangedInt":
-      return meta.min ?? 0;
-    case "number":
-      return (
-        meta.min ?? (meta.max !== undefined && meta.max < 0 ? meta.max : 0)
-      );
-    case "enum":
-      return meta.values?.[0] ?? "";
-    case "string":
-      return "example";
-  }
-}
-
-/** Build one shape-correct semantic report example for a worker prompt. */
-export function semanticReportExample(
-  task: SemanticTask,
-): Record<string, unknown> {
-  const semantic: Record<string, unknown> = {};
-  const judgmentIds = task.requests
-    .filter((request) => request.kind === "judgment")
-    .map((request) => request.briefId);
-  const observations: Record<string, unknown> = {};
-  for (const request of task.requests) {
-    if (request.kind === "observation") {
-      observations[request.briefId] = {
-        status: "resolved",
-        value: exampleObservationValue(request.meta),
-      };
-    } else if (request.kind === "observation-group") {
-      observations[request.briefId] = {
-        fields: Object.fromEntries(
-          request.fields.map((field) => [
-            field.cell,
-            { status: "resolved", value: exampleObservationValue(field.meta) },
-          ]),
-        ),
-      };
-    }
-  }
-  if (judgmentIds.length > 0) {
-    semantic["judgments"] = Object.fromEntries(
-      judgmentIds.map((id) => [id, true]),
-    );
-  }
-  if (Object.keys(observations).length > 0) {
-    semantic["observations"] = observations;
-  }
-  return semantic;
-}
 
 export type RenderedSemanticRequestForPrompt =
   | RenderedJudgmentRequestForPrompt
@@ -357,7 +309,7 @@ export function renderSemanticRequestForPrompt(
         cell: field.cell,
         question: renderAgentSemanticText(field.question, context, target).text,
         currentValue: field.currentValue,
-        meta: field.meta,
+        meta: renderObservationMetaForPrompt(field.meta, context, target),
       })),
     };
   }
@@ -382,7 +334,51 @@ export function renderSemanticRequestForPrompt(
     question,
     ...guidance,
     currentValue: request.currentValue,
-    meta: request.meta,
+    meta: renderObservationMetaForPrompt(request.meta, context, target),
+  };
+}
+
+/** Renders every Struct field question in observation metadata for a target. */
+function renderObservationMetaForPrompt(
+  meta: ObservationMeta,
+  context: RoutineContext,
+  target: ArtifactPathRenderTarget,
+): RenderedObservationMetaForPrompt {
+  switch (meta.type) {
+    case "array": {
+      const element = meta.element;
+      return {
+        type: "array",
+        element:
+          element.type === "struct"
+            ? renderStructObservationMetaForPrompt(element, context, target)
+            : element,
+      };
+    }
+    case "struct":
+      return renderStructObservationMetaForPrompt(meta, context, target);
+    default:
+      return meta;
+  }
+}
+
+function renderStructObservationMetaForPrompt(
+  meta: StructObservationMeta,
+  context: RoutineContext,
+  target: ArtifactPathRenderTarget,
+): RenderedStructObservationMetaForPrompt {
+  return {
+    type: "struct",
+    fields: Object.fromEntries(
+      Object.entries(meta.fields).map(([name, field]) => [
+        name,
+        {
+          question: renderAgentSemanticText(field.question, context, target)
+            .text,
+          meta: renderObservationMetaForPrompt(field.meta, context, target),
+        },
+      ]),
+    ),
   };
 }
 

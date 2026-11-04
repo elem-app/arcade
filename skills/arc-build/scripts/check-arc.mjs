@@ -5702,6 +5702,18 @@ function cloneParameterSpec(spec2) {
 function isObservableCellSpec(spec2) {
   return spec2.type !== "dialogCursor" && spec2.type !== "artifact" && (spec2.type !== "array" || spec2.element.type !== "artifact");
 }
+function isObservableFieldSpec(spec2) {
+  switch (spec2.type) {
+    case "artifact":
+    case "dialogCursor":
+    case "index":
+      return false;
+    case "array":
+      return spec2.element.type !== "artifact";
+    default:
+      return true;
+  }
+}
 function isSettableCellSpec(spec2) {
   return isObservableCellSpec(spec2) || spec2.type === "array" || spec2.type === "dialogCursor" || spec2.type === "artifact";
 }
@@ -5724,9 +5736,55 @@ function cellSpecToChannelSpec(spec2) {
         type: "array",
         element: arrayElementSpecToChannelSpec(spec2.element)
       };
+    case "struct":
+      return structSpecOf(spec2);
+  }
+}
+function fieldAtPath(struct, path, asStruct) {
+  let fields = struct.fields;
+  let field;
+  for (const [depth, name2] of path.entries()) {
+    if (depth > 0) {
+      const nested = asStruct(field);
+      if (!nested)
+        return void 0;
+      fields = nested.fields;
+    }
+    if (!Object.hasOwn(fields, name2))
+      return void 0;
+    field = fields[name2];
+  }
+  return field;
+}
+function fieldSpecAt(spec2, path) {
+  return fieldAtPath(spec2, path, (field) => field.type === "struct" ? field : void 0);
+}
+function structSpecOf(spec2) {
+  return {
+    type: "struct",
+    fields: Object.fromEntries(Object.entries(spec2.fields).map(([name2, field]) => [
+      name2,
+      fieldSpecOf(field)
+    ]))
+  };
+}
+function fieldSpecOf(spec2) {
+  switch (spec2.type) {
+    case "struct":
+      return structSpecOf(spec2);
+    case "array":
+      return { type: "array", element: observableElementSpecOf(spec2.element) };
+    default:
+      return scalarSpecOf(spec2);
   }
 }
 function arrayElementSpecToChannelSpec(spec2) {
+  return spec2.type === "artifact" ? { type: "artifact" } : observableElementSpecOf(spec2);
+}
+function observableElementSpecOf(spec2) {
+  return spec2.type === "struct" ? structSpecOf(spec2) : scalarSpecOf(spec2);
+}
+function scalarSpecOf(spec2) {
   switch (spec2.type) {
     case "boolean":
       return { type: "boolean" };
@@ -5736,8 +5794,6 @@ function arrayElementSpecToChannelSpec(spec2) {
       return { type: "enum", values: spec2.values };
     case "number":
       return { type: "number" };
-    case "artifact":
-      return { type: "artifact" };
   }
 }
 
@@ -5813,6 +5869,13 @@ function isArtifactValue(value) {
 }
 
 // node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/value-utils.js
+function isPlainRecord(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
 function firstInvalidPayloadValue(value, path = "$") {
   try {
     return firstInvalidPayloadValueShape(value, path, true);
@@ -6020,7 +6083,35 @@ function admitValue(spec2, value, path = "$") {
     }
     case "dialogCursor":
       return isDialogCursorValue(value) ? admitted(value) : violation("invalid-dialog-cursor", "A valid Dialog cursor is required", path);
+    case "struct":
+      return admitStructValue(spec2, value, path);
   }
+}
+function admitStructValue(spec2, value, path) {
+  const carrierIssue = firstInvalidPayloadValue(value, path);
+  if (carrierIssue) {
+    return violation("invalid-struct", carrierIssue.detail, carrierIssue.path);
+  }
+  if (!isPlainRecord(value)) {
+    return violation("invalid-struct", "A Struct record is required", path);
+  }
+  for (const key of Object.keys(value)) {
+    if (!Object.hasOwn(spec2.fields, key)) {
+      return violation("invalid-struct", "Struct value contains an undeclared field", `${path}[${JSON.stringify(key)}]`);
+    }
+  }
+  const fields = {};
+  for (const [name2, field] of Object.entries(spec2.fields)) {
+    const fieldPath2 = `${path}[${JSON.stringify(name2)}]`;
+    if (!Object.hasOwn(value, name2)) {
+      return violation("invalid-struct", "Struct value is missing a declared field", fieldPath2);
+    }
+    const result = admitValue(field, value[name2], fieldPath2);
+    if (!result.admitted)
+      return result;
+    fields[name2] = result.value;
+  }
+  return admitted(fields);
 }
 function admitted(value) {
   return { admitted: true, value };
@@ -6084,7 +6175,14 @@ function reusableSpecCompatible(provider, receiver) {
   if (provider.type === "array" && receiver.type === "array") {
     return reusableSpecCompatible(provider.element, receiver.element);
   }
+  if (provider.type === "struct" && receiver.type === "struct") {
+    return sameFieldNames(provider.fields, receiver.fields) && Object.entries(provider.fields).every(([name2, field]) => reusableSpecCompatible(field, receiver.fields[name2]));
+  }
   return true;
+}
+function sameFieldNames(left, right) {
+  const leftNames = Object.keys(left);
+  return leftNames.length === Object.keys(right).length && leftNames.every((name2) => Object.hasOwn(right, name2));
 }
 function judgeSpecLanding(source, destination) {
   if (reusableSpecCompatible(source, destination))
@@ -6098,6 +6196,11 @@ function judgeSpecLanding(source, destination) {
   }
   if (source.type === "array" && destination.type === "array") {
     return judgeSpecLanding(source.element, destination.element);
+  }
+  if (source.type === "struct" && destination.type === "struct") {
+    if (!sameFieldNames(source.fields, destination.fields))
+      return INCOMPATIBLE;
+    return reduceAlternativeJudgments(Object.entries(source.fields).map(([name2, field]) => judgeSpecLanding(field, destination.fields[name2])));
   }
   return INCOMPATIBLE;
 }
@@ -6116,10 +6219,22 @@ function resolveProducer(expression, context) {
       const spec2 = context.signature?.[expression.namespace][expression.key];
       return spec2 ? { kind: "fact", fact: { kind: "site", spec: spec2 } } : { kind: "dynamic" };
     }
+    case "field": {
+      const spec2 = resolveReferenceSpec(expression, context);
+      return spec2 ? { kind: "fact", fact: { kind: "site", spec: spec2 } } : { kind: "dynamic" };
+    }
     case "arrayElementRead": {
       const spec2 = resolveArrayElementSpec(expression.array, context);
       return spec2 ? { kind: "fact", fact: { kind: "site", spec: spec2 } } : { kind: "dynamic" };
     }
+    case "structLiteral":
+      return {
+        kind: "struct",
+        fields: Object.fromEntries(Object.entries(expression.fields).map(([name2, field]) => [
+          name2,
+          resolveProducer(field, context)
+        ]))
+      };
     case "span":
       if (expression.key === "index") {
         return {
@@ -6219,8 +6334,35 @@ function judgeHostArgument(argument, destination, context) {
   if (destination.type === "semanticText") {
     return stringOperandRule.checkProducer(argument.value, context);
   }
+  if (destination.type === "struct") {
+    return judgeHostStructValue(resolveProducer(argument.value, context), destination);
+  }
   const channelSpec = hostParameterChannelSpec(destination);
   return channelSpec ? judgeProducerLanding(resolveProducer(argument.value, context), channelSpec) : { kind: "incompatible" };
+}
+function judgeHostStructValue(evidence, destination) {
+  if (evidence.kind === "dynamic")
+    return { kind: "unknown" };
+  if (evidence.kind === "alternatives") {
+    return reduceAlternativeJudgments(evidence.alternatives.map((alternative) => judgeHostStructValue(alternative, destination)));
+  }
+  const fields = evidence.kind === "struct" ? evidence.fields : evidence.kind === "fact" && evidence.fact.kind === "site" && evidence.fact.spec.type === "struct" ? Object.fromEntries(Object.entries(evidence.fact.spec.fields).map(([name2, spec2]) => [
+    name2,
+    { kind: "fact", fact: { kind: "site", spec: spec2 } }
+  ])) : void 0;
+  if (!fields)
+    return { kind: "incompatible" };
+  if (Object.keys(fields).some((name2) => !Object.hasOwn(destination.fields, name2)) || Object.entries(destination.fields).some(([name2, field]) => field.type !== "omittable" && !Object.hasOwn(fields, name2))) {
+    return { kind: "incompatible" };
+  }
+  return reduceAlternativeJudgments(Object.entries(fields).map(([name2, field]) => {
+    const fieldSpec = hostParameterValueSpec(destination.fields[name2]);
+    if (fieldSpec.type === "struct") {
+      return judgeHostStructValue(field, fieldSpec);
+    }
+    const channelSpec = hostParameterChannelSpec(fieldSpec);
+    return channelSpec ? judgeProducerLanding(field, channelSpec) : { kind: "incompatible" };
+  }));
 }
 function judgeProducerLanding(evidence, destination) {
   switch (evidence.kind) {
@@ -6229,8 +6371,9 @@ function judgeProducerLanding(evidence, destination) {
     case "dynamic":
       return judgeOneTimeLanding(void 0, destination);
     case "unusable":
-    case "struct":
       return { kind: "incompatible" };
+    case "struct":
+      return judgeStructEvidenceLanding(evidence, destination);
     case "alternatives":
       return reduceAlternativeJudgments(evidence.alternatives.map((alternative) => judgeProducerLanding(alternative, destination)));
     case "array":
@@ -6238,6 +6381,17 @@ function judgeProducerLanding(evidence, destination) {
         return { kind: "incompatible" };
       return reduceAlternativeJudgments(evidence.elements.map((element) => judgeProducerLanding(element, destination.element)));
   }
+}
+function judgeStructEvidenceLanding(evidence, destination) {
+  if (destination.type !== "struct" || !evidence.fields) {
+    return { kind: "incompatible" };
+  }
+  const fields = evidence.fields;
+  const names = Object.keys(fields);
+  if (names.some((name2) => !Object.hasOwn(destination.fields, name2)) || Object.keys(destination.fields).some((name2) => !Object.hasOwn(fields, name2))) {
+    return { kind: "incompatible" };
+  }
+  return reduceAlternativeJudgments(names.map((name2) => judgeProducerLanding(fields[name2], destination.fields[name2])));
 }
 function producerGuaranteesArtifact(evidence) {
   switch (evidence.kind) {
@@ -6367,6 +6521,8 @@ var comparisonRule = {
         return isArtifactValue(left) && isArtifactValue(right) ? operationAdmitted({ left, right }) : operationViolation("invalid-artifact-value", "Artifact equality requires valid Artifact values");
       case "array":
         return admitArrayComparisonValues(decision2.arrayElementFamily, left, right);
+      case "struct":
+        return isPlainRecord(left) && isPlainRecord(right) ? operationAdmitted({ left, right }) : operationViolation("invalid-struct-comparison", "Struct equality requires Struct operands");
       case "dynamic":
         if (Array.isArray(left) || Array.isArray(right)) {
           return admitArrayComparisonValues(void 0, left, right);
@@ -6421,14 +6577,27 @@ function decideComparison(op, left, right) {
     if (elementFamilies.size > 1) {
       return decision("incompatible", "array");
     }
-    const arrayElementFamily = elementFamilies.values().next().value;
+    const arrayElementFamily2 = elementFamilies.values().next().value;
+    if (arrayElementFamily2 !== void 0 && !isArrayComparisonFamily(arrayElementFamily2)) {
+      return decision("incompatible", "array");
+    }
+    if (arrayElementFamily2 === "struct") {
+      return {
+        judgment: judgeStructArrayEquality(left, right),
+        mode: "array",
+        arrayElementFamily: arrayElementFamily2
+      };
+    }
     const judgment = reduceAlternativeJudgments([
-      judgeArrayEvidence(left, arrayElementFamily),
-      judgeArrayEvidence(right, arrayElementFamily)
+      judgeArrayEvidence(left, arrayElementFamily2),
+      judgeArrayEvidence(right, arrayElementFamily2)
     ]);
-    return { judgment, mode: "array", arrayElementFamily };
+    return { judgment, mode: "array", arrayElementFamily: arrayElementFamily2 };
   }
-  if (known === "dialog-cursor" || known === "struct" || known === "unusable") {
+  if (known === "struct") {
+    return ordering ? decision("incompatible", "struct") : { judgment: judgeStructEquality(left, right), mode: "struct" };
+  }
+  if (known === "dialog-cursor" || known === "unusable") {
     return decision("incompatible", "dynamic");
   }
   if (known === "boolean") {
@@ -6458,6 +6627,81 @@ function decideComparison(op, left, right) {
 }
 function decision(kind, mode) {
   return { judgment: { kind }, mode };
+}
+function judgeStructEquality(left, right) {
+  if (left.kind === "alternatives") {
+    return reduceAlternativeJudgments(left.alternatives.map((alternative) => judgeStructEquality(alternative, right)));
+  }
+  if (right.kind === "alternatives") {
+    return reduceAlternativeJudgments(right.alternatives.map((alternative) => judgeStructEquality(left, alternative)));
+  }
+  const leftFields = structOperandFields(left);
+  const rightFields = structOperandFields(right);
+  if (leftFields === void 0 || rightFields === void 0) {
+    return INCOMPATIBLE;
+  }
+  if (leftFields === "dynamic" || rightFields === "dynamic")
+    return UNKNOWN;
+  const names = Object.keys(leftFields);
+  if (names.length !== Object.keys(rightFields).length || names.some((name2) => !Object.hasOwn(rightFields, name2))) {
+    return INCOMPATIBLE;
+  }
+  return reduceAlternativeJudgments(names.map((name2) => decideComparison("==", leftFields[name2], rightFields[name2]).judgment));
+}
+function structOperandFields(evidence) {
+  switch (evidence.kind) {
+    case "struct":
+      return evidence.fields ?? "dynamic";
+    case "dynamic":
+      return "dynamic";
+    case "fact":
+      return evidence.fact.kind === "site" && evidence.fact.spec.type === "struct" ? Object.fromEntries(Object.entries(evidence.fact.spec.fields).map(([name2, spec2]) => [
+        name2,
+        { kind: "fact", fact: { kind: "site", spec: spec2 } }
+      ])) : void 0;
+    case "array":
+    case "unusable":
+      return void 0;
+  }
+}
+function judgeStructArrayEquality(left, right) {
+  const [first, ...rest] = [
+    ...arrayElementEvidence(left),
+    ...arrayElementEvidence(right)
+  ];
+  if (!first)
+    return COMPATIBLE;
+  return reduceAlternativeJudgments(rest.map((element) => judgeStructEquality(first, element)));
+}
+function arrayElementEvidence(evidence) {
+  switch (evidence.kind) {
+    case "array":
+      return evidence.elements;
+    case "alternatives":
+      return evidence.alternatives.flatMap(arrayElementEvidence);
+    case "dynamic":
+      return [evidence];
+    case "struct":
+    case "unusable":
+      return [{ kind: "unusable" }];
+    case "fact": {
+      const fact = evidence.fact;
+      if (fact.kind === "empty-array")
+        return [];
+      if (fact.kind === "array") {
+        return fact.elements.map((element) => ({
+          kind: "fact",
+          fact: element
+        }));
+      }
+      if (fact.kind === "site" && fact.spec.type === "array") {
+        return [
+          { kind: "fact", fact: { kind: "site", spec: fact.spec.element } }
+        ];
+      }
+      return [{ kind: "unusable" }];
+    }
+  }
 }
 function stableFamily(evidence) {
   switch (evidence.kind) {
@@ -6505,6 +6749,8 @@ function stableFamily(evidence) {
           return "dialog-cursor";
         case "array":
           return "array";
+        case "struct":
+          return "struct";
       }
     }
   }
@@ -6523,7 +6769,7 @@ function collectArrayElementFamilies(evidence, families) {
       return;
     case "fact":
       if (evidence.fact.kind === "site" && evidence.fact.spec.type === "array") {
-        families.add(arrayComparisonFamily(evidence.fact.spec.element));
+        families.add(arrayElementFamily(evidence.fact.spec.element));
       } else if (evidence.fact.kind === "array") {
         for (const element of evidence.fact.elements) {
           collectScalarComparisonFamilies({ kind: "fact", fact: element }, families);
@@ -6544,9 +6790,8 @@ function collectScalarComparisonFamilies(evidence, families) {
     return;
   }
   const family = stableFamily(evidence);
-  if (family === "boolean" || family === "string" || family === "number" || family === "artifact") {
+  if (isArrayComparisonFamily(family))
     families.add(family);
-  }
 }
 function judgeArrayEvidence(evidence, elementFamily) {
   switch (evidence.kind) {
@@ -6564,7 +6809,7 @@ function judgeArrayEvidence(evidence, elementFamily) {
         return reduceAlternativeJudgments(evidence.fact.elements.map((element) => judgeScalarComparisonEvidence({ kind: "fact", fact: element }, elementFamily)));
       }
       if (evidence.fact.kind === "site" && evidence.fact.spec.type === "array") {
-        const family = arrayComparisonFamily(evidence.fact.spec.element);
+        const family = arrayElementFamily(evidence.fact.spec.element);
         return elementFamily === void 0 || family === elementFamily ? { kind: "compatible" } : { kind: "incompatible" };
       }
       return { kind: "incompatible" };
@@ -6584,8 +6829,11 @@ function judgeScalarComparisonEvidence(evidence, family) {
   const stable = stableFamily(evidence);
   return stable === "boolean" || stable === "string" || stable === "number" || stable === "artifact" ? { kind: "compatible" } : { kind: "incompatible" };
 }
-function arrayComparisonFamily(spec2) {
+function arrayElementFamily(spec2) {
   return spec2.type === "enum" ? "string" : spec2.type;
+}
+function isArrayComparisonFamily(family) {
+  return family === "boolean" || family === "string" || family === "number" || family === "artifact" || family === "struct";
 }
 function judgeFamily(evidence, family) {
   switch (evidence.kind) {
@@ -6600,6 +6848,9 @@ function judgeFamily(evidence, family) {
 function admitArrayComparisonValues(elementFamily, left, right) {
   if (!Array.isArray(left) || !Array.isArray(right)) {
     return operationViolation("invalid-array-operation", "Array equality requires array operands");
+  }
+  if (elementFamily === "struct") {
+    return left.every(isPlainRecord) && right.every(isPlainRecord) ? operationAdmitted({ left, right }) : operationViolation("invalid-array-operation", "Struct array equality requires Struct elements");
   }
   if (elementFamily === "artifact") {
     const spec3 = {
@@ -6823,12 +7074,35 @@ function producerMayProduceArtifact(evidence) {
   }
 }
 function resolveArrayElementSpec(reference, context) {
+  const spec2 = resolveReferenceSpec(reference, context);
+  return spec2?.type === "array" ? spec2.element : void 0;
+}
+function resolveReferenceSpec(reference, context) {
   if (reference.kind === "channel") {
-    const spec2 = context.signature?.[reference.namespace][reference.key];
-    return spec2?.type === "array" ? spec2.element : void 0;
+    return context.signature?.[reference.namespace][reference.key];
   }
-  const cell = findCell(context, reference.name);
-  return cell?.type === "array" ? cell.element : void 0;
+  if (reference.kind === "cell") {
+    const cell = findCell(context, reference.name);
+    return cell ? cellSpecToChannelSpec(cell) : void 0;
+  }
+  const receiver = resolveReceiverSpec(reference.receiver, context);
+  if (receiver?.type !== "struct")
+    return void 0;
+  const field = fieldSpecAt(receiver, reference.path);
+  return field ? fieldSpecOf(field) : void 0;
+}
+function resolveReceiverSpec(receiver, context) {
+  switch (receiver.kind) {
+    case "cell":
+    case "channel":
+      return resolveReferenceSpec(receiver, context);
+    case "arrayElementRead": {
+      const array2 = resolveReferenceSpec(receiver.array, context);
+      return array2?.type === "array" ? array2.element : void 0;
+    }
+    case "span":
+      return context.map?.receiverSpec;
+  }
 }
 function findCell(context, name2) {
   const resolved = context.resolveCell?.(name2);
@@ -6842,8 +7116,26 @@ function findCell(context, name2) {
   return void 0;
 }
 
+// node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/spec/struct.js
+function isStructFieldName(name2) {
+  return isHostStructFieldName(name2) && !name2.startsWith("$") && name2 !== "isUnset";
+}
+
 // node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/types/parser.js
 var UNSTAMPED_ID = "";
+function observingQuestions(declaration) {
+  switch (declaration.type) {
+    case "array":
+      return observingQuestions(declaration.element);
+    case "struct":
+      return [
+        ...declaration.observing ? [declaration.observing] : [],
+        ...Object.values(declaration.fields).flatMap(observingQuestions)
+      ];
+    default:
+      return declaration.observing ? [declaration.observing] : [];
+  }
+}
 function isObservableCell(cell) {
   return isObservableCellSpec(cell);
 }
@@ -6851,7 +7143,17 @@ function isArrayCell(cell) {
   return cell.type === "array";
 }
 function isScalarObservableCell(cell) {
-  return isObservableCell(cell) && cell.type !== "array";
+  return isObservableCell(cell) && cell.type !== "array" && cell.type !== "struct";
+}
+function mapResultsCell(target2) {
+  if (typeof target2 === "string")
+    return target2;
+  return target2.receiver.kind === "cell" ? target2.receiver.name : void 0;
+}
+function mapResultsLabel(target2) {
+  if (typeof target2 === "string")
+    return target2;
+  return [mapResultsCell(target2) ?? "", ...target2.path].join(".");
 }
 function isValueExpressionCell(cell) {
   return isObservableCell(cell) || cell.type === "array" || cell.type === "dialogCursor" || cell.type === "artifact";
@@ -6923,6 +7225,131 @@ function targetLabel(mode) {
 }
 
 // node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/parser/ast.js
+var declarationScope = [];
+var mapItemScope = [];
+function withDeclarationScope(frame, body2) {
+  declarationScope = [...declarationScope, frame];
+  try {
+    return body2();
+  } finally {
+    declarationScope = declarationScope.slice(0, -1);
+  }
+}
+function withMapItemScope(element, body2) {
+  mapItemScope = [...mapItemScope, element];
+  try {
+    return body2();
+  } finally {
+    mapItemScope = mapItemScope.slice(0, -1);
+  }
+}
+function resetDeclarationScope() {
+  declarationScope = [];
+  mapItemScope = [];
+}
+function scopedSlotSpec(reference) {
+  if (reference.kind === "channel") {
+    return declarationScope.at(-1)?.signature?.[reference.namespace][reference.key];
+  }
+  for (let index = declarationScope.length - 1; index >= 0; index -= 1) {
+    const cell = declarationScope[index].cells.get(reference.name);
+    if (cell)
+      return cell;
+  }
+  return void 0;
+}
+function scopedReceiverSpec(receiver) {
+  switch (receiver.kind) {
+    case "cell":
+    case "channel":
+      return scopedSlotSpec(receiver);
+    case "arrayElementRead": {
+      const array2 = scopedReferenceSpec(receiver.array);
+      return array2?.type === "array" ? array2.element : void 0;
+    }
+    case "span":
+      return mapItemScope.at(-1);
+  }
+}
+function scopedReferenceSpec(reference) {
+  if (reference.kind !== "field")
+    return scopedSlotSpec(reference);
+  const receiver = scopedReceiverSpec(reference.receiver);
+  return receiver?.type === "struct" ? fieldSpecAt(receiver, reference.path) : void 0;
+}
+function parseSlotReference(node2, availableHostModules) {
+  if (node2.type === "Identifier") {
+    if (availableHostModules.has(node2.name))
+      return void 0;
+    return { kind: "cell", name: node2.name };
+  }
+  if (node2.type === "MemberExpression" && !node2.computed && node2.object.type === "Identifier" && (node2.object.name === "args" || node2.object.name === "returns") && node2.property.type === "Identifier") {
+    return {
+      kind: "channel",
+      namespace: node2.object.name,
+      key: node2.property.name
+    };
+  }
+  return void 0;
+}
+function parseFieldReference(node2, availableHostModules, context) {
+  if (node2.type !== "MemberExpression" || node2.object.type === "Super") {
+    return void 0;
+  }
+  const name2 = staticFieldName(node2);
+  if (name2 === void 0)
+    return void 0;
+  const object = node2.object;
+  const parent = parseFieldReference(object, availableHostModules, context) ?? parseSlotReference(object, availableHostModules) ?? parseElementReceiver(object, availableHostModules, context);
+  if (!parent)
+    return void 0;
+  const receiverSpec = parent.kind === "field" ? scopedReferenceSpec(parent) : scopedReceiverSpec(parent);
+  if (receiverSpec?.type !== "struct")
+    return void 0;
+  if (!Object.hasOwn(receiverSpec.fields, name2)) {
+    throw new Error(`Struct ${formatReference(parent)} has no declared field ${JSON.stringify(name2)}`);
+  }
+  return parent.kind === "field" ? { kind: "field", receiver: parent.receiver, path: [...parent.path, name2] } : { kind: "field", receiver: parent, path: [name2] };
+}
+function parseElementReceiver(node2, availableHostModules, context) {
+  if (node2.type !== "MemberExpression" || node2.object.type === "Super") {
+    return void 0;
+  }
+  if (!node2.computed && node2.object.type === "Identifier" && node2.object.name === "span" && node2.property.type === "Identifier" && node2.property.name === "item") {
+    return { kind: "span", owner: "map", key: "item" };
+  }
+  if (!node2.computed || node2.property.type === "PrivateIdentifier") {
+    return void 0;
+  }
+  const array2 = parseArrayReference(node2.object, availableHostModules, context);
+  if (!array2)
+    return void 0;
+  return {
+    kind: "arrayElementRead",
+    array: array2,
+    index: expressionToLocalExpression(node2.property, availableHostModules, void 0, context)
+  };
+}
+function staticFieldName(node2) {
+  if (!node2.computed) {
+    return node2.property.type === "Identifier" ? node2.property.name : void 0;
+  }
+  return node2.property.type === "Literal" && typeof node2.property.value === "string" ? node2.property.value : void 0;
+}
+function formatReference(reference) {
+  switch (reference.kind) {
+    case "field":
+      return [formatReference(reference.receiver), ...reference.path].join(".");
+    case "cell":
+      return reference.name;
+    case "channel":
+      return `${reference.namespace}.${reference.key}`;
+    case "arrayElementRead":
+      return `${formatReference(reference.array)}[...]`;
+    case "span":
+      return "span.item";
+  }
+}
 function getName(node2) {
   if (node2?.type !== "Identifier")
     return void 0;
@@ -7016,6 +7443,9 @@ function expressionToLocalExpression(node2, availableHostModules = /* @__PURE__ 
     };
   }
   if (node2.type === "MemberExpression") {
+    const field = parseFieldReference(node2, availableHostModules, context);
+    if (field)
+      return field;
     if (node2.computed) {
       const array2 = parseArrayReference(node2.object, availableHostModules);
       if (!array2) {
@@ -7118,20 +7548,8 @@ function parseCellTarget(node2, availableHostModules = /* @__PURE__ */ new Map()
     expressionToLocalExpression(node2.property, availableHostModules, true, context)
   ];
 }
-function parseArrayReference(node2, availableHostModules) {
-  if (node2.type === "Identifier") {
-    if (availableHostModules.has(node2.name))
-      return void 0;
-    return { kind: "cell", name: node2.name };
-  }
-  if (node2.type === "MemberExpression" && !node2.computed && node2.object.type === "Identifier" && (node2.object.name === "args" || node2.object.name === "returns") && node2.property.type === "Identifier") {
-    return {
-      kind: "channel",
-      namespace: node2.object.name,
-      key: node2.property.name
-    };
-  }
-  return void 0;
+function parseArrayReference(node2, availableHostModules, context) {
+  return parseFieldReference(node2, availableHostModules, context) ?? parseSlotReference(node2, availableHostModules);
 }
 function parseExpression(node2, availableHostModules = /* @__PURE__ */ new Map(), briefable, context) {
   if (node2.type === "TemplateLiteral") {
@@ -7155,6 +7573,9 @@ function parseExpression(node2, availableHostModules = /* @__PURE__ */ new Map()
         return parseExpression(element, availableHostModules, briefable, context);
       })
     };
+  }
+  if (node2.type === "ObjectExpression") {
+    return parseStructLiteral(node2, availableHostModules, briefable, context);
   }
   if (node2.type === "LogicalExpression") {
     if (node2.operator !== "&&" && node2.operator !== "||") {
@@ -7233,6 +7654,12 @@ function parseExpression(node2, availableHostModules = /* @__PURE__ */ new Map()
         kind: "isUnset",
         cell: node2.callee.object.name
       };
+    }
+    if (node2.callee.type === "MemberExpression" && !node2.callee.computed && node2.callee.property.type === "Identifier" && node2.callee.property.name === "isUnset" && node2.callee.object.type === "MemberExpression") {
+      const field = parseFieldReference(node2.callee.object, availableHostModules);
+      if (field) {
+        throw new Error("isUnset() applies to a whole cell; a Struct field is set exactly when its Struct is set");
+      }
     }
     if (node2.callee.type === "MemberExpression" && !node2.callee.computed && node2.callee.object.type === "MemberExpression" && !node2.callee.object.computed && node2.callee.object.object.type === "Identifier" && (node2.callee.object.object.name === "args" || node2.callee.object.object.name === "returns") && node2.callee.object.property.type === "Identifier" && node2.callee.property.type === "Identifier" && node2.callee.property.name === "isUnset") {
       if (node2.arguments.length !== 0) {
@@ -7322,6 +7749,32 @@ function parseExpression(node2, availableHostModules = /* @__PURE__ */ new Map()
     }
   }
   return expressionToLocalExpression(node2, availableHostModules, briefable, context);
+}
+function parseStructLiteral(node2, availableHostModules, briefable, context) {
+  const fields = {};
+  for (const property of node2.properties) {
+    if (property.type === "SpreadElement") {
+      throw new Error("Struct values do not support spread");
+    }
+    if (property.computed) {
+      throw new Error("Struct values do not support computed keys");
+    }
+    if (property.kind !== "init" || property.method) {
+      throw new Error("Struct values require data properties");
+    }
+    const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" && typeof property.key.value === "string" ? property.key.value : void 0;
+    if (key === void 0) {
+      throw new Error("Struct values require identifier or string keys");
+    }
+    if (!isStructFieldName(key)) {
+      throw new Error(`Invalid Struct field name ${JSON.stringify(key)}`);
+    }
+    if (Object.hasOwn(fields, key)) {
+      throw new Error(`Duplicate Struct field ${JSON.stringify(key)}`);
+    }
+    fields[key] = parseExpression(property.value, availableHostModules, briefable, context);
+  }
+  return { kind: "structLiteral", fields };
 }
 function parseArtifactConstructCall(call, owner, availableHostModules, briefable, context) {
   if (call.arguments.length !== 1) {
@@ -7525,6 +7978,8 @@ function containsBriefableExpression(expression) {
       return containsBriefableExpression(expression.index);
     case "arrayLiteral":
       return expression.elements.some((element) => containsBriefableExpression(element));
+    case "structLiteral":
+      return Object.values(expression.fields).some((field) => containsBriefableExpression(field));
     default:
       return false;
   }
@@ -7740,8 +8195,8 @@ function validateHostParameterSpec(value, path, context, issues, state) {
         const element = inspectHostSpecObject(object.element, `${path}.element`, issues);
         if (!element)
           return;
-        if (element.type !== "boolean" && element.type !== "string" && element.type !== "enum" && element.type !== "number" && element.type !== "artifact") {
-          hostSpecIssue(issues, `${path}.element`, "result array element must be a scalar or Artifact Arc spec");
+        if (element.type !== "boolean" && element.type !== "string" && element.type !== "enum" && element.type !== "number" && element.type !== "artifact" && element.type !== "struct") {
+          hostSpecIssue(issues, `${path}.element`, "result array element must be a scalar, Artifact, or Struct Arc spec");
           return;
         }
         validateHostParameterSpec(object.element, `${path}.element`, "result", issues, state);
@@ -7763,12 +8218,12 @@ function validateHostParameterSpec(value, path, context, issues, state) {
       return;
     }
     if (type === "struct") {
-      if (context === "result") {
-        hostSpecIssue(issues, path, "struct specs are parameter-only");
-        return;
-      }
       if (!exactHostSpecKeys(object, ["type", "fields"], path, issues))
         return;
+      if (context === "result") {
+        validateHostStructResultSpec(object, path, issues, state);
+        return;
+      }
       const fields = inspectHostSpecObject(object.fields, `${path}.fields`, issues);
       if (!fields)
         return;
@@ -7813,6 +8268,27 @@ function validateHostParameterSpec(value, path, context, issues, state) {
       hostSpecIssue(issues, path, violation2.detail);
   } finally {
     state.visiting.delete(object);
+  }
+}
+function validateHostStructResultSpec(object, path, issues, state) {
+  const fields = inspectHostSpecObject(object.fields, `${path}.fields`, issues);
+  if (!fields)
+    return;
+  for (const [name2, field] of Object.entries(fields)) {
+    const fieldPath2 = `${path}.fields[${JSON.stringify(name2)}]`;
+    if (!isStructFieldName(name2)) {
+      hostSpecIssue(issues, fieldPath2, "invalid Struct result field name");
+      continue;
+    }
+    const fieldObject = inspectHostSpecObject(field, fieldPath2, issues);
+    if (!fieldObject)
+      continue;
+    const elementType = fieldObject.type === "array" && isPlainRecord(fieldObject.element) ? fieldObject.element.type : void 0;
+    if (fieldObject.type === "artifact" || fieldObject.type === "dialogCursor" || fieldObject.type === "index" || fieldObject.type === "omittable" || elementType === "artifact") {
+      hostSpecIssue(issues, fieldPath2, "Struct result fields must be observable scalars, observable arrays, or Structs");
+      continue;
+    }
+    validateHostParameterSpec(field, fieldPath2, "result", issues, state);
   }
 }
 function enterHostSpecObject(object, path, issues, state) {
@@ -7916,13 +8392,16 @@ function validateSpec(spec2) {
     if (elementViolation)
       return elementViolation;
     const elementType = object.element.type;
-    if (elementType !== "boolean" && elementType !== "string" && elementType !== "enum" && elementType !== "number" && elementType !== "artifact") {
+    if (elementType !== "boolean" && elementType !== "string" && elementType !== "enum" && elementType !== "number" && elementType !== "artifact" && elementType !== "struct") {
       return {
         code: "invalid-spec-shape",
-        detail: "Array element spec must be scalar or Artifact"
+        detail: "Array element spec must be scalar, Artifact, or Struct"
       };
     }
     return void 0;
+  }
+  if (object.type === "struct") {
+    return validateStructSpec(object);
   }
   if (object.type === "enum") {
     if (!Array.isArray(object.values) || object.values.some((value) => typeof value !== "string")) {
@@ -7951,6 +8430,36 @@ function validateSpec(spec2) {
       code: "invalid-spec-shape",
       detail: `Unsupported spec type ${JSON.stringify(object.type)}`
     };
+  }
+  return void 0;
+}
+function validateStructSpec(object) {
+  const fields = object.fields;
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+    return {
+      code: "invalid-spec-shape",
+      detail: "Struct spec requires a fields record"
+    };
+  }
+  for (const [name2, field] of Object.entries(fields)) {
+    if (!isStructFieldName(name2)) {
+      return {
+        code: "invalid-spec-shape",
+        detail: `Invalid Struct field name ${JSON.stringify(name2)}`
+      };
+    }
+    const violation2 = validateSpec(field);
+    if (violation2)
+      return violation2;
+    if (!isPlainRecord(field))
+      continue;
+    const elementType = field.type === "array" && isPlainRecord(field.element) ? field.element.type : void 0;
+    if (field.type === "artifact" || field.type === "dialogCursor" || field.type === "index" || elementType === "artifact") {
+      return {
+        code: "invalid-spec-shape",
+        detail: `Struct field ${JSON.stringify(name2)} must be observable`
+      };
+    }
   }
   return void 0;
 }
@@ -8079,7 +8588,7 @@ var target = record({
   imported: boolean,
   mode: coded(oneOf("canonical", "forgetful", "newcopy"), "INVALID_TARGET_MODE")
 });
-var arrayReference = variants("kind", {
+var slotReferenceRules = {
   cell: record({
     kind: oneOf("cell"),
     name
@@ -8089,7 +8598,36 @@ var arrayReference = variants("kind", {
     namespace: oneOf("args", "returns"),
     key: name
   })
+};
+var structFieldName = predicate((v) => typeof v === "string" && isStructFieldName(v), "invalid Struct field name");
+var fieldReference = (value, path, issues) => record({
+  kind: oneOf("field"),
+  receiver: variants("kind", {
+    ...slotReferenceRules,
+    arrayElementRead: (element, elementPath, elementIssues) => expressionRules.arrayElementRead(element, elementPath, elementIssues),
+    span: record({
+      kind: oneOf("span"),
+      owner: oneOf("map"),
+      key: oneOf("item")
+    })
+  }),
+  path: array(structFieldName, 1)
+})(value, path, issues);
+var arrayReference = variants("kind", {
+  ...slotReferenceRules,
+  field: fieldReference
 });
+var mapResults = (value, path, issues) => {
+  if (typeof value === "string") {
+    name(value, path, issues);
+    return;
+  }
+  record({
+    kind: oneOf("field"),
+    receiver: slotReferenceRules.cell,
+    path: array(structFieldName, 1)
+  })(value, path, issues);
+};
 var cellTarget = (value, path, issues) => {
   if (!Array.isArray(value) || value.length === 0) {
     issue(issues, path, "expected a cell target with a root");
@@ -8123,6 +8661,11 @@ var expressionRules = {
     kind: oneOf("channelIsUnset"),
     namespace: oneOf("args", "returns"),
     key: name
+  }),
+  field: fieldReference,
+  structLiteral: expr({
+    kind: oneOf("structLiteral"),
+    fields: map(valueChild, structFieldName)
   }),
   arrayElementRead: expr({
     kind: oneOf("arrayElementRead"),
@@ -8248,6 +8791,7 @@ var localKinds = {
   isUnset: true,
   channel: true,
   channelIsUnset: true,
+  field: true,
   arrayElementRead: true,
   arrayLength: true,
   span: true,
@@ -8377,7 +8921,8 @@ var specTypes = {
   artifact: true,
   dialogCursor: true,
   index: true,
-  array: true
+  array: true,
+  struct: true
 };
 function spec(role) {
   return (value, path, issues) => {
@@ -8390,7 +8935,7 @@ function spec(role) {
       return;
     }
     const type = value.type;
-    if (typeof type !== "string" || !Object.hasOwn(specTypes, type) || role === "cell" && type === "index" || role.endsWith("element") && ["array", "index", "dialogCursor"].includes(type)) {
+    if (typeof type !== "string" || !Object.hasOwn(specTypes, type) || role === "cell" && type === "index" || role.endsWith("element") && ["array", "index", "dialogCursor"].includes(type) || role.endsWith("field") && ["artifact", "index", "dialogCursor"].includes(type)) {
       issue(issues, path, "unsupported spec type for this role", "INVALID_SPEC");
       return;
     }
@@ -8399,9 +8944,18 @@ function spec(role) {
       Object.assign(fields, { name, loc: optional(location) });
     if (type === "enum")
       fields.values = array(string);
+    const cellRole = role === "cell" || role === "cell-element" || role === "cell-field";
     if (type === "array")
-      fields.element = spec(role === "cell" ? "cell-element" : "channel-element");
-    const observable = (role === "cell" || role === "cell-element") && ["boolean", "string", "enum", "number"].includes(type);
+      fields.element = role.endsWith("field") ? refine(spec(cellRole ? "cell-element" : "channel-element"), (v, p, i) => {
+        if (isRecord(v) && v.type === "artifact")
+          issue(i, p, "Struct field arrays require observable elements", "INVALID_SPEC");
+      }) : spec(cellRole ? "cell-element" : "channel-element");
+    if (type === "struct") {
+      fields.fields = map(spec(cellRole ? "cell-field" : "channel-field"), structFieldName);
+      if (cellRole)
+        fields.observing = optional(semanticChild);
+    }
+    const observable = cellRole && ["boolean", "string", "enum", "number"].includes(type);
     if (observable)
       fields.observing = optional(semanticChild);
     if (observable && type === "number")
@@ -8599,7 +9153,7 @@ function statement(role) {
       ...meta,
       kind: oneOf("map"),
       receiver: arrayReference,
-      results: optional(name),
+      results: optional(mapResults),
       body: body("action")
     }),
     "host-call": expressionRules["host-call"]
@@ -8847,8 +9401,7 @@ function lintNodeBareCellBooleans(node2, lintIssues) {
     emitLintIssue(lintIssues, "bare-cell-boolean", node2.loc);
   }
   for (const cell of node2.cells) {
-    const observing = isScalarObservableCell(cell) ? cell.observing : isArrayCell(cell) && cell.element.type !== "artifact" ? cell.element.observing : void 0;
-    if (observing && semanticStringContainsBareCellBoolean(observing)) {
+    if (isObservableCell(cell) && observingQuestions(cell).some(semanticStringContainsBareCellBoolean)) {
       emitLintIssue(lintIssues, "bare-cell-boolean", cell.loc);
     }
     if (cell.type === "artifact" && cell.initializer !== void 0 && expressionContainsBareCellBoolean(cell.initializer.path, false)) {
@@ -9192,21 +9745,41 @@ function collectExpressionReads(expression, into) {
       }
       return;
     case "arrayElementRead":
-      if (expression.array.kind === "cell")
-        into.add(expression.array.name);
+      collectReferenceRead(expression.array, into);
       collectExpressionReads(expression.index, into);
       return;
     case "arrayLength":
-      if (expression.array.kind === "cell")
-        into.add(expression.array.name);
+      collectReferenceRead(expression.array, into);
+      return;
+    case "field":
+      collectReferenceRead(expression, into);
       return;
     case "arrayLiteral":
       for (const element of expression.elements) {
         collectExpressionReads(element, into);
       }
       return;
+    case "structLiteral":
+      for (const field of Object.values(expression.fields)) {
+        collectExpressionReads(field, into);
+      }
+      return;
     default:
       return;
+  }
+}
+function collectReferenceRead(reference, into) {
+  if (reference.kind === "cell") {
+    into.add(reference.name);
+    return;
+  }
+  if (reference.kind !== "field")
+    return;
+  const receiver = reference.receiver;
+  if (receiver.kind === "cell") {
+    into.add(receiver.name);
+  } else if (receiver.kind === "arrayElementRead") {
+    collectExpressionReads(receiver, into);
   }
 }
 function collectHostCallArgumentReads(arg, into) {
@@ -9261,14 +9834,19 @@ function collectReadsAndWrites(statements, onRead, onWrite) {
           }
         }
         break;
-      case "map":
-        if (statement2.receiver.kind === "cell") {
-          onRead(statement2.receiver.name, statement2.loc);
-        }
+      case "map": {
+        const receiverReads = /* @__PURE__ */ new Set();
+        collectReferenceRead(statement2.receiver, receiverReads);
+        for (const name2 of receiverReads)
+          onRead(name2, statement2.loc);
         collectReadsAndWrites(statement2.body, onRead, onWrite);
-        if (statement2.results)
+        if (typeof statement2.results === "string") {
           onWrite(statement2.results, statement2.loc);
+        } else if (statement2.results) {
+          onRead(mapResultsCell(statement2.results), statement2.loc);
+        }
         break;
+      }
       case "set-span":
       case "set-return":
         emitExpressionReads(statement2.value, statement2.loc, onRead);
@@ -9392,8 +9970,9 @@ function collectArcCellUsage(node2, inheritedDeclarations, firstRead, assigned) 
   if (node2.guidance)
     emitSemanticReads(node2.guidance, node2.loc, onRead);
   for (const cell of node2.cells) {
-    const observing = isScalarObservableCell(cell) ? cell.observing : isArrayCell(cell) && cell.element.type !== "artifact" ? cell.element.observing : void 0;
-    if (observing) {
+    if (!isObservableCell(cell))
+      continue;
+    for (const observing of observingQuestions(cell)) {
       emitSemanticReads(observing, cell.loc, onRead);
     }
   }
@@ -9507,12 +10086,16 @@ function walkReadBeforeSet(statements, assigned, qualifying, childrenById, repor
         }
         break;
       case "map": {
-        if (statement2.receiver.kind === "cell") {
-          report(statement2.receiver.name, statement2.loc);
-        }
+        const receiverReads = /* @__PURE__ */ new Set();
+        collectReferenceRead(statement2.receiver, receiverReads);
+        for (const name2 of receiverReads)
+          report(name2, statement2.loc);
         walkReadBeforeSet(statement2.body, new Set(assigned), qualifying, childrenById, reported, lintIssues);
-        if (statement2.results)
+        if (typeof statement2.results === "string") {
           assigned.add(statement2.results);
+        } else if (statement2.results) {
+          report(mapResultsCell(statement2.results), statement2.loc);
+        }
         break;
       }
       case "set-span":
@@ -9593,6 +10176,7 @@ var ARC_RESERVED_IMPORT_ALIAS_NAMES = /* @__PURE__ */ new Set([
   "user"
 ]);
 function parse4(source) {
+  resetDeclarationScope();
   const program = parse3(source, {
     ecmaVersion: "latest",
     sourceType: "module",
@@ -9838,7 +10422,26 @@ function parseNode(fn, availableImports, availableHostModules, visibleNodeNames,
     throw new Error("invoke is a reserved name and cannot name a node");
   }
   const signature2 = parseNodeSignature(fn.params);
-  const cells = [];
+  const declarationStatements = fn.body.body.filter((statement2) => statement2.type === "VariableDeclaration");
+  const shapes = parseNodeCellDeclarations(declarationStatements, {
+    hostModules: availableHostModules,
+    expressions: false
+  });
+  return withDeclarationScope({ cells: new Map(shapes.map((cell) => [cell.name, cell])), signature: signature2 }, () => parseNodeBody(fn, fn.id.name, signature2, parseNodeCellDeclarations(declarationStatements, {
+    hostModules: availableHostModules,
+    expressions: true
+  }), new Set(declarationStatements), availableImports, availableHostModules, visibleNodeNames, visibleCellNames, inheritedDeflectWhen));
+}
+function parseNodeCellDeclarations(statements, context) {
+  return statements.flatMap((statement2) => {
+    const cells = parseCellDeclarations(statement2, context);
+    if (cells.length !== statement2.declarations.length) {
+      throw new Error("Node-body declarations must use supported Arc cell constructors");
+    }
+    return cells;
+  });
+}
+function parseNodeBody(fn, identifier, signature2, cells, declarationStatements, availableImports, availableHostModules, visibleNodeNames, visibleCellNames, inheritedDeflectWhen) {
   const childFunctions = /* @__PURE__ */ new Map();
   let forgetfulEntry = false;
   const writeDiffMode = "advance";
@@ -9858,12 +10461,7 @@ function parseNode(fn, availableImports, availableHostModules, visibleNodeNames,
   const seenNodeConfigAssignments = /* @__PURE__ */ new Set();
   const handledStatements = /* @__PURE__ */ new Set();
   for (const statement2 of fn.body.body) {
-    if (statement2.type === "VariableDeclaration") {
-      const parsedCells = parseCellDeclarations(statement2, availableHostModules);
-      if (parsedCells.length !== statement2.declarations.length) {
-        throw new Error("Node-body declarations must use supported Arc cell constructors");
-      }
-      cells.push(...parsedCells);
+    if (declarationStatements.has(statement2)) {
       handledStatements.add(statement2);
       continue;
     }
@@ -10002,7 +10600,7 @@ function parseNode(fn, availableImports, availableHostModules, visibleNodeNames,
     ...cells.map((entry) => entry.name)
   ]);
   const enclosing = {
-    identifier: fn.id.name,
+    identifier,
     childNames: new Set(childFunctions.keys())
   };
   if (catchInterruptionBody) {
@@ -10025,7 +10623,7 @@ function parseNode(fn, availableImports, availableHostModules, visibleNodeNames,
   const statements = fn.body.body.flatMap((statement2) => parseNodeStatement(statement2, childFunctions, handledStatements, availableImports, nextVisibleNodeNames, nextVisibleCellNames, availableHostModules, effectiveDeflectWhen, enclosing));
   const children = [...childFunctionNodes];
   return {
-    identifier: fn.id.name,
+    identifier,
     displayName,
     description,
     guidance,
@@ -10122,6 +10720,9 @@ function parseChannelSpec(expression, owner) {
     }
     return { type: "artifact" };
   }
+  if (name2 === "Struct") {
+    return parseStructChannelSpec(expression, owner);
+  }
   if (name2 === "Index") {
     if (expression.arguments.length !== 0) {
       throw new Error(`${owner} Index() takes no arguments`);
@@ -10172,11 +10773,36 @@ function parseChannelSpec(expression, owner) {
       throw new Error(`${owner} Array() channel spec cannot nest arrays`);
     }
     if (element.type === "index" || element.type === "dialogCursor") {
-      throw new Error(`${owner} Array() element must be a scalar or Artifact channel type`);
+      throw new Error(`${owner} Array() element must be a scalar, Artifact, or Struct channel type`);
     }
     return { type: "array", element };
   }
   throw new Error(`${owner} unsupported channel spec: ${name2}`);
+}
+function parseStructChannelSpec(expression, owner) {
+  const fieldsArg = expression.arguments[0];
+  if (expression.arguments.length !== 1 || !fieldsArg || fieldsArg.type !== "ObjectExpression") {
+    throw new Error(`${owner} Struct() channel spec takes one field object`);
+  }
+  const fields = {};
+  for (const property of fieldsArg.properties) {
+    if (property.type === "SpreadElement" || property.computed || property.kind !== "init" || property.method) {
+      throw new Error(`${owner} Struct() fields must be named data properties`);
+    }
+    const name2 = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" && typeof property.key.value === "string" ? property.key.value : void 0;
+    if (name2 === void 0 || !isStructFieldName(name2)) {
+      throw new Error(`${owner} Struct() has an invalid field name ${JSON.stringify(name2 ?? "<computed>")}`);
+    }
+    if (Object.hasOwn(fields, name2)) {
+      throw new Error(`${owner} Struct() repeats field ${name2}`);
+    }
+    const field = parseChannelSpec(property.value, `${owner}.${name2}`);
+    if (!isObservableFieldSpec(field)) {
+      throw new Error(`${owner}.${name2} must be an observable scalar, observable array, or Struct`);
+    }
+    fields[name2] = field;
+  }
+  return { type: "struct", fields };
 }
 function collectNewCopyNodeAliases(statements) {
   const aliases = [];
@@ -10388,7 +11014,7 @@ function applyElementId(element, expected, verify) {
     });
   }
 }
-function parseCellDeclarations(statement2, availableHostModules) {
+function parseCellDeclarations(statement2, context) {
   const cells = [];
   for (const declaration of statement2.declarations) {
     const id2 = declaration.id;
@@ -10427,7 +11053,11 @@ function parseCellDeclarations(statement2, availableHostModules) {
         });
         continue;
       }
-      const initializer = parseArtifactConstructCall(declaration.init, `Artifact ${id2.name}`, availableHostModules, true);
+      if (!context.expressions) {
+        cells.push({ name: id2.name, type: "artifact", loc: locOf(id2) });
+        continue;
+      }
+      const initializer = parseArtifactConstructCall(declaration.init, `Artifact ${id2.name}`, context.hostModules, true);
       if (containsBriefableExpression(initializer)) {
         throw new Error(`Artifact ${id2.name} path cannot contain judge() or host call expressions`);
       }
@@ -10442,8 +11072,16 @@ function parseCellDeclarations(statement2, availableHostModules) {
     if (callee.name === "Index") {
       throw new Error(`Index() is a channel-only type and cannot declare the cell ${id2.name}`);
     }
+    if (callee.name === "Struct") {
+      cells.push({
+        name: id2.name,
+        ...parseStructDeclaration(declaration.init, id2.name, context),
+        loc: locOf(id2)
+      });
+      continue;
+    }
     if (callee.name === "Array") {
-      const element = parseArrayElementSpec(id2.name, declaration.init.arguments, availableHostModules);
+      const element = parseArrayElementSpec(id2.name, declaration.init.arguments, context);
       if (element.type === "artifact") {
         cells.push({
           name: id2.name,
@@ -10461,20 +11099,69 @@ function parseCellDeclarations(statement2, availableHostModules) {
       }
       continue;
     }
-    const scalar = parseScalarConstructorSpec(declaration.init, id2.name, availableHostModules);
+    const scalar = parseScalarConstructorSpec(declaration.init, id2.name, context);
     if (scalar) {
       cells.push({ name: id2.name, ...scalar, loc: locOf(id2) });
     }
   }
   return cells;
 }
-function parseScalarConstructorSpec(call, owner, availableHostModules) {
+function parseStructDeclaration(call, owner, context) {
+  if (call.arguments.length < 1 || call.arguments.length > 2) {
+    throw new Error(`Struct ${owner} takes a field object and an optional config argument`);
+  }
+  const fieldsArg = call.arguments[0];
+  if (!fieldsArg || fieldsArg.type !== "ObjectExpression") {
+    throw new Error(`Struct ${owner} fields must be an object literal`);
+  }
+  const fields = {};
+  for (const property of fieldsArg.properties) {
+    if (property.type === "SpreadElement") {
+      throw new Error(`Struct ${owner} fields do not support spread`);
+    }
+    if (property.computed || property.kind !== "init" || property.method) {
+      throw new Error(`Struct ${owner} fields must be named data properties without computed keys`);
+    }
+    const name2 = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" && typeof property.key.value === "string" ? property.key.value : void 0;
+    if (name2 === void 0 || !isStructFieldName(name2)) {
+      throw new Error(`Struct ${owner} has an invalid field name ${JSON.stringify(name2 ?? "<computed>")}`);
+    }
+    if (Object.hasOwn(fields, name2)) {
+      throw new Error(`Struct ${owner} repeats field ${name2}`);
+    }
+    fields[name2] = parseStructFieldDeclaration(property.value, `${owner}.${name2}`, context);
+  }
+  const config = parseCellConfig(owner, "Struct", call.arguments[1], context);
+  return { type: "struct", fields, ...config };
+}
+function parseStructFieldDeclaration(expression, owner, context) {
+  if (expression.type !== "CallExpression") {
+    throw new Error(`Struct field ${owner} must be a constructed observable field, e.g. Str()`);
+  }
+  const callee = expression.callee;
+  if (callee.type === "Identifier" && callee.name === "Struct") {
+    return parseStructDeclaration(expression, owner, context);
+  }
+  if (callee.type === "Identifier" && callee.name === "Array") {
+    const element = parseArrayElementSpec(owner, expression.arguments, context);
+    if (element.type === "artifact") {
+      throw new Error(`Struct field ${owner} cannot hold Artifact elements; Struct fields must be observable`);
+    }
+    return { type: "array", element };
+  }
+  const scalar = parseScalarConstructorSpec(expression, owner, context);
+  if (!scalar) {
+    throw new Error(`Struct field ${owner} must be an observable scalar, observable array, or Struct constructor`);
+  }
+  return scalar;
+}
+function parseScalarConstructorSpec(call, owner, context) {
   if (call.callee.type !== "Identifier")
     return void 0;
   const name2 = call.callee.name;
   if (name2 === "Enum") {
     const arg = call.arguments[0];
-    const config = parseCellConfig(owner, name2, call.arguments[1], availableHostModules);
+    const config = parseCellConfig(owner, name2, call.arguments[1], context);
     if (!arg || arg.type === "SpreadElement" || arg.type !== "ArrayExpression") {
       throw new Error(`Enum cell ${owner} requires an array literal`);
     }
@@ -10487,15 +11174,15 @@ function parseScalarConstructorSpec(call, owner, availableHostModules) {
     return { type: "enum", values, ...config };
   }
   if (name2 === "Bool") {
-    const config = parseCellConfig(owner, name2, call.arguments[0], availableHostModules);
+    const config = parseCellConfig(owner, name2, call.arguments[0], context);
     return { type: "boolean", ...config };
   }
   if (name2 === "Str") {
-    const config = parseCellConfig(owner, name2, call.arguments[0], availableHostModules);
+    const config = parseCellConfig(owner, name2, call.arguments[0], context);
     return { type: "string", ...config };
   }
   if (name2 === "Num") {
-    const config = parseNumericCellConfig(owner, name2, call.arguments[0], availableHostModules);
+    const config = parseNumericCellConfig(owner, name2, call.arguments[0], context);
     if (call.arguments.length > 1) {
       throw new Error(`Num cell ${owner} accepts at most one config argument`);
     }
@@ -10507,7 +11194,7 @@ function parseScalarConstructorSpec(call, owner, availableHostModules) {
     }
     const minArg = call.arguments[0];
     const maxArg = call.arguments[1];
-    const config = parseCellConfig(owner, name2, call.arguments[2], availableHostModules);
+    const config = parseCellConfig(owner, name2, call.arguments[2], context);
     const min = parseSignedNumericLiteral(minArg);
     const max = parseSignedNumericLiteral(maxArg);
     if (min === void 0 || max === void 0) {
@@ -10524,7 +11211,7 @@ function parseScalarConstructorSpec(call, owner, availableHostModules) {
   }
   return void 0;
 }
-function parseArrayElementSpec(cellName, args, availableHostModules) {
+function parseArrayElementSpec(cellName, args, context) {
   const arg = args[0];
   if (args.length !== 1 || !arg || arg.type === "SpreadElement") {
     throw new Error(`Array cell ${cellName} takes exactly one element constructor`);
@@ -10541,13 +11228,16 @@ function parseArrayElementSpec(cellName, args, availableHostModules) {
     }
     return { type: "artifact" };
   }
-  const element = parseScalarConstructorSpec(arg, cellName, availableHostModules);
+  if (arg.callee.type === "Identifier" && arg.callee.name === "Struct") {
+    return parseStructDeclaration(arg, `${cellName}[]`, context);
+  }
+  const element = parseScalarConstructorSpec(arg, cellName, context);
   if (!element) {
-    throw new Error(`Array cell ${cellName} element must be a scalar or Artifact cell constructor`);
+    throw new Error(`Array cell ${cellName} element must be a scalar, Artifact, or Struct cell constructor`);
   }
   return element;
 }
-function parseCellConfig(cellName, typeName, arg, availableHostModules) {
+function parseCellConfig(cellName, typeName, arg, context) {
   if (!arg)
     return {};
   if (arg.type === "SpreadElement" || arg.type !== "ObjectExpression") {
@@ -10565,11 +11255,13 @@ function parseCellConfig(cellName, typeName, arg, availableHostModules) {
     if (config.observing !== void 0) {
       throw new Error(`Duplicate cell config assignment: ${cellName}.observing`);
     }
-    config.observing = parseSemanticString(property.value, availableHostModules);
+    if (context.expressions) {
+      config.observing = parseSemanticString(property.value, context.hostModules);
+    }
   }
   return config;
 }
-function parseNumericCellConfig(cellName, typeName, arg, availableHostModules) {
+function parseNumericCellConfig(cellName, typeName, arg, context) {
   if (!arg)
     return {};
   if (arg.type === "SpreadElement" || arg.type !== "ObjectExpression") {
@@ -10585,7 +11277,9 @@ function parseNumericCellConfig(cellName, typeName, arg, availableHostModules) {
       if (config.observing !== void 0) {
         throw new Error(`Duplicate cell config assignment: ${cellName}.observing`);
       }
-      config.observing = parseSemanticString(property.value, availableHostModules);
+      if (context.expressions) {
+        config.observing = parseSemanticString(property.value, context.hostModules);
+      }
       continue;
     }
     if (key === "observeAs") {
@@ -10808,9 +11502,9 @@ function parseMapCall(expression, availableImports, visibleNodeNames, visibleCel
   if (callee.type !== "MemberExpression" || callee.computed || callee.object.type === "Super") {
     throw new Error("$map must be called as receiver.$map(...)");
   }
-  const receiver = mapReceiverFrom(callee.object, availableHostModules);
+  const receiver = parseArrayReference(callee.object, availableHostModules);
   if (!receiver) {
-    throw new Error("$map receiver must be an array cell or a typed array channel");
+    throw new Error("$map receiver must be an array cell, a typed array channel, or a Struct field");
   }
   const [arrow, resultsArg, ...rest] = expression.arguments;
   if (!arrow || rest.length > 0) {
@@ -10827,24 +11521,10 @@ function parseMapCall(expression, availableImports, visibleNodeNames, visibleCel
   }
   let results;
   if (resultsArg) {
-    if (resultsArg.type !== "Identifier") {
-      throw new Error("$map results must be a bare array cell");
-    }
-    results = resultsArg.name;
+    results = parseMapResults(resultsArg, availableHostModules);
   }
-  const bodyChildFunctions = /* @__PURE__ */ new Map();
-  const bodyHandledStatements = /* @__PURE__ */ new Set();
-  const block = getFunctionBody(arrow);
-  let body2;
-  if (block) {
-    body2 = parseStatementList(block, bodyChildFunctions, bodyHandledStatements, availableImports, visibleNodeNames, visibleCellNames, availableHostModules, defaultDeflectWhen, enclosing);
-  } else {
-    const action = parseActionExpression(arrow.body, bodyChildFunctions, availableImports, visibleNodeNames, visibleCellNames, availableHostModules, defaultDeflectWhen, enclosing);
-    if (!action) {
-      throw new Error("Unsupported $map callback expression");
-    }
-    body2 = [action];
-  }
+  const receiverSpec = scopedReferenceSpec(receiver);
+  const body2 = withMapItemScope(receiverSpec?.type === "array" ? receiverSpec.element : void 0, () => parseMapCallback(arrow, availableImports, visibleNodeNames, visibleCellNames, availableHostModules, defaultDeflectWhen, enclosing));
   return {
     id: UNSTAMPED_ID,
     kind: "map",
@@ -10854,20 +11534,26 @@ function parseMapCall(expression, availableImports, visibleNodeNames, visibleCel
     loc: locOf(expression)
   };
 }
-function mapReceiverFrom(node2, availableHostModules) {
-  if (node2.type === "Identifier") {
-    if (availableHostModules.has(node2.name))
-      return void 0;
-    return { kind: "cell", name: node2.name };
+function parseMapCallback(arrow, availableImports, visibleNodeNames, visibleCellNames, availableHostModules, defaultDeflectWhen, enclosing) {
+  const bodyChildFunctions = /* @__PURE__ */ new Map();
+  const bodyHandledStatements = /* @__PURE__ */ new Set();
+  if (arrow.body.type === "BlockStatement") {
+    return parseStatementList(arrow.body.body, bodyChildFunctions, bodyHandledStatements, availableImports, visibleNodeNames, visibleCellNames, availableHostModules, defaultDeflectWhen, enclosing);
   }
-  if (node2.type === "MemberExpression" && !node2.computed && node2.object.type === "Identifier" && (node2.object.name === "args" || node2.object.name === "returns") && node2.property.type === "Identifier") {
-    return {
-      kind: "channel",
-      namespace: node2.object.name,
-      key: node2.property.name
-    };
+  const action = parseActionExpression(arrow.body, bodyChildFunctions, availableImports, visibleNodeNames, visibleCellNames, availableHostModules, defaultDeflectWhen, enclosing);
+  if (!action) {
+    throw new Error("Unsupported $map callback expression");
   }
-  return void 0;
+  return [action];
+}
+function parseMapResults(node2, availableHostModules) {
+  if (node2.type === "Identifier" && !availableHostModules.has(node2.name)) {
+    return node2.name;
+  }
+  const field = node2.type === "MemberExpression" ? parseFieldReference(node2, availableHostModules) : void 0;
+  if (field?.receiver.kind === "cell")
+    return field;
+  throw new Error("$map results must be an array cell or a Struct cell field");
 }
 function parseInvokeCall(expression, availableImports, visibleNodeNames, visibleCellNames, availableHostModules, defaultDeflectWhen, enclosing) {
   const argument = expression.arguments[0];
@@ -11276,9 +11962,6 @@ function parseCellMutationCall(expression, availableHostModules, context, expres
     }
     const target3 = parseCellTarget(calleeObject, availableHostModules, expressionContext);
     assertOrdinaryCellTarget(target3, "$unset()");
-    if (target3.length !== 1) {
-      throw new Error("$unset() requires a direct cell target");
-    }
     return {
       id: UNSTAMPED_ID,
       kind: "unset",
@@ -11979,27 +12662,33 @@ function formatCellTarget(target2) {
   }
   return rendered;
 }
-function descendCellTargetSpec(spec2, remainingAccessors, onNonContainer) {
-  if (spec2.type !== "array") {
-    onNonContainer?.();
-    return void 0;
+function resolveCellTargetSpec(rootSpec, accessors, onNonContainer, onUnknownField) {
+  let resolved = { kind: "direct", spec: rootSpec };
+  for (const accessor of accessors) {
+    const spec2 = resolved.spec;
+    if (spec2.type === "struct") {
+      const name2 = accessor.kind === "literal" && typeof accessor.value === "string" ? accessor.value : void 0;
+      if (name2 === void 0 || !Object.hasOwn(spec2.fields, name2)) {
+        onUnknownField?.(name2);
+        return void 0;
+      }
+      resolved = { kind: "field", spec: spec2.fields[name2] };
+      continue;
+    }
+    if (spec2.type !== "array") {
+      onNonContainer?.();
+      return void 0;
+    }
+    resolved = { kind: "decorated", spec: spec2.element };
   }
-  const leafSpec = spec2.element;
-  if (remainingAccessors === 1)
-    return leafSpec;
-  return descendCellTargetSpec(leafSpec, remainingAccessors - 1, onNonContainer);
-}
-function resolveCellTargetSpec(rootSpec, accessorCount, onNonContainer) {
-  if (accessorCount === 0)
-    return { kind: "direct", spec: rootSpec };
-  const leafSpec = descendCellTargetSpec(rootSpec, accessorCount, onNonContainer);
-  return leafSpec ? { kind: "decorated", spec: leafSpec } : void 0;
+  return resolved;
 }
 function cellTargetSpec(target2, cells) {
   const rootSpec = findCell2(cells, cellTargetRoot2(target2));
   if (!rootSpec)
     return void 0;
-  return resolveCellTargetSpec(rootSpec, target2.length - 1);
+  const [, ...accessors] = target2;
+  return resolveCellTargetSpec(rootSpec, accessors);
 }
 function validateCellTarget(target2, cells, nodes, issues, options, loc) {
   const [root, ...accessors] = target2;
@@ -12014,6 +12703,8 @@ function validateCellTarget(target2, cells, nodes, issues, options, loc) {
     recordCellRead(root);
   }
   for (const accessor of accessors) {
+    if (accessor.kind === "literal")
+      continue;
     validateExpression(accessor, cells, nodes, issues, options);
     if (expressionIsArray(accessor, cells, options.references?.currentNode.signature, options)) {
       issues.push({
@@ -12025,10 +12716,16 @@ function validateCellTarget(target2, cells, nodes, issues, options, loc) {
   }
   if (!rootCell)
     return void 0;
-  return resolveCellTargetSpec(rootCell, accessors.length, () => {
+  return resolveCellTargetSpec(rootCell, accessors, () => {
     issues.push({
       code: "CELL_TARGET_NON_CONTAINER",
       message: `Cell target ${formatCellTarget(target2)} accesses through a non-container value`,
+      loc
+    });
+  }, (name2) => {
+    issues.push({
+      code: "UNKNOWN_STRUCT_FIELD",
+      message: name2 === void 0 ? `Cell target ${formatCellTarget(target2)} must name a Struct field with a literal string` : `Cell target ${formatCellTarget(target2)} names an undeclared Struct field ${JSON.stringify(name2)}`,
       loc
     });
   });
@@ -12149,11 +12846,9 @@ function validateNode(node2, context) {
     if (node2.guidance !== void 0)
       validateSemanticString(node2.guidance, cells, nodeNames, context.issues, baseOptions);
     for (const cell of node2.cells) {
-      if (isScalarObservableCell(cell) && cell.observing !== void 0) {
-        validateSemanticString(cell.observing, cells, nodeNames, context.issues, baseOptions);
-      }
-      if (isArrayCell(cell) && cell.element.type !== "artifact" && cell.element.observing !== void 0) {
-        validateSemanticString(cell.element.observing, cells, nodeNames, context.issues, baseOptions);
+      const questions = isObservableCell(cell) ? observingQuestions(cell) : [];
+      for (const question of questions) {
+        validateSemanticString(question, cells, nodeNames, context.issues, baseOptions);
       }
       if (cell.type === "artifact" && cell.initializer !== void 0) {
         if (containsBriefableExpression(cell.initializer)) {
@@ -12347,12 +13042,18 @@ function arrayReferenceElementSpec(ref2, cells, signature2) {
     const cell = findCell2(cells, ref2.name);
     return cell && isArrayCell(cell) ? cell.element : void 0;
   }
-  const spec2 = signature2?.[ref2.namespace]?.[ref2.key];
+  const spec2 = resolveReferenceSpec(ref2, { cells, signature: signature2 });
   return spec2?.type === "array" ? spec2.element : void 0;
 }
-function arrayCellElementSpec(name2, cells) {
-  const cell = findCell2(cells, name2);
-  return cell && isArrayCell(cell) ? cell.element : void 0;
+function mapResultsElementSpec(results, cells) {
+  const cell = findCell2(cells, mapResultsCell(results));
+  if (!cell)
+    return void 0;
+  if (typeof results === "string") {
+    return isArrayCell(cell) ? cell.element : void 0;
+  }
+  const spec2 = cell.type === "struct" ? fieldSpecAt(cell, results.path) : void 0;
+  return spec2?.type === "array" ? spec2.element : void 0;
 }
 function producerContext(cells, signature2, options = {}) {
   const map2 = mapContextStack[mapContextStack.length - 1];
@@ -12417,28 +13118,14 @@ function checkTypedCellAssignment(statement2, cells, signature2, issues, options
 }
 function validateMapStatement(statement2, cells, nodes, issues, options) {
   const signature2 = options.references?.currentNode.signature;
-  validateArrayReference(statement2.receiver, "index", cells, issues, signature2);
+  validateArrayReference(statement2.receiver, "index", cells, nodes, issues, options);
   if (statement2.results !== void 0) {
-    const cell = findCell2(cells, statement2.results);
-    if (!cell) {
-      issues.push({
-        code: "UNKNOWN_CELL",
-        message: `Unknown cell: ${statement2.results}`,
-        loc: statement2.loc
-      });
-    } else if (!isArrayCell(cell)) {
-      issues.push({
-        code: "MAP_RESULTS_NON_ARRAY",
-        message: `$map() results cell ${statement2.results} is not an array`,
-        loc: statement2.loc
-      });
-    }
+    validateMapResults(statement2.results, cells, issues, statement2.loc);
   }
-  const receiverCell = statement2.receiver.kind === "cell" ? statement2.receiver.name : void 0;
-  checkMapCallbackBody(statement2.body, receiverCell, statement2.results !== void 0, issues);
+  checkMapCallbackBody(statement2.body, mapReceiverPath(statement2.receiver), statement2.results !== void 0, issues);
   const context = {
     receiverSpec: arrayReferenceElementSpec(statement2.receiver, cells, signature2),
-    resultsSpec: statement2.results !== void 0 ? arrayCellElementSpec(statement2.results, cells) : void 0
+    resultsSpec: statement2.results !== void 0 ? mapResultsElementSpec(statement2.results, cells) : void 0
   };
   const mapBuilder = {
     cells: /* @__PURE__ */ new Set(),
@@ -12455,7 +13142,64 @@ function validateMapStatement(statement2, cells, nodes, issues, options) {
   }
   activeSegReadSets?.set(invokeSegKey(statement2.id), finalizeReadSet(mapBuilder));
 }
-function checkMapCallbackBody(body2, receiverCell, hasResults, issues) {
+function validateMapResults(results, cells, issues, loc) {
+  const label = mapResultsLabel(results);
+  const root = mapResultsCell(results);
+  const cell = findCell2(cells, root);
+  if (!cell) {
+    issues.push({
+      code: "UNKNOWN_CELL",
+      message: `Unknown cell: ${root}`,
+      loc
+    });
+    return;
+  }
+  if (typeof results !== "string")
+    recordCellRead(root);
+  const spec2 = typeof results === "string" ? cell : cell.type === "struct" ? fieldSpecAt(cell, results.path) : void 0;
+  if (spec2 === void 0) {
+    issues.push({
+      code: cell.type === "struct" ? "UNKNOWN_STRUCT_FIELD" : "FIELD_READ_NON_STRUCT",
+      message: `$map() results ${label} does not name a declared Struct field`,
+      loc
+    });
+    return;
+  }
+  if (spec2.type !== "array") {
+    issues.push({
+      code: "MAP_RESULTS_NON_ARRAY",
+      message: `$map() results ${label} is not an array`,
+      loc
+    });
+  }
+}
+function mapReceiverPath(receiver) {
+  if (receiver.kind === "cell")
+    return { cell: receiver.name, path: [] };
+  if (receiver.kind !== "field")
+    return void 0;
+  const root = receiver.receiver;
+  if (root.kind === "cell")
+    return { cell: root.name, path: receiver.path };
+  return root.kind === "arrayElementRead" ? mapReceiverPath(root.array) : void 0;
+}
+function formatMapReceiver(receiver) {
+  return [receiver.cell, ...receiver.path].join(".");
+}
+function targetWritesReceiver(target2, receiver) {
+  const [root, ...accessors] = target2;
+  if (root !== receiver.cell)
+    return false;
+  const shared = Math.min(accessors.length, receiver.path.length);
+  for (let index = 0; index < shared; index += 1) {
+    const accessor = accessors[index];
+    if (accessor.kind !== "literal" || accessor.value !== receiver.path[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+function checkMapCallbackBody(body2, receiver, hasResults, issues) {
   const spanResultBinding = (bindings) => Object.values(bindings ?? {}).some((source) => source.kind === "span" && source.key === "result");
   const visit = (list) => {
     for (const statement2 of list) {
@@ -12494,10 +13238,10 @@ function checkMapCallbackBody(body2, receiverCell, hasResults, issues) {
               loc: statement2.loc
             });
           }
-          if (receiverCell !== void 0 && Object.values(statement2.returns ?? {}).some((source) => source.kind === "cell" && source.cell === receiverCell)) {
+          if (receiver !== void 0 && Object.values(statement2.returns ?? {}).some((source) => source.kind === "cell" && source.cell === receiver.cell)) {
             issues.push({
               code: "MAP_RECEIVER_WRITE",
-              message: `$map callback cannot write its receiver ${receiverCell}`,
+              message: `$map callback cannot write its receiver ${receiver.cell}`,
               loc: statement2.loc
             });
           }
@@ -12506,20 +13250,20 @@ function checkMapCallbackBody(body2, receiverCell, hasResults, issues) {
         case "unset":
         case "observe":
         case "observeOrAsk":
-          if (receiverCell !== void 0 && cellTargetRoot2(statement2.target) === receiverCell) {
+          if (receiver !== void 0 && targetWritesReceiver(statement2.target, receiver)) {
             issues.push({
               code: "MAP_RECEIVER_WRITE",
-              message: `$map callback cannot write its receiver ${receiverCell}`,
+              message: `$map callback cannot write its receiver ${formatMapReceiver(receiver)}`,
               loc: statement2.loc
             });
           }
           break;
         case "observeGroup":
         case "observeOrAskGroup":
-          if (receiverCell !== void 0 && statement2.targets.some((target2) => cellTargetRoot2(target2) === receiverCell)) {
+          if (receiver !== void 0 && statement2.targets.some((target2) => targetWritesReceiver(target2, receiver))) {
             issues.push({
               code: "MAP_RECEIVER_WRITE",
-              message: `$map callback cannot write its receiver ${receiverCell}`,
+              message: `$map callback cannot write its receiver ${formatMapReceiver(receiver)}`,
               loc: statement2.loc
             });
           }
@@ -13014,7 +13758,65 @@ function checkBooleanValue(expression, cells, signature2, issues, options) {
     });
   }
 }
-function validateArrayReference(array2, operation, cells, issues, signature2) {
+function validateFieldReference(field, cells, nodes, issues, options) {
+  const signature2 = options.references?.currentNode.signature;
+  const receiver = field.receiver;
+  let receiverSpec;
+  let label;
+  if (receiver.kind === "arrayElementRead" || receiver.kind === "span") {
+    validateExpression(receiver, cells, nodes, issues, options);
+    label = formatReference(receiver);
+    receiverSpec = receiver.kind === "span" ? mapContextStack.at(-1)?.receiverSpec : arrayReferenceElementSpec(receiver.array, cells, signature2);
+    if (!receiverSpec)
+      return void 0;
+  } else if (receiver.kind === "channel") {
+    recordChannelRead(receiver.namespace, receiver.key);
+    label = `${receiver.namespace}.${receiver.key}`;
+    receiverSpec = signature2?.[receiver.namespace][receiver.key];
+    if (!receiverSpec) {
+      issues.push({
+        code: "UNKNOWN_CHANNEL_KEY",
+        message: `Unknown ${label} channel for a Struct field read`
+      });
+      return void 0;
+    }
+  } else {
+    recordCellRead(receiver.name);
+    label = receiver.name;
+    receiverSpec = findCell2(cells, receiver.name);
+    if (!receiverSpec) {
+      issues.push({ code: "UNKNOWN_CELL", message: `Unknown cell: ${label}` });
+      return void 0;
+    }
+  }
+  if (receiverSpec.type !== "struct") {
+    issues.push({
+      code: "FIELD_READ_NON_STRUCT",
+      message: `${label} is not a Struct; cannot read field ${field.path.join(".")}`
+    });
+    return void 0;
+  }
+  const spec2 = fieldSpecAt(receiverSpec, field.path);
+  if (!spec2) {
+    issues.push({
+      code: "UNKNOWN_STRUCT_FIELD",
+      message: `${label} has no declared field ${field.path.join(".")}`
+    });
+  }
+  return spec2;
+}
+function validateArrayReference(array2, operation, cells, nodes, issues, options) {
+  const signature2 = options.references?.currentNode.signature;
+  if (array2.kind === "field") {
+    const spec2 = validateFieldReference(array2, cells, nodes, issues, options);
+    if (spec2 && spec2.type !== "array") {
+      issues.push({
+        code: operation === "index" ? "INDEX_NON_ARRAY" : "LENGTH_NON_ARRAY",
+        message: `Struct field ${array2.path.join(".")} is not an array; cannot read ${operation}`
+      });
+    }
+    return;
+  }
   if (array2.kind === "channel") {
     recordChannelRead(array2.namespace, array2.key);
     const declared = signature2?.[array2.namespace][array2.key];
@@ -13046,7 +13848,7 @@ function validateExpression(expression, cells, nodes, issues, options = {}) {
   const signature2 = options.references?.currentNode.signature;
   switch (expression.kind) {
     case "arrayElementRead":
-      validateArrayReference(expression.array, "index", cells, issues, signature2);
+      validateArrayReference(expression.array, "index", cells, nodes, issues, options);
       validateExpression(expression.index, cells, nodes, issues, options);
       if (expressionIsArray(expression.index, cells, signature2, options)) {
         issues.push({
@@ -13056,12 +13858,26 @@ function validateExpression(expression, cells, nodes, issues, options = {}) {
       }
       return;
     case "arrayLength":
-      validateArrayReference(expression.array, "length", cells, issues, signature2);
+      validateArrayReference(expression.array, "length", cells, nodes, issues, options);
       return;
     case "arrayLiteral":
       for (const element of expression.elements) {
         validateExpression(element, cells, nodes, issues, options);
       }
+      return;
+    case "structLiteral":
+      for (const [name2, field] of Object.entries(expression.fields)) {
+        if (!isStructFieldName(name2)) {
+          issues.push({
+            code: "INVALID_STRUCT_FIELD_NAME",
+            message: `Invalid Struct field name ${JSON.stringify(name2)}`
+          });
+        }
+        validateExpression(field, cells, nodes, issues, options);
+      }
+      return;
+    case "field":
+      validateFieldReference(expression, cells, nodes, issues, options);
       return;
     case "span":
       if (mapContextStack.length === 0) {
@@ -13534,11 +14350,27 @@ function isChannelSpec(spec2) {
     case "dialogCursor":
       return true;
     case "array":
-      return spec2.element.type === "boolean" || spec2.element.type === "string" || spec2.element.type === "enum" || spec2.element.type === "number" || spec2.element.type === "artifact";
+      return spec2.element.type === "boolean" || spec2.element.type === "string" || spec2.element.type === "enum" || spec2.element.type === "number" || spec2.element.type === "artifact" || isObservableFieldSpec2(spec2.element);
+    case "struct":
+      return Object.values(spec2.fields).every(isObservableFieldSpec2);
     case "omittable":
     case "tuple":
-    case "struct":
     case "semanticText":
+      return false;
+  }
+}
+function isObservableFieldSpec2(spec2) {
+  switch (spec2.type) {
+    case "boolean":
+    case "string":
+    case "enum":
+    case "number":
+      return true;
+    case "array":
+      return spec2.element.type !== "array" && isObservableFieldSpec2(spec2.element);
+    case "struct":
+      return Object.values(spec2.fields).every(isObservableFieldSpec2);
+    default:
       return false;
   }
 }

@@ -1,3 +1,4 @@
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { executionControlFor, workEventsFor } from "./work-event-fixtures.js";
@@ -18,13 +19,27 @@ vi.mock("@earendil-works/pi-agent-core", () => ({
   Agent: class {
     state: { messages: unknown[] } = { messages: [] };
 
-    constructor(options: { initialState?: { systemPrompt?: string } }) {
+    constructor(
+      private options: {
+        initialState?: { systemPrompt?: string; tools?: AgentTool[] };
+      },
+    ) {
       fakeAgent.systems.push(options.initialState?.systemPrompt);
     }
 
     async prompt(prompt: string): Promise<void> {
       fakeAgent.prompts.push(prompt);
       if (fakeAgent.error !== undefined) throw fakeAgent.error;
+      const reportTool = this.options.initialState?.tools?.find(
+        (tool) => tool.name === "report",
+      );
+      if (reportTool) {
+        const response =
+          typeof fakeAgent.response === "function"
+            ? fakeAgent.response(prompt)
+            : fakeAgent.response;
+        await reportTool.execute("report:1", JSON.parse(response));
+      }
       this.state.messages = [
         {
           role: "assistant",
@@ -405,7 +420,7 @@ function Watch() {
     expect(ordinaryRun).toHaveBeenCalledTimes(2);
   });
 
-  it("accepts a complete semantic report through the stock PI text path", async () => {
+  it("accepts a complete semantic report through the stock PI report tool", async () => {
     resetFakeAgent();
     // Declining the judgment keeps the run to its semantic routine.
     fakeAgent.response = (prompt) =>

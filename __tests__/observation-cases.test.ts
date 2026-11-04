@@ -9,6 +9,10 @@ import "../eval/cases/index.js";
 import { listEvalCases } from "../eval/case-registry.js";
 import type { ObservationCase } from "../eval/observation-cases.js";
 import { observationCases } from "../eval/observation-cases.js";
+import {
+  structObservationCases,
+  structTriggerSource,
+} from "../eval/struct-observation-cases.js";
 import type {
   RoutineContext,
   SemanticRequest,
@@ -39,6 +43,8 @@ describe("observation eval cases", () => {
       "array-observation",
       "grouped-observe-or-ask",
       "standing-guidance-observation",
+      "struct-observation",
+      "struct-array-observation",
     ]);
     const registry = new Map(listEvalCases().map((item) => [item.id, item]));
     for (const item of cases) {
@@ -106,6 +112,32 @@ describe("observation eval cases", () => {
           cell: "regions",
           meta: { type: "array", element: { type: "string" } },
         });
+      } else if (item.name === "struct-observation") {
+        expect(observationRequests[0], item.name).toMatchObject({
+          kind: "observation",
+          cell: "incident",
+          meta: {
+            type: "struct",
+            fields: {
+              routing: { meta: { type: "struct" } },
+              checks: { meta: { type: "array", element: { type: "struct" } } },
+            },
+          },
+        });
+      } else if (item.name === "struct-array-observation") {
+        expect(observationRequests[0], item.name).toMatchObject({
+          kind: "observation",
+          cell: "targets",
+          meta: {
+            type: "array",
+            element: {
+              type: "struct",
+              fields: {
+                rollout: { meta: { type: "struct" } },
+              },
+            },
+          },
+        });
       } else {
         expect(observationRequests[0], item.name).toMatchObject({
           kind: "observation-group",
@@ -131,12 +163,61 @@ describe("observation eval cases", () => {
       }
     }
   });
+
+  it("admits Struct trigger eval values and rejects the nonmatching nested values", async () => {
+    for (const item of structObservationCases()) {
+      for (const matches of [false, true]) {
+        const arcHost = await makeArcHost();
+        const source = `trigger-${item.name}`;
+        await arcHost.registerArc(source, parse(structTriggerSource(item)));
+        const requests: SemanticRequest[] = [];
+        const { workerHub } = makeWorkerHub({
+          arcHost,
+          workers: {
+            triager: async (task) => {
+              if (task.kind !== "semantic" || task.stage !== "trigger")
+                throw new Error("expected a trigger semantic task");
+              requests.push(...task.requests);
+              return semanticReport(
+                task,
+                {
+                  name: item.name,
+                  observed: {
+                    [item.cell]: matches ? item.value : item.negativeValue,
+                  },
+                },
+                undefined,
+              );
+            },
+          },
+        });
+        const events = [];
+        for await (const event of workerHub.submitInbound({
+          content: matches ? item.inbound : item.negativeInbound,
+          metadata: { principal: ALICE_OWNER },
+        }))
+          events.push(event);
+        expect(requests).toHaveLength(1);
+        expect(requests[0]).toMatchObject({
+          kind: "observation",
+          cell: item.cell,
+          meta: {
+            type: item.name === "struct-observation" ? "struct" : "array",
+          },
+        });
+        expect(
+          events.map((event) => event.kind),
+          `${item.name}:${matches}`,
+        ).toEqual(matches ? ["activated"] : []);
+      }
+    }
+  });
 });
 
 /** Report every request of a semantic task from the case's observed values. */
 function semanticReport(
   task: SemanticTask,
-  item: ObservationCase,
+  item: Pick<ObservationCase, "name" | "observed">,
   parkedCell: string | undefined,
 ) {
   const observations: Record<
@@ -161,7 +242,7 @@ function semanticReport(
 }
 
 function outcome(
-  item: ObservationCase,
+  item: Pick<ObservationCase, "name" | "observed">,
   cell: string,
   parkedCell: string | undefined,
 ): ObservationReport {

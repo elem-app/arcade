@@ -1,3 +1,9 @@
+import type {
+  ObservationMeta,
+  ObservedValue,
+  ScalarObservationMeta,
+  StructObservationMeta,
+} from "@elem-app/arc/runtime";
 /**
  * Shared harness for the hub suites: SDK query doubles, semantic task
  * fixtures, advance-input recording, and the submission drivers the area files
@@ -43,7 +49,10 @@ export async function callClaudeSdkTool(
       >;
     };
   };
-  return await server.instance._registeredTools[name]!.handler(input, {});
+  return await server.instance._registeredTools[name]!.handler(
+    name === "report" ? { report: input } : input,
+    {},
+  );
 }
 
 export function claudeStreamingQuery(
@@ -117,17 +126,51 @@ export async function* claudeSemanticMessages(value: unknown) {
   } as unknown;
 }
 
-/**
- * The completed report a rendered semantic prompt carries as its example.
- * It answers every request in the prompt, so a provider double can return it
- * without knowing the runtime's brief ids.
- */
+/** Build a deterministic provider response from the rendered requests. */
 export function exampleSemanticReport(prompt: string): RoutineReport {
-  const line = prompt
-    .split("\n")
-    .find((entry) => entry.startsWith('{"outcome":"completed","semantic":'));
-  if (!line) throw new Error("prompt carries no semantic report example");
-  return JSON.parse(line) as RoutineReport;
+  const block = prompt.match(
+    /<semantic-requests>\n([\s\S]*?)\n<\/semantic-requests>/,
+  )?.[1];
+  if (!block) throw new Error("prompt carries no semantic requests");
+  const requests = JSON.parse(block) as Array<{
+    id: string;
+    kind: string;
+    meta: ObservationMeta;
+    fields: Array<{ cell: string; meta: ObservationMeta }>;
+  }>;
+  const judgments = Object.fromEntries(
+    requests.filter((r) => r.kind === "judgment").map((r) => [r.id, true]),
+  );
+  const observations = Object.fromEntries(
+    requests
+      .filter((r) => r.kind !== "judgment")
+      .map((r) => [
+        r.id,
+        r.kind === "observation"
+          ? {
+              status: "resolved" as const,
+              value: exampleObservationValue(r.meta),
+            }
+          : {
+              fields: Object.fromEntries(
+                r.fields.map((f) => [
+                  f.cell,
+                  {
+                    status: "resolved" as const,
+                    value: exampleObservationValue(f.meta),
+                  },
+                ]),
+              ),
+            },
+      ]),
+  );
+  return {
+    outcome: "completed",
+    semantic: {
+      ...(Object.keys(judgments).length ? { judgments } : {}),
+      ...(Object.keys(observations).length ? { observations } : {}),
+    },
+  };
 }
 
 export function semanticRequestIds(prompt: string): string[] {
@@ -136,7 +179,7 @@ export function semanticRequestIds(prompt: string): string[] {
     .filter((id): id is string => id !== undefined);
 }
 
-export function openAiSemanticTask(): Task {
+export function openAiSemanticTask(): Extract<Task, { kind: "semantic" }> {
   return {
     kind: "semantic",
     allowedDispositions: [],
@@ -305,4 +348,48 @@ export function lifecycleReader(
       return result.value;
     },
   };
+}
+
+function exampleObservationValue(meta: ObservationMeta): ObservedValue {
+  switch (meta.type) {
+    case "array":
+      return meta.element.type === "struct"
+        ? [exampleStructObservationValue(meta.element)]
+        : [exampleScalarObservationValue(meta.element)];
+    case "struct":
+      return exampleStructObservationValue(meta);
+    default:
+      return exampleScalarObservationValue(meta);
+  }
+}
+
+/** A complete example record carrying an example value for every field. */
+function exampleStructObservationValue(
+  meta: StructObservationMeta,
+): Record<string, ObservedValue> {
+  return Object.fromEntries(
+    Object.entries(meta.fields).map(([name, field]) => [
+      name,
+      exampleObservationValue(field.meta),
+    ]),
+  );
+}
+
+function exampleScalarObservationValue(
+  meta: ScalarObservationMeta,
+): boolean | number | string {
+  switch (meta.type) {
+    case "boolean":
+      return true;
+    case "rangedInt":
+      return meta.min ?? 0;
+    case "number":
+      return (
+        meta.min ?? (meta.max !== undefined && meta.max < 0 ? meta.max : 0)
+      );
+    case "enum":
+      return meta.values?.[0] ?? "";
+    case "string":
+      return "example";
+  }
 }

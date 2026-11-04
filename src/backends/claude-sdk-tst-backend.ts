@@ -16,10 +16,9 @@ import {
 import {
   buildSemanticPrompt,
   buildSemanticSystemPrompt,
-  parseAgentJsonOutput,
 } from "../service/semantic-resolver.js";
+import { modelReportContract } from "../service/semantic-schema.js";
 import { routineTokenUsageFromClaudeSdkMessages } from "../service/token-usage.js";
-import { isRecord, validateAgentRoutineReport } from "../service/utils.js";
 import { defineBackend, type Backend, type Worker } from "../types/backend.js";
 import type { JsonValue } from "../types/json.js";
 import type { RoutineInput, RoutineReport } from "../types/routine.js";
@@ -158,11 +157,16 @@ export class ClaudeSdkTstWorker implements Worker {
     this.#preparedStarts = new PreparedStartPool({
       max: this.#fastStarts.enabled ? this.#fastStarts.maxPreparedStarts : 0,
       idleTtlMs: this.#fastStarts.idleTtlMs,
-      start: (cwd, abortController) =>
-        this.#startup({
-          options: this.#buildOptions(abortController, cwd),
+      start: (key, abortController) => {
+        const { cwd, schema } = JSON.parse(key) as {
+          cwd: string;
+          schema: Record<string, unknown>;
+        };
+        return this.#startup({
+          options: this.#buildOptions(abortController, cwd, schema),
           initializeTimeoutMs: this.#fastStarts.initializeTimeoutMs,
-        }),
+        });
+      },
       close: (warm) => warm.close(),
       failed: (error) =>
         this.#logger.info("backend.claude_sdk_tst.prepared_start_failed", {
@@ -193,7 +197,12 @@ export class ClaudeSdkTstWorker implements Worker {
     const prompt = buildSemanticPrompt(task, context);
     const cwd = this.#configuredCwd ?? context.workspacePath;
     if (this.#stopped) throw new Error("Claude SDK tst worker is stopped.");
-    const prepared = this.#preparedStarts.take(cwd);
+    const prepared = this.#preparedStarts.take(
+      JSON.stringify({
+        cwd,
+        schema: modelReportContract(task, true).jsonSchema,
+      }),
+    );
     let abortController = prepared?.abortController ?? new AbortController();
     this.#activeControllers.add(abortController);
     let preparedClosed = false;
@@ -214,7 +223,7 @@ export class ClaudeSdkTstWorker implements Worker {
     const startedAt = Date.now();
     let backendDetails = this.#backendDetails(routine, false, cwd);
 
-    let messages: SDKMessage[] = [];
+    const messages: SDKMessage[] = [];
     let tokenUsageRecorded = false;
     const recordMessageTokenUsage = async () => {
       if (tokenUsageRecorded) return;
@@ -258,37 +267,19 @@ export class ClaudeSdkTstWorker implements Worker {
         queried.preparedStartUsed,
         cwd,
       );
-      const output = await collectSemanticOutput(queried.messages);
-      messages = output.messages;
-      await diagnostics.writeJson("sdk-messages", output.messages);
+      let output;
+      try {
+        output = await collectSemanticOutput(queried.messages, messages);
+      } finally {
+        await diagnostics.writeJson("sdk-messages", messages);
+      }
       await recordMessageTokenUsage();
       const outputKind =
         output.structured !== undefined ? "structured" : "text";
-      if (output.structured !== undefined) {
-        const raw =
-          isRecord(output.structured) && "report" in output.structured
-            ? output.structured.report
-            : output.structured;
-        const report = validateAgentRoutineReport(
-          raw,
-          "Claude SDK semantic output",
-        );
-        this.#logger.info("backend.claude_sdk_tst.finished", {
-          arcRunId: task.arcRunId,
-          routineId: routine.id,
-          role: routine.role,
-          model: this.#model,
-          durationMs: Date.now() - startedAt,
-          outputKind,
-          reportKind: report.outcome ?? report.error,
-        });
-        return withBackendDetails(report, backendDetails);
-      }
-      const report = await parseAgentJsonOutput(
-        output.text,
-        undefined,
-        "Claude SDK semantic output",
-        { allowOutbound: false },
+      const report = modelReportContract(task, true).parse(
+        output.structured !== undefined
+          ? output.structured
+          : JSON.parse(output.text),
       );
       this.#logger.info("backend.claude_sdk_tst.finished", {
         arcRunId: task.arcRunId,
@@ -374,7 +365,11 @@ export class ClaudeSdkTstWorker implements Worker {
     }
     const messages = this.#query({
       prompt,
-      options: this.#buildOptions(abortController, cwd),
+      options: this.#buildOptions(
+        abortController,
+        cwd,
+        modelReportContract(task, true).jsonSchema,
+      ),
     });
     return {
       messages,
@@ -401,6 +396,7 @@ export class ClaudeSdkTstWorker implements Worker {
   #buildOptions(
     abortController: AbortController,
     cwd: string,
+    schema: Record<string, unknown>,
   ): ClaudeSdkOptions {
     return {
       abortController,
@@ -416,7 +412,7 @@ export class ClaudeSdkTstWorker implements Worker {
       tools: [],
       outputFormat: {
         type: "json_schema",
-        schema: semanticOutputSchema(),
+        schema,
       },
     };
   }
@@ -430,15 +426,14 @@ function normalizeFastStarts(
 
 async function collectSemanticOutput(
   messages: AsyncIterable<SDKMessage>,
+  transcript: SDKMessage[],
 ): Promise<{
   text: string;
   structured?: unknown;
-  messages: SDKMessage[];
 }> {
   let text = "";
   let structured: unknown;
   const errors: string[] = [];
-  const transcript: SDKMessage[] = [];
 
   for await (const message of messages) {
     transcript.push(message);
@@ -470,7 +465,7 @@ async function collectSemanticOutput(
       "Claude SDK semantic query completed without semantic output.",
     );
   }
-  return { text, structured, messages: transcript };
+  return { text, structured };
 }
 
 function assistantMessageText(
@@ -493,49 +488,4 @@ function isTextBlock(value: unknown): value is { type: "text"; text: string } {
     "type" in value &&
     value.type === "text"
   );
-}
-
-function semanticOutputSchema(): Record<string, unknown> {
-  return {
-    type: "object",
-    additionalProperties: false,
-    required: ["report"],
-    properties: {
-      report: {
-        type: "object",
-        additionalProperties: false,
-        required: ["outcome", "semantic"],
-        properties: {
-          outcome: { const: "completed" },
-          semantic: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              judgments: {
-                type: "object",
-                additionalProperties: { type: "boolean" },
-              },
-              observations: {
-                type: "object",
-                additionalProperties: {
-                  type: "object",
-                  additionalProperties: false,
-                  required: ["status"],
-                  properties: {
-                    status: {
-                      enum: ["resolved", "unknown", "needs-user"],
-                    },
-                    value: {
-                      type: ["string", "number", "boolean"],
-                    },
-                  },
-                },
-              },
-              preferredMatch: { type: "string" },
-            },
-          },
-        },
-      },
-    },
-  };
 }

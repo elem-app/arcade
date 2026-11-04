@@ -1,6 +1,7 @@
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ZodType } from "zod/v4";
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -23,6 +24,71 @@ import {
 } from "./backend-helpers.js";
 
 describe("OpenAiSdkTstWorker", () => {
+  it("binds OpenAI trigger structured output to the current brief and nested value schema", async () => {
+    const task = observationTask();
+    const request = task.requests[0]!;
+    if (request.kind !== "observation") throw new Error("expected observation");
+    request.meta = {
+      type: "struct",
+      fields: {
+        ready: { question: "ready?", meta: { type: "boolean" } },
+        checks: {
+          question: "checks?",
+          meta: {
+            type: "array",
+            element: {
+              type: "struct",
+              fields: {
+                label: { question: "label?", meta: { type: "string" } },
+              },
+            },
+          },
+        },
+      },
+    };
+    const value = { ready: true, checks: [{ label: "complete" }] };
+    const report = {
+      outcome: "completed",
+      semantic: {
+        observations: { "observe:1": { status: "resolved", value } },
+      },
+    };
+    const run = vi.fn<OpenAiSdkTstRunFn>(async (input) => {
+      const schema = input.agent.outputType as ZodType;
+      expect(schema.safeParse({ report }).success).toBe(true);
+      expect(
+        schema.safeParse({
+          report: {
+            ...report,
+            semantic: {
+              observations: { "observe:wrong": { status: "resolved", value } },
+            },
+          },
+        }).success,
+      ).toBe(false);
+      expect(
+        schema.safeParse({
+          report: {
+            ...report,
+            semantic: {
+              observations: {
+                "observe:1": {
+                  status: "resolved",
+                  value: { ready: true, checks: [{}] },
+                },
+              },
+            },
+          },
+        }).success,
+      ).toBe(false);
+      return { finalOutput: { report } };
+    });
+    const backend = new OpenAiSdkTstWorker({ apiKey: "test", run });
+    await expect(runSemantic(backend, task)).resolves.toMatchObject(report);
+    expect(run).toHaveBeenCalledOnce();
+    await backend.stop();
+  });
+
   it("aborts active OpenAI TST execution on stop and fences later provider entry", async () => {
     let entered!: () => void;
     const started = new Promise<void>((resolve) => {
@@ -129,7 +195,7 @@ describe("OpenAiSdkTstWorker", () => {
     });
   });
 
-  it("returns unrequested OpenAI TST semantic keys for worker hub validation", async () => {
+  it("rejects unrequested OpenAI TST semantic keys against the bound schema", async () => {
     const backend = new OpenAiSdkTstWorker({
       apiKey: "sk-test",
       run: runReturning({
@@ -140,12 +206,9 @@ describe("OpenAiSdkTstWorker", () => {
       }),
     });
 
-    await expect(runSemantic(backend, judgmentTask())).resolves.toMatchObject({
-      outcome: "completed",
-      semantic: {
-        judgments: { "judge:1": true, "judge:extra": false },
-      },
-    });
+    await expect(runSemantic(backend, judgmentTask())).rejects.toThrow(
+      "judge:extra",
+    );
   });
 
   it("rejects non-semantic routines clearly in the OpenAI tst backend", async () => {
@@ -272,7 +335,7 @@ describe("OpenAiSdkTstWorker", () => {
 
 function runReturning(value: unknown) {
   return vi.fn<OpenAiSdkTstRunFn>(async () => ({
-    finalOutput: JSON.stringify(value),
+    finalOutput: JSON.stringify({ report: value }),
     lastResponseId: "resp-semantic",
   }));
 }

@@ -38,6 +38,7 @@ import {
   HOST_MODULE_DECLARATIONS,
   INVALID_INSTRUCTION_SOURCE,
   OBSERVE_SOURCE,
+  STRUCT_OBSERVE_SOURCE,
   WATCH_SOURCE,
   deferred,
   hostModule,
@@ -1627,6 +1628,91 @@ function Main() {
       expect.objectContaining({
         role: "greeter",
         texts: ["Interest is warm, mood is high."],
+      }),
+    ]);
+  });
+
+  it("commits a Struct observation report into the next Arc frontier", async () => {
+    const arcHost = await makeArcHostWithSource(
+      "struct-observe",
+      STRUCT_OBSERVE_SOURCE,
+    );
+    const driver = await beginActivatedDriver(arcHost, {
+      cursor: { user: 0, self: 0 },
+      lastTurns: [],
+    });
+    const begun = driver.frontier;
+
+    expect(begun.status).toBe("ready");
+    expect(begun.briefs.observations).toEqual([
+      expect.objectContaining({
+        cell: "trip",
+        meta: expect.objectContaining({ type: "struct" }),
+      }),
+    ]);
+    const task = begun.tasks[0];
+    if (task?.kind !== "semantic") throw new Error("expected a semantic task");
+    // The tool schema asks for a complete record, recursively, so a strict
+    // tool call cannot omit a declared field.
+    expect(
+      (task.requests[0]?.tool.parameters.anyOf as unknown[])[0],
+    ).toMatchObject({
+      properties: {
+        value: {
+          type: "object",
+          properties: {
+            destination: { type: "string" },
+            stops: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  city: { type: "string" },
+                  nights: { type: "number" },
+                },
+                required: ["city", "nights"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ["destination", "stops"],
+          additionalProperties: false,
+        },
+      },
+    });
+
+    const committed = await advanceView(
+      driver,
+      { cursor: { user: 0, self: 0 }, lastTurns: [] },
+      {
+        instructionCoverage: {},
+        reports: [
+          {
+            outcome: "completed",
+            semantic: {
+              observations: {
+                [begun.briefs.observations[0]!.id]: {
+                  status: "resolved",
+                  value: {
+                    destination: "Kyoto",
+                    stops: [
+                      { city: "Osaka", nights: 2 },
+                      { city: "Nara", nights: 1 },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+        ],
+      },
+    );
+
+    expect(committed.status).toBe("ready");
+    expect(committed.tasks).toEqual([
+      expect.objectContaining({
+        role: "greeter",
+        texts: ["Trip to Kyoto with 2 stops."],
       }),
     ]);
   });

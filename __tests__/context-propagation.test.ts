@@ -64,8 +64,10 @@ describe("service-to-provider context propagation", () => {
       }
       return {
         finalOutput: JSON.stringify({
-          outcome: "completed",
-          semantic: { judgments },
+          report: {
+            outcome: "completed",
+            semantic: { judgments },
+          },
         }),
         lastResponseId: "resp-trigger",
       };
@@ -390,7 +392,11 @@ async function invokeWorkerTool(
     .tools;
   const tool = tools.find((candidate) => candidate.name === name);
   if (!tool) throw new Error(`worker tool not found: ${name}`);
-  await tool.invoke({} as never, JSON.stringify(input), {});
+  await tool.invoke(
+    {} as never,
+    JSON.stringify(name === "report" ? { report: input } : input),
+    {},
+  );
 }
 
 async function findInstructionRoutine(

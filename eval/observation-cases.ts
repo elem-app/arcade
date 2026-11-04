@@ -1,5 +1,5 @@
 /**
- * Behavioral scenarios for grouped observations, array observations, and the
+ * Behavioral scenarios for grouped, array, and Struct observations and the
  * grouped ask path, shared by the OpenAI and Claude general SDK evals.
  *
  * Each case is decided by Arc control flow over observed cell values: the Arc
@@ -16,6 +16,9 @@
  * `__tests__/observation-cases.test.ts`.
  */
 
+import type { ObservedValue } from "@elem-app/arc/runtime";
+import { structObservationCases } from "./struct-observation-cases.js";
+
 /** One shared observation scenario. */
 export type ObservationCase = {
   name: string;
@@ -24,7 +27,7 @@ export type ObservationCase = {
   /** Arc source whose branch is decided by the observed cell values. */
   arcSource: string;
   /** Observed values the Arc must hold, keyed by cell name. */
-  observed: Record<string, string | string[]>;
+  observed: Record<string, ObservedValue>;
   /** Relative artifact path the selected branch writes. */
   artifact: string;
   /** Substrings the produced artifact must carry. */
@@ -191,6 +194,30 @@ export function observationCases(): ObservationCase[] {
     ARRAY_OBSERVATION,
     GROUPED_ASK,
     GUIDED_OBSERVATION,
+    ...structObservationCases().map(
+      (item): ObservationCase => ({
+        name: item.name,
+        inbound: item.inbound,
+        observed: { [item.cell]: item.value },
+        artifact: "selected.md",
+        requiredArtifactFacts: [item.expectedText],
+        unselectedArtifact: "other.md",
+        arcSource: `"arc";
+function Main() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "writer" };
+${item.declaration}
+  let selected = Artifact("selected.md");
+  let other = Artifact("other.md");
+  $observe(${item.cell});
+  if (${item.condition}) {
+    $instruct(\`Create \${selected} whose entire content is exactly this one line: ${item.rendered}\`);
+  } else {
+    $instruct(\`Create \${other} whose entire content is exactly this one line: ${item.rendered}\`);
+  }
+}`,
+      }),
+    ),
   ];
 }
 

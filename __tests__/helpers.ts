@@ -241,6 +241,28 @@ function LearnPreferences() {
 }
 `;
 
+export const STRUCT_OBSERVE_SOURCE = `
+"arc";
+
+function LearnTrip() {
+  this.trigger = () => {
+    return true;
+  };
+  this.hostParams = {
+    workerRole: "greeter",
+  };
+  let trip = Struct(
+    {
+      destination: Str({ observing: \`where \${user} wants to go\` }),
+      stops: Array(Struct({ city: Str(), nights: Num() })),
+    },
+    { observing: \`the trip \${user} describes\` },
+  );
+  $observe(trip);
+  $instruct(\`Trip to \${trip.destination} with \${trip.stops.length} stops.\`);
+}
+`;
+
 export const DEFLECTABLE_SOURCE = `
 "arc";
 

@@ -145,6 +145,10 @@ import {
   createReplayIso,
   stageReplayIso,
 } from "./replay-verify.js";
+import {
+  observationGroupResultSchema,
+  observationResultSchema,
+} from "./semantic-schema.js";
 import type { WorkEventService } from "./work-events.js";
 import { semanticTaskSourceRef } from "./worker-context.js";
 
@@ -5380,86 +5384,6 @@ function roleFromHostParams(params: PayloadValue): string {
   return typeof role === "string" && role.trim() !== ""
     ? role
     : DEFAULT_WORKER_ROLE;
-}
-
-function scalarObservationValueSchema(meta: {
-  type: "boolean" | "string" | "enum" | "rangedInt" | "number";
-  values?: string[];
-  min?: number;
-  max?: number;
-}): Record<string, unknown> {
-  return meta.type === "boolean"
-    ? { type: "boolean" }
-    : meta.type === "rangedInt"
-      ? {
-          type: "integer",
-          minimum: meta.min,
-          maximum: meta.max,
-        }
-      : meta.type === "number"
-        ? {
-            type: "number",
-            minimum: meta.min,
-            maximum: meta.max,
-          }
-        : {
-            type: "string",
-            enum: meta.values,
-          };
-}
-
-function observationResultSchema(
-  request: Pick<SemanticRequest & { kind: "observation" }, "mode" | "meta">,
-): Record<string, unknown> {
-  const valueSchema =
-    request.meta.type === "array"
-      ? {
-          type: "array",
-          items: scalarObservationValueSchema(request.meta.element),
-        }
-      : scalarObservationValueSchema(request.meta);
-
-  return {
-    type: "object",
-    properties: {
-      status: {
-        type: "string",
-        enum:
-          request.mode === "observeOrAsk"
-            ? ["resolved", "unknown", "needs-user"]
-            : ["resolved", "unknown"],
-      },
-      value: valueSchema,
-    },
-    required: ["status"],
-    additionalProperties: false,
-  };
-}
-
-/**
- * Tool schema for a grouped observation: one property per grouped cell, each
- * carrying the same per-cell observation result schema a single observation
- * uses. Every field is required so the model reports the whole group atomically.
- */
-function observationGroupResultSchema(
-  request: Pick<
-    SemanticRequest & { kind: "observation-group" },
-    "mode" | "fields"
-  >,
-): Record<string, unknown> {
-  const properties: Record<string, unknown> = {};
-  for (const field of request.fields) {
-    properties[field.cell] = observationResultSchema({
-      mode: request.mode,
-      meta: field.meta,
-    });
-  }
-  return {
-    type: "object",
-    properties,
-    required: request.fields.map((field) => field.cell),
-    additionalProperties: false,
-  };
 }
 
 function isPayloadObject(

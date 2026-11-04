@@ -10,10 +10,9 @@ import type { SecretResolver } from "../service/secrets.js";
 import {
   buildSemanticPrompt,
   buildSemanticSystemPrompt,
-  parseAgentJsonOutput,
 } from "../service/semantic-resolver.js";
+import { modelReportContract } from "../service/semantic-schema.js";
 import { routineTokenUsageFromOpenAiRun } from "../service/token-usage.js";
-import { isRecord, validateAgentRoutineReport } from "../service/utils.js";
 import { defineBackend, type Backend, type Worker } from "../types/backend.js";
 import type { JsonValue } from "../types/json.js";
 import type { RoutineInput, RoutineReport } from "../types/routine.js";
@@ -181,20 +180,11 @@ export class OpenAiSdkTstWorker implements Worker {
       await diagnostics.writeJson("sdk-result", result);
       const tokenUsage = routineTokenUsageFromOpenAiRun(result);
       if (tokenUsage) await effects.recordTokenUsage(tokenUsage);
-      const report =
+      const report = modelReportContract(task, true).parse(
         typeof result.finalOutput === "string"
-          ? await parseAgentJsonOutput(
-              result.finalOutput,
-              undefined,
-              "OpenAI SDK semantic output",
-              { allowOutbound: false },
-            )
-          : validateAgentRoutineReport(
-              isRecord(result.finalOutput) && "report" in result.finalOutput
-                ? result.finalOutput.report
-                : result.finalOutput,
-              "OpenAI SDK semantic output",
-            );
+          ? JSON.parse(result.finalOutput)
+          : result.finalOutput,
+      );
       this.#logger.info("backend.openai_sdk_tst.finished", {
         arcRunId: task.arcRunId,
         routineId: routine.id,
@@ -241,6 +231,7 @@ export class OpenAiSdkTstWorker implements Worker {
       name: `Arcade semantic ${task.role}`,
       instructions: buildSemanticSystemPrompt("trigger"),
       model: this.#model,
+      outputType: modelReportContract(task, true).schema,
     });
   }
 

@@ -121,7 +121,7 @@ export type SemanticRequest =
       mode: ObservationBrief["mode"];
       question: SemanticText;
       guidance?: SemanticText;
-      currentValue?: PrimitiveValue | PrimitiveValue[];
+      currentValue?: ObservationBrief["currentValue"];
       meta: ObservationBrief["meta"];
       tool: SemanticToolDefinition;
       sourceRef: NodeRef;

@@ -2,7 +2,9 @@ import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { ObservationMeta } from "@elem-app/arc/runtime";
 import { describe, expect, it, vi } from "vitest";
+import { fromJSONSchema } from "zod/v4";
 
 import type { RoutineDescriptor } from "../src/index.js";
 import {
@@ -28,6 +30,159 @@ import {
 import { deferred } from "./helpers.js";
 
 describe("ClaudeSdkTstWorker", () => {
+  it("admits composite and grouped observations through the Claude trigger output schema", async () => {
+    const meta: ObservationMeta = {
+      type: "struct",
+      fields: {
+        destination: { question: "where to?", meta: { type: "string" } },
+        stops: {
+          question: "which stops?",
+          meta: {
+            type: "array",
+            element: {
+              type: "struct",
+              fields: {
+                nights: { question: "how long?", meta: { type: "number" } },
+              },
+            },
+          },
+        },
+      },
+    };
+    const value = { destination: "Kyoto", stops: [{ nights: 2 }] };
+    const task = observationTask();
+    task.requests = [
+      {
+        ...task.requests[0]!,
+        kind: "observation",
+        cell: "trip",
+        mode: "observe",
+        question: "the trip",
+        meta,
+      },
+      {
+        kind: "observation-group",
+        briefId: "observe:group",
+        role: "default",
+        mode: "observe",
+        tool: semanticTool(),
+        sourceRef: "node:test:Main",
+        fields: [
+          {
+            cell: "trips",
+            question: "the trips",
+            meta: { type: "array", element: meta },
+          },
+          {
+            cell: "tags",
+            question: "the tags",
+            meta: { type: "array", element: { type: "string" } },
+          },
+          { cell: "missing", question: "unknown?", meta: { type: "string" } },
+        ],
+      },
+    ];
+    const report = {
+      outcome: "completed",
+      semantic: {
+        observations: {
+          "observe:1": { status: "resolved", value },
+          "observe:group": {
+            fields: {
+              trips: { status: "resolved", value: [value] },
+              tags: { status: "resolved", value: ["holiday"] },
+              missing: { status: "unknown" },
+            },
+          },
+        },
+      },
+    };
+    const query = vi.fn((params: Parameters<ClaudeSdkTstQueryFn>[0]) => {
+      const format = params.options?.outputFormat;
+      if (format?.type !== "json_schema")
+        throw new Error("expected output schema");
+      const schema = fromJSONSchema(format.schema);
+      expect(schema.safeParse({ report }).success).toBe(true);
+      const withObservation = (outcome: unknown) => ({
+        report: {
+          outcome: "completed",
+          semantic: {
+            observations: {
+              ...report.semantic.observations,
+              "observe:1": outcome,
+            },
+          },
+        },
+      });
+      expect(
+        schema.safeParse(withObservation({ status: "unknown" })).success,
+      ).toBe(true);
+      for (const outcome of [
+        { status: "resolved" },
+        { status: "unknown", value },
+        { status: "needs-user", value },
+      ]) {
+        expect(schema.safeParse(withObservation(outcome)).success).toBe(false);
+      }
+      return sdkMessages(JSON.stringify({ report }));
+    });
+    const backend = new ClaudeSdkTstWorker({
+      fastStarts: { enabled: false },
+      query: query as unknown as ClaudeSdkTstQueryFn,
+    });
+    await expect(runSemantic(backend, task)).resolves.toMatchObject(report);
+    expect(query).toHaveBeenCalledOnce();
+    await backend.stop();
+  });
+
+  it("retires prepared Claude trigger starts when the requested report schema changes", async () => {
+    const starts: Array<{ close: ReturnType<typeof vi.fn>; schema: unknown }> =
+      [];
+    const query = vi.fn((params: Parameters<ClaudeSdkTstQueryFn>[0]) => {
+      const observation = String(params.prompt).includes('"observe:1"');
+      return sdkMessages(
+        JSON.stringify({
+          report: {
+            outcome: "completed",
+            semantic: observation
+              ? {
+                  observations: {
+                    "observe:1": { status: "resolved", value: "yes" },
+                  },
+                }
+              : { judgments: { "judge:1": true } },
+          },
+        }),
+      );
+    });
+    const startup = vi.fn(
+      async (input: Parameters<ClaudeSdkTstStartupFn>[0]) => {
+        const start = { close: vi.fn(), schema: input?.options?.outputFormat };
+        starts.push(start);
+        return {
+          close: start.close,
+          query: vi.fn(() => semanticMessages(true)),
+        };
+      },
+    );
+    const worker = new ClaudeSdkTstWorker({
+      query: query as unknown as ClaudeSdkTstQueryFn,
+      startup: startup as unknown as ClaudeSdkTstStartupFn,
+      fastStarts: { enabled: true, maxPreparedStarts: 1 },
+    });
+    try {
+      await runSemantic(worker, judgmentTask());
+      await flushMicrotasks();
+      await runSemantic(worker, observationTask());
+      await flushMicrotasks();
+      expect(query).toHaveBeenCalledTimes(2);
+      expect(starts[0]!.close).toHaveBeenCalledOnce();
+      expect(starts[0]!.schema).not.toEqual(starts[1]!.schema);
+    } finally {
+      await worker.stop();
+    }
+  });
+
   it("aborts an active Claude TST query on stop and closes its transport", async () => {
     const entered = deferred();
     const close = vi.fn();
@@ -269,7 +424,7 @@ describe("ClaudeSdkTstWorker", () => {
     });
   });
 
-  it("leaves task-aware completeness validation to worker hub", async () => {
+  it("rejects missing Claude TST answers against the bound schema", async () => {
     const backend = new ClaudeSdkTstWorker({
       query: queryReturning({
         report: {
@@ -279,13 +434,12 @@ describe("ClaudeSdkTstWorker", () => {
       }),
     });
 
-    await expect(runSemantic(backend, judgmentTask())).resolves.toMatchObject({
-      outcome: "completed",
-      semantic: { judgments: {} },
-    });
+    await expect(runSemantic(backend, judgmentTask())).rejects.toThrow(
+      "judge:1",
+    );
   });
 
-  it("returns unrequested Claude TST semantic keys for worker hub validation", async () => {
+  it("rejects unrequested Claude TST semantic keys against the bound schema", async () => {
     const logger = {
       level: "info" as const,
       format: "json" as const,
@@ -319,15 +473,7 @@ describe("ClaudeSdkTstWorker", () => {
         noopRoutineEffects(),
         diagnostics,
       ),
-    ).resolves.toMatchObject({
-      outcome: "completed",
-      semantic: {
-        judgments: { "judge:1": true },
-        observations: {
-          "judge:1": { status: "resolved", value: "echoed" },
-        },
-      },
-    });
+    ).rejects.toThrow("observations");
     expect(logger.info).not.toHaveBeenCalledWith(
       expect.stringContaining("semantic_drift"),
       expect.anything(),
@@ -569,6 +715,39 @@ describe("ClaudeSdkTstWorker", () => {
     expect(transcript).toHaveLength(2);
   });
 
+  it("retains partial Claude TST messages when the provider stream fails", async () => {
+    const backend = new ClaudeSdkTstWorker({
+      fastStarts: { enabled: false },
+      query: (() =>
+        (async function* () {
+          for await (const message of sdkMessages("partial semantic output")) {
+            yield message;
+            break;
+          }
+          throw new Error("Reached maximum number of turns (2)");
+        })()) as unknown as ClaudeSdkTstQueryFn,
+    });
+    const diagnostics = { ...noopDiagnostics, writeJson: vi.fn() };
+    await expect(
+      runBackend(
+        backend,
+        semanticRoutine(judgmentTask()),
+        context(),
+        noopRoutineEffects(),
+        diagnostics,
+      ),
+    ).rejects.toThrow("Reached maximum number of turns (2)");
+    expect(diagnostics.writeJson).toHaveBeenCalledWith("sdk-messages", [
+      expect.objectContaining({
+        type: "assistant",
+        message: expect.objectContaining({
+          content: [{ type: "text", text: "partial semantic output" }],
+        }),
+      }),
+    ]);
+    await backend.stop();
+  });
+
   it("uses the supplied workspace for Claude TST cold queries", async () => {
     const query = queryReturning({
       report: {
@@ -631,7 +810,7 @@ describe("ClaudeSdkTstWorker", () => {
     backend.stop();
   });
 
-  it("starts a task-independent fast-trigger pool from invocation admission", async () => {
+  it("starts a schema-bound fast-trigger pool from invocation admission", async () => {
     const query = queryReturning({
       report: {
         outcome: "completed",
@@ -857,7 +1036,13 @@ function queryReturning(
   value: unknown,
 ): ClaudeSdkTstQueryFn & ReturnType<typeof vi.fn> {
   return vi.fn((_params: Parameters<ClaudeSdkTstQueryFn>[0]) =>
-    sdkMessages(JSON.stringify(value)),
+    sdkMessages(
+      JSON.stringify(
+        typeof value === "object" && value !== null && "report" in value
+          ? value
+          : { report: value },
+      ),
+    ),
   ) as unknown as ClaudeSdkTstQueryFn & ReturnType<typeof vi.fn>;
 }
 

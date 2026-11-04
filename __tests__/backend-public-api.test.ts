@@ -633,7 +633,7 @@ describe("backend authoring public API", () => {
     const context = routineContext();
 
     expect(buildSemanticSystemPrompt(task.stage)).toContain(
-      "Include a key for every request id",
+      "Resolve every requested judgment or observation",
     );
     expect(buildSemanticPrompt(task, context)).toContain('"id": "judge:1"');
     expect(buildSemanticSystemPrompt(task.stage)).toContain(

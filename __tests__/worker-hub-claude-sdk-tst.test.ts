@@ -114,11 +114,7 @@ function Watch() {
     expect(prompt).toContain("<rules>");
     expect(prompt).toContain("</rules>");
     expect(prompt).toContain("Resolve this action semantic work.");
-    expect(prompt).toContain("Semantic report:");
-    expect(prompt).toContain(
-      'Do not call report with bare {"outcome":"completed"} for semantic work.',
-    );
-    expect(prompt).toContain('{"status":"resolved","value":true}');
+    expect(prompt).toContain("Call report using its declared schema");
   });
 });
 

@@ -30,6 +30,7 @@ import {
 import { ArcHostService } from "../../src/service/arc-host.js";
 import { createSecretResolver } from "../../src/service/secrets.js";
 import { WorkerHubService } from "../../src/service/worker-hub.js";
+import { arcRunKey } from "../../src/storage/base.js";
 import {
   InMemoryArcHostStore,
   InMemoryHistoryStore,
@@ -850,10 +851,11 @@ defineManagedEvalGroup(
         new InMemoryWorkEventStore(),
         createArcadeLogger(),
       );
+      const store = new InMemoryArcHostStore();
       const arcHost = new ArcHostService({
         executionControl: routineStore,
         workEvents,
-        store: new InMemoryArcHostStore(),
+        store,
         artifactRoot,
         logger,
       });
@@ -912,6 +914,18 @@ defineManagedEvalGroup(
       for (const fact of item.requiredArtifactFacts) {
         expect(content, `${item.name}:${fact}`).toContain(fact);
       }
+      // The writer also sees the inbound, so check committed cells directly:
+      // correcting a bad observation while writing must not produce a pass.
+      const state = await store.getState(arcRunKey(arcRunId));
+      const cells = state?.traversals.find(
+        (traversal) => traversal.ref === state.arcRef,
+      )?.cells;
+      expect(
+        Object.fromEntries(
+          Object.keys(item.observed).map((cell) => [cell, cells?.[cell]]),
+        ),
+        `${item.name}: complete committed observations`,
+      ).toEqual(item.observed);
       await expect(
         readFile(
           runArtifactPath(artifactRoot, arcRunId, item.unselectedArtifact),

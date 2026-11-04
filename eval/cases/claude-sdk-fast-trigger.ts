@@ -145,8 +145,8 @@ defineManagedEvalGroup(
         ),
       );
 
-      // The first observation owns the initial pool acquisition for each turn.
-      // Exclude the bootstrap turn before checking the concurrent overflow.
+      // Every turn requests the same composite value, so the two prepared
+      // schemas are eligible and the third concurrent turn overflows cold.
       const overflowRoutines = (
         await waitForTriggerRoutines(routineStore, 4)
       ).filter((routine) => !bootstrapIds.has(routine.id));
@@ -190,6 +190,29 @@ defineManagedEvalGroup(
       expect(preparedStarts.snapshot().consumed).toBeGreaterThan(
         consumedBeforeReplenished,
       );
+      // Changing the required record fields makes the ready starts incompatible.
+      await arcHost.registerArcs([
+        {
+          source: "claude-sdk-fast-trigger",
+          document: parse(fastTriggerEvalArc(sentinel, true)),
+          replace: true,
+        },
+      ]);
+      const previousIds = new Set(allRoutines.map((routine) => routine.id));
+      const changedArcRunId = await submitResearchCheck(
+        workerHub,
+        "changed-schema",
+        sentinel,
+      );
+      const changedRoutine = (
+        await waitForTriggerRoutines(routineStore, 6)
+      ).find((routine) => !previousIds.has(routine.id));
+      expect(changedRoutine?.backendDetails).toMatchObject({
+        backend: "claude-sdk-tst",
+        preparedStartUsed: false,
+      });
+      expectTriggerSemanticTask(changedRoutine?.task);
+      await expectReplies(replies, [changedArcRunId], sentinel);
       expect(preparedStarts.snapshot().failed).toBe(0);
       expect(questions).toHaveLength(0);
     } finally {
@@ -206,17 +229,12 @@ function expectTriggerSemanticTask(
   if (task?.kind !== "semantic") return;
   expect(task.stage).toBe("trigger");
   expect(task.role).toBe(SEMANTIC_ROLE);
-  expect(task.requests.length).toBeGreaterThan(0);
-  const judgment = task.requests.find((request) => request.kind === "judgment");
-  const observation = task.requests.find(
-    (request) => request.kind === "observation",
-  );
-  if (judgment) {
-    expect(judgment.question).toContain("Please start the research check");
-  }
-  if (observation) {
-    expect(observation.cell).toBe("route");
-  }
+  expect(task.requests).toHaveLength(1);
+  expect(task.requests[0]).toMatchObject({
+    kind: "observation",
+    cell: "request",
+    meta: expect.objectContaining({ type: "struct" }),
+  });
 }
 
 function preparedStartUsed(routine: RoutineState): boolean | undefined {
@@ -244,9 +262,8 @@ async function waitForTriggerRoutines(
   count: number,
 ): Promise<RoutineState[]> {
   return waitFor(async () => {
-    // Each trigger turn resolves as an `observe` then a `judge` routine sharing
-    // one volatile arcRunId; keep the first seen per turn (the `observe`, which
-    // is persisted first) so the count tracks distinct turns, not routines.
+    // Each trigger turn resolves one composite observation. Track its routine
+    // by probe run so concurrent submissions remain independent.
     const byTurn = new Map<ArcRunId, RoutineState>();
     for await (const routine of store.listRoutines()) {
       if (routine.task.kind !== "semantic") continue;
@@ -262,7 +279,7 @@ async function waitForTriggerRoutines(
   });
 }
 
-function fastTriggerEvalArc(sentinel: string): string {
+function fastTriggerEvalArc(sentinel: string, changedSchema = false): string {
   return `
 "arc";
 
@@ -270,12 +287,15 @@ function ResearchCheck() {
   this.hostParams = {
     workerRole: "${SEMANTIC_ROLE}",
   };
-  let route = Enum(["normal", "expedite"], {
-    observing: \`The route value stated in the latest user message.\`,
-  });
+  let request = Struct({
+    route: Enum(["normal", "expedite"], { observing: "The route value stated in the latest user message." }),
+    token: Str({ observing: "The required token stated in the latest user message." }),
+    start: Bool({ observing: "Whether the latest user message asks: Please start the research check." }),
+    ${changedSchema ? 'confirmed: Bool({ observing: "Whether the latest user message explicitly states a required token." }),' : ""}
+  }, { observing: "The research-check request in the latest user message." });
   this.trigger = () => {
-    $observe(route);
-        return judge(\`The latest user message contains the exact token "${sentinel}" and the words "Please start the research check".\`) && route == "expedite";
+    $observe(request);
+    return request.start && request.token == "${sentinel}" && request.route == "expedite"${changedSchema ? " && request.confirmed" : ""};
   };
 
   $enter(Respond);

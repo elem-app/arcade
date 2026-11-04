@@ -745,11 +745,13 @@ function Main() {
     const arcHost = await makeArcHostWithSource("test", TRIGGER_JUDGE_SOURCE);
     const run = vi.fn<OpenAiSdkTstRunFn>(async ({ prompt }) => ({
       finalOutput: JSON.stringify({
-        outcome: "completed",
-        semantic: {
-          judgments: Object.fromEntries(
-            semanticRequestIds(prompt).map((id) => [id, true]),
-          ),
+        report: {
+          outcome: "completed",
+          semantic: {
+            judgments: Object.fromEntries(
+              semanticRequestIds(prompt).map((id) => [id, true]),
+            ),
+          },
         },
       }),
       lastResponseId: "resp-semantic",
@@ -1570,7 +1572,7 @@ function claudeSemanticQuery(
       await callClaudeSdkTool(
         params,
         "report",
-        prompt.includes('{"outcome":"completed","semantic":')
+        prompt.includes("<semantic-requests>")
           ? (exampleSemanticReport(prompt) as Record<string, unknown>)
           : { outcome: "completed" },
       );

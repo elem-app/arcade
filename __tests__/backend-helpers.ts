@@ -117,10 +117,7 @@ export async function callSdkReport(
       >;
     };
   };
-  await server.instance._registeredTools.report!.handler(
-    report as Record<string, unknown>,
-    {},
-  );
+  await server.instance._registeredTools.report!.handler({ report }, {});
 }
 
 /** A Claude SDK tst stream that yields one assistant text turn then a result. */
@@ -157,6 +154,10 @@ export async function callOpenAiTool(
     .tools;
   const fn = tools.find((tool) => tool.name === name);
   if (!fn) throw new Error(`tool not found: ${name}`);
-  const result = await fn.invoke({} as any, JSON.stringify(input), {});
+  const result = await fn.invoke(
+    {} as any,
+    JSON.stringify(name === "report" ? { report: input } : input),
+    {},
+  );
   return typeof result === "string" ? JSON.parse(result) : result;
 }

@@ -148,7 +148,7 @@ describe("Stock worker concurrent invocation ownership", () => {
                 await release[index]!.promise;
                 expect(signal.aborted).toBe(false);
                 return {
-                  finalOutput: JSON.stringify(report(index)),
+                  finalOutput: JSON.stringify({ report: report(index) }),
                   lastResponseId: `response:${index}`,
                 };
               },
@@ -164,13 +164,22 @@ describe("Stock worker concurrent invocation ownership", () => {
                   expect(params.options?.abortController?.signal.aborted).toBe(
                     false,
                   );
-                  yield* sdkTextMessages(JSON.stringify(report(index)));
+                  yield* sdkTextMessages(
+                    JSON.stringify({ report: report(index) }),
+                  );
                 })();
               }) as ClaudeSdkTstQueryFn,
             });
       const inputs: RoutineInput[] = [0, 1].map((index) => ({
         routine: routine(
-          { ...openAiSemanticTask(), arcRunId: `run:${index}` },
+          {
+            ...openAiSemanticTask(),
+            arcRunId: `run:${index}`,
+            requests: openAiSemanticTask().requests.map((request) => ({
+              ...request,
+              briefId: `judge:${index}`,
+            })),
+          },
           { id: `routine:${index}`, contextKey: `context:${index}` },
         ),
         context: { workspacePath: process.cwd(), workspaceBundle: {} },
