@@ -5674,6 +5674,11 @@ function hostParameterValueSpec(parameter) {
 }
 function cloneParameterSpec(spec2) {
   switch (spec2.type) {
+    case "union":
+      return {
+        type: "union",
+        members: spec2.members.map((member) => cloneParameterSpec(member))
+      };
     case "omittable":
       return { type: "omittable", spec: cloneParameterSpec(spec2.spec) };
     case "enum":
@@ -5698,7 +5703,28 @@ function cloneParameterSpec(spec2) {
   }
 }
 
+// node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/types/shape.js
+function fieldAtPath(struct, path, asStruct) {
+  let fields = struct.fields;
+  let field;
+  for (const [depth, name2] of path.entries()) {
+    if (depth > 0) {
+      const nested = asStruct(field);
+      if (!nested)
+        return void 0;
+      fields = nested.fields;
+    }
+    if (!Object.hasOwn(fields, name2))
+      return void 0;
+    field = fields[name2];
+  }
+  return field;
+}
+
 // node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/types/spec.js
+function isUnionMemberSpec(spec2) {
+  return spec2.type === "boolean" || spec2.type === "string" || spec2.type === "enum" || spec2.type === "number";
+}
 function isObservableCellSpec(spec2) {
   return spec2.type !== "dialogCursor" && spec2.type !== "artifact" && (spec2.type !== "array" || spec2.element.type !== "artifact");
 }
@@ -5719,6 +5745,8 @@ function isSettableCellSpec(spec2) {
 }
 function cellSpecToChannelSpec(spec2) {
   switch (spec2.type) {
+    case "union":
+      return unionSpecOf(spec2);
     case "boolean":
       return { type: "boolean" };
     case "string":
@@ -5740,22 +5768,6 @@ function cellSpecToChannelSpec(spec2) {
       return structSpecOf(spec2);
   }
 }
-function fieldAtPath(struct, path, asStruct) {
-  let fields = struct.fields;
-  let field;
-  for (const [depth, name2] of path.entries()) {
-    if (depth > 0) {
-      const nested = asStruct(field);
-      if (!nested)
-        return void 0;
-      fields = nested.fields;
-    }
-    if (!Object.hasOwn(fields, name2))
-      return void 0;
-    field = fields[name2];
-  }
-  return field;
-}
 function fieldSpecAt(spec2, path) {
   return fieldAtPath(spec2, path, (field) => field.type === "struct" ? field : void 0);
 }
@@ -5770,6 +5782,8 @@ function structSpecOf(spec2) {
 }
 function fieldSpecOf(spec2) {
   switch (spec2.type) {
+    case "union":
+      return unionSpecOf(spec2);
     case "struct":
       return structSpecOf(spec2);
     case "array":
@@ -5782,7 +5796,10 @@ function arrayElementSpecToChannelSpec(spec2) {
   return spec2.type === "artifact" ? { type: "artifact" } : observableElementSpecOf(spec2);
 }
 function observableElementSpecOf(spec2) {
-  return spec2.type === "struct" ? structSpecOf(spec2) : scalarSpecOf(spec2);
+  return spec2.type === "struct" ? structSpecOf(spec2) : spec2.type === "union" ? unionSpecOf(spec2) : scalarSpecOf(spec2);
+}
+function unionSpecOf(spec2) {
+  return { type: "union", members: spec2.members.map(scalarSpecOf) };
 }
 function scalarSpecOf(spec2) {
   switch (spec2.type) {
@@ -5798,35 +5815,18 @@ function scalarSpecOf(spec2) {
 }
 
 // node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/types/value.js
+function isPlainRecord(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
 function isPrimitiveValue(value) {
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
 function isPrimitiveArrayValue(value) {
   return Array.isArray(value) && value.every(isPrimitiveValue);
-}
-function isDialogCursorValue(value) {
-  try {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      return false;
-    }
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null)
-      return false;
-    const keys = Reflect.ownKeys(value);
-    if (keys.some((key) => typeof key !== "string" || key !== "user" && key !== "self" && key !== "view") || !keys.includes("user") || !keys.includes("self")) {
-      return false;
-    }
-    const fields = Object.fromEntries(keys.map((key) => [key, Object.getOwnPropertyDescriptor(value, key)]));
-    const user = fields.user;
-    const self = fields.self;
-    const view = fields.view;
-    if (!user || !self || !("value" in user) || !("value" in self) || !user.enumerable || !self.enumerable || view && (!("value" in view) || !view.enumerable)) {
-      return false;
-    }
-    return Number.isSafeInteger(user.value) && Number.isSafeInteger(self.value) && user.value >= 0 && self.value >= 0 && (!view || view.value === void 0 || typeof view.value === "string");
-  } catch {
-    return false;
-  }
 }
 function classifyArtifactPath(path) {
   if (typeof path !== "string")
@@ -5848,13 +5848,8 @@ function classifyArtifactValue(value) {
   }
 }
 function classifyArtifactValueShape(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  if (!isPlainRecord(value))
     return "not-plain-object";
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return "not-plain-object";
-  }
   const keys = Reflect.ownKeys(value);
   if (keys.length !== 1 || !keys.includes("path"))
     return "invalid-keys";
@@ -5867,14 +5862,29 @@ function classifyArtifactValueShape(value) {
 function isArtifactValue(value) {
   return classifyArtifactValue(value) === void 0;
 }
-
-// node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/value-utils.js
-function isPlainRecord(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
+function describeArtifactPathIssue(issue2) {
+  switch (issue2) {
+    case "non-string":
+      return "path must be a string";
+    case "empty":
+      return "path cannot be empty";
+    case "absolute":
+      return "path must be relative";
+    case "dot-segment":
+      return 'path cannot contain "." or ".." segments';
   }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+}
+function describeArtifactValueIssue(issue2) {
+  switch (issue2) {
+    case "not-plain-object":
+      return "value must be a plain object";
+    case "invalid-keys":
+      return "value must contain exactly path";
+    case "invalid-properties":
+      return "path must be an enumerable data property";
+    default:
+      return describeArtifactPathIssue(issue2);
+  }
 }
 function firstInvalidPayloadValue(value, path = "$") {
   try {
@@ -6008,29 +6018,390 @@ function firstNonFiniteNumberPath(value, path = "$") {
   }
   return void 0;
 }
-function describeArtifactPathIssue(issue2) {
-  switch (issue2) {
-    case "non-string":
-      return "path must be a string";
-    case "empty":
-      return "path cannot be empty";
-    case "absolute":
-      return "path must be relative";
-    case "dot-segment":
-      return 'path cannot contain "." or ".." segments';
+function isDialogCursorValue(value) {
+  try {
+    if (!isPlainRecord(value))
+      return false;
+    const keys = Reflect.ownKeys(value);
+    if (keys.some((key) => typeof key !== "string" || key !== "user" && key !== "self" && key !== "view") || !keys.includes("user") || !keys.includes("self")) {
+      return false;
+    }
+    const fields = Object.fromEntries(keys.map((key) => [key, Object.getOwnPropertyDescriptor(value, key)]));
+    const user = fields.user;
+    const self = fields.self;
+    const view = fields.view;
+    if (!user || !self || !("value" in user) || !("value" in self) || !user.enumerable || !self.enumerable || view && (!("value" in view) || !view.enumerable)) {
+      return false;
+    }
+    return Number.isSafeInteger(user.value) && Number.isSafeInteger(self.value) && user.value >= 0 && self.value >= 0 && (!view || view.value === void 0 || typeof view.value === "string");
+  } catch {
+    return false;
   }
 }
-function describeArtifactValueIssue(issue2) {
-  switch (issue2) {
-    case "not-plain-object":
-      return "value must be a plain object";
-    case "invalid-keys":
-      return "value must contain exactly path";
-    case "invalid-properties":
-      return "path must be an enumerable data property";
-    default:
-      return describeArtifactPathIssue(issue2);
+
+// node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/spec/fmt.js
+var at2 = (path, key) => `${path}[${JSON.stringify(key)}]`;
+function validateFmtConfig(value, path = "$") {
+  const record2 = (input, keys, here) => {
+    if (!isPlainRecord(input))
+      return {
+        path: here,
+        detail: "Expected a fmt configuration object"
+      };
+    for (const key of Reflect.ownKeys(input)) {
+      if (typeof key !== "string" || !keys.includes(key))
+        return {
+          path: typeof key === "string" ? at2(here, key) : here,
+          detail: "Unknown fmt setting"
+        };
+      const property = Object.getOwnPropertyDescriptor(input, key);
+      if (!("value" in property) || !property.enumerable)
+        return {
+          path: at2(here, key),
+          detail: "Fmt settings must be enumerable data properties"
+        };
+    }
+    return void 0;
+  };
+  const root = record2(value, ["array", "struct", "str"], path);
+  if (root)
+    return root;
+  const config = value;
+  if (Object.hasOwn(config, "str") && config.str !== "bare" && config.str !== "json")
+    return { path: at2(path, "str"), detail: 'Expected "bare" or "json"' };
+  if (Object.hasOwn(config, "struct")) {
+    const here = at2(path, "struct");
+    const issue2 = record2(config.struct, ["style"], here);
+    if (issue2)
+      return issue2;
+    const struct = config.struct;
+    if (Object.hasOwn(struct, "style") && struct.style !== "json")
+      return { path: at2(here, "style"), detail: 'Expected "json"' };
   }
+  if (Object.hasOwn(config, "array")) {
+    const here = at2(path, "array");
+    const issue2 = record2(config.array, ["style", "separator", "parentheses"], here);
+    if (issue2)
+      return issue2;
+    const array2 = config.array;
+    if (Object.hasOwn(array2, "style")) {
+      if (array2.style !== "json")
+        return { path: at2(here, "style"), detail: 'Expected "json"' };
+      for (const key of ["separator", "parentheses"])
+        if (Object.hasOwn(array2, key))
+          return {
+            path: at2(here, key),
+            detail: "JSON array style cannot include layout settings"
+          };
+    }
+    if (Object.hasOwn(array2, "separator") && typeof array2.separator !== "string")
+      return {
+        path: at2(here, "separator"),
+        detail: "Expected a string separator"
+      };
+    if (Object.hasOwn(array2, "parentheses") && !["", "[]", "()", "{}"].includes(array2.parentheses))
+      return {
+        path: at2(here, "parentheses"),
+        detail: "Expected empty, square, round, or curly delimiters"
+      };
+  }
+  return void 0;
+}
+function normalizeFmtConfig(config) {
+  return {
+    array: config.array?.style === "json" ? { style: "json" } : {
+      separator: config.array?.separator ?? ", ",
+      parentheses: config.array?.parentheses ?? ""
+    },
+    struct: { style: "json" },
+    str: config.str ?? "bare"
+  };
+}
+function specShape(spec2) {
+  switch (spec2.type) {
+    case "union":
+      return {
+        kind: "alternatives",
+        alternatives: spec2.members.map(specShape)
+      };
+    case "dialogCursor":
+      return { kind: "unusable" };
+    case "artifact":
+      return { kind: "artifact" };
+    case "array":
+      return { kind: "list", element: specShape(spec2.element) };
+    case "struct":
+      return {
+        kind: "struct",
+        fields: Object.fromEntries(Object.entries(spec2.fields).map(([key, field]) => [
+          key,
+          specShape(field)
+        ]))
+      };
+    default:
+      return { kind: "scalar", spec: spec2 };
+  }
+}
+function factShape(fact) {
+  switch (fact.kind) {
+    case "site":
+      return specShape(fact.spec);
+    case "carrier":
+      return { kind: "scalar", spec: { type: fact.carrier } };
+    case "literal":
+      return {
+        kind: "scalar",
+        spec: { type: typeof fact.value },
+        literal: fact.value
+      };
+    case "provenance":
+      return fact.provenance === "artifact" ? { kind: "artifact" } : fact.provenance === "index" ? { kind: "scalar", spec: { type: "index" } } : { kind: "unusable" };
+    case "array":
+      return { kind: "array", elements: fact.elements.map(factShape) };
+    case "empty-array":
+      return { kind: "array", elements: [] };
+  }
+}
+function evidenceShape(evidence) {
+  switch (evidence.kind) {
+    case "fact":
+      return factShape(evidence.fact);
+    case "alternatives":
+      return {
+        kind: "alternatives",
+        alternatives: evidence.alternatives.map(evidenceShape)
+      };
+    case "array":
+      return { kind: "array", elements: evidence.elements.map(evidenceShape) };
+    case "struct":
+      return {
+        kind: "struct",
+        fields: evidence.fields && Object.fromEntries(Object.entries(evidence.fields).map(([key, field]) => [
+          key,
+          evidenceShape(field)
+        ]))
+      };
+    default:
+      return evidence;
+  }
+}
+var disjoint = { overlaps: false, ambiguous: false };
+var same = { overlaps: true, ambiguous: false };
+function scalarFamily(shape) {
+  return shape.spec.type === "enum" ? "string" : shape.spec.type === "index" ? "number" : shape.spec.type;
+}
+function exactScalars(shape) {
+  return shape.literal !== void 0 ? [shape.literal] : shape.spec.type === "enum" ? shape.spec.values : void 0;
+}
+function scalarContains(shape, value) {
+  if (shape.literal !== void 0 && value !== shape.literal)
+    return false;
+  if (shape.spec.type === "enum")
+    return typeof value === "string" && shape.spec.values.includes(value);
+  if (shape.spec.type === "index")
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  return typeof value === shape.spec.type;
+}
+function artifactPathOverlap(shape) {
+  if (shape.kind === "dynamic")
+    return same;
+  if (shape.kind === "alternatives") {
+    const children = shape.alternatives.map(artifactPathOverlap);
+    return {
+      overlaps: children.some((child) => child.overlaps),
+      ambiguous: children.some((child) => child.ambiguous)
+    };
+  }
+  if (shape.kind !== "scalar" || scalarFamily(shape) !== "string")
+    return disjoint;
+  const values = exactScalars(shape);
+  return values && !values.some((value) => typeof value === "string" && classifyArtifactPath(value) === void 0) ? disjoint : { overlaps: true, ambiguous: true };
+}
+function overlap(left, right) {
+  if (left.kind === "alternatives" || right.kind === "alternatives") {
+    const pairs = (left.kind === "alternatives" ? left.alternatives : [left]).flatMap((a) => (right.kind === "alternatives" ? right.alternatives : [right]).map((b) => overlap(a, b)));
+    return {
+      overlaps: pairs.some((p) => p.overlaps),
+      ambiguous: pairs.some((p) => p.ambiguous)
+    };
+  }
+  if (left.kind === "unusable" || right.kind === "unusable")
+    return disjoint;
+  if (left.kind === "dynamic" || right.kind === "dynamic")
+    return same;
+  if (left.kind === "artifact" || right.kind === "artifact") {
+    if (left.kind === "artifact" && right.kind === "artifact")
+      return same;
+    const other = left.kind === "artifact" ? right : left;
+    if (other.kind !== "struct")
+      return disjoint;
+    if (!other.fields)
+      return same;
+    const keys = Object.keys(other.fields);
+    if (keys.length !== 1 || keys[0] !== "path")
+      return disjoint;
+    return artifactPathOverlap(other.fields.path);
+  }
+  if (left.kind === "scalar" || right.kind === "scalar") {
+    if (left.kind !== "scalar" || right.kind !== "scalar" || scalarFamily(left) !== scalarFamily(right))
+      return disjoint;
+    const a = exactScalars(left), b = exactScalars(right);
+    if (a && !a.some((value) => scalarContains(right, value)))
+      return disjoint;
+    if (b && !b.some((value) => scalarContains(left, value)))
+      return disjoint;
+    return same;
+  }
+  if (left.kind === "struct" || right.kind === "struct") {
+    if (left.kind !== "struct" || right.kind !== "struct")
+      return disjoint;
+    if (!left.fields || !right.fields)
+      return same;
+    const keys = Object.keys(left.fields);
+    if (keys.length !== Object.keys(right.fields).length || keys.some((key) => !Object.hasOwn(right.fields, key)))
+      return disjoint;
+    const children2 = keys.map((key) => overlap(left.fields[key], right.fields[key]));
+    return children2.some((p) => !p.overlaps) ? disjoint : { overlaps: true, ambiguous: children2.some((p) => p.ambiguous) };
+  }
+  if (left.kind === "list" && right.kind === "list") {
+    const child = overlap(left.element, right.element);
+    return { overlaps: true, ambiguous: child.ambiguous };
+  }
+  if (left.kind === "array" && right.kind === "array" && left.elements.length !== right.elements.length)
+    return disjoint;
+  const count = left.kind === "array" ? left.elements.length : right.kind === "array" ? right.elements.length : 0;
+  const children = Array.from({ length: count }, (_, i) => overlap(left.kind === "array" ? left.elements[i] : left.element, right.kind === "array" ? right.elements[i] : right.element));
+  return children.some((p) => !p.overlaps) ? disjoint : { overlaps: true, ambiguous: children.some((p) => p.ambiguous) };
+}
+function judgeShape(shape) {
+  if (shape.kind === "unusable")
+    return { kind: "incompatible" };
+  if (shape.kind === "dynamic" || shape.kind === "struct" && !shape.fields)
+    return { kind: "unknown" };
+  const children = shape.kind === "alternatives" ? shape.alternatives : shape.kind === "array" ? shape.elements : shape.kind === "list" ? [shape.element] : shape.kind === "struct" ? Object.values(shape.fields) : [];
+  const judgments = children.map(judgeShape);
+  if (judgments.some((j) => j.kind === "incompatible"))
+    return { kind: "incompatible" };
+  if (judgments.some((j) => j.kind === "unknown"))
+    return { kind: "unknown" };
+  if (shape.kind === "alternatives" && children.some((a, i) => children.slice(i + 1).some((b) => overlap(a, b).ambiguous)))
+    return { kind: "incompatible" };
+  return { kind: "compatible" };
+}
+function checkFmtEvidence(evidence) {
+  return judgeShape(evidenceShape(evidence));
+}
+function encodeJson(data2) {
+  if (Array.isArray(data2))
+    return `[${data2.map(encodeJson).join(",")}]`;
+  if (typeof data2 === "object")
+    return `{${Object.keys(data2).map((key) => `${JSON.stringify(key)}:${encodeJson(data2[key])}`).join(",")}}`;
+  return JSON.stringify(data2);
+}
+var fail = (detail, path) => ({
+  admitted: false,
+  violation: {
+    code: "invalid-fmt-value",
+    detail: `${detail} at ${path}`
+  }
+});
+function project(shape, value, path, admit) {
+  if (shape.kind === "unusable")
+    return fail("Unsupported formatting authority", path);
+  if (shape.kind === "alternatives") {
+    const projections = shape.alternatives.map((child) => project(child, value, path, admit));
+    const valid = projections.filter((p) => p.admitted);
+    if (valid.length === 0)
+      return fail("Value does not satisfy a formatting alternative", path);
+    const first = valid[0].value;
+    if (valid.some((p) => encodeJson(p.value) !== encodeJson(first)))
+      return fail("Ambiguous formatting authority", path);
+    return { admitted: true, value: first };
+  }
+  if (shape.kind === "scalar") {
+    const admission = admit(shape.spec, value, path);
+    return admission.admitted && (shape.literal === void 0 || shape.literal === value) ? { admitted: true, value } : fail(admission.admitted ? "Value differs from its literal evidence" : admission.violation.detail, path);
+  }
+  if (shape.kind === "artifact") {
+    const admission = admit({ type: "artifact" }, value, path);
+    return admission.admitted ? { admitted: true, value: value.path } : fail(admission.violation.detail, path);
+  }
+  if (shape.kind === "array" || shape.kind === "list") {
+    if (!Array.isArray(value) || shape.kind === "array" && value.length !== shape.elements.length)
+      return fail("Array does not satisfy its formatting evidence", path);
+    const values = [];
+    for (let i = 0; i < value.length; i++) {
+      const child = project(shape.kind === "list" ? shape.element : shape.elements[i], value[i], `${path}[${i}]`, admit);
+      if (!child.admitted)
+        return child;
+      values.push(child.value);
+    }
+    return { admitted: true, value: values };
+  }
+  if (shape.kind === "struct") {
+    if (!isPlainRecord(value))
+      return fail("Expected a Struct record", path);
+    if (!shape.fields)
+      return { admitted: true, value };
+    const keys = Object.keys(value);
+    for (const key of keys) {
+      if (!Object.hasOwn(shape.fields, key))
+        return fail("Undeclared Struct field", at2(path, key));
+    }
+    for (const key of Object.keys(shape.fields)) {
+      if (!Object.hasOwn(value, key))
+        return fail("Missing Struct field", at2(path, key));
+    }
+    const entries = [];
+    for (const key of keys) {
+      const child = project(shape.fields[key], value[key], at2(path, key), admit);
+      if (!child.admitted)
+        return child;
+      entries.push([key, child.value]);
+    }
+    return { admitted: true, value: Object.fromEntries(entries) };
+  }
+  return { admitted: true, value };
+}
+function fmtValue(evidence, value, config, admit) {
+  if (value === void 0)
+    return {
+      admitted: false,
+      violation: {
+        code: "unset-value",
+        detail: "Formatting requires a set value"
+      }
+    };
+  const issue2 = firstInvalidPayloadValue(value);
+  if (issue2)
+    return fail(issue2.detail, issue2.path);
+  const nonFinite = firstNonFiniteNumberPath(value);
+  if (nonFinite !== void 0)
+    return {
+      admitted: false,
+      violation: {
+        code: "non-finite-number",
+        detail: `Numeric value must be finite before formatting${nonFinite === "$" ? "" : ` at ${nonFinite}`}`
+      }
+    };
+  const projected = project(evidenceShape(evidence), value, "$", admit);
+  if (!projected.admitted)
+    return projected;
+  const options = normalizeFmtConfig(config);
+  const render = (data2) => {
+    if (typeof data2 === "string")
+      return options.str === "json" ? JSON.stringify(data2) : data2;
+    if (Array.isArray(data2)) {
+      if (options.array?.style === "json")
+        return encodeJson(data2);
+      const delimiters = options.array?.parentheses ?? "";
+      return (delimiters[0] ?? "") + data2.map(render).join(options.array?.separator) + (delimiters[1] ?? "");
+    }
+    if (typeof data2 === "object")
+      return encodeJson(data2);
+    return String(data2);
+  };
+  return { admitted: true, value: render(projected.value) };
 }
 
 // node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/spec/resolution.js
@@ -6054,6 +6425,15 @@ function admitValue(spec2, value, path = "$") {
     return violation("unset", "A set value is required", path);
   }
   switch (spec2.type) {
+    case "union": {
+      for (const member of spec2.members) {
+        const result = admitValue(member, value, path);
+        if (result.admitted)
+          return result;
+      }
+      const sameCarrier = spec2.members.filter((member) => typeof value === (member.type === "enum" ? "string" : member.type));
+      return sameCarrier.length === 1 ? admitValue(sameCarrier[0], value, path) : violation("invalid-union", "Value must satisfy a Union member", path);
+    }
     case "boolean":
       return typeof value === "boolean" ? admitted(value) : violation("invalid-boolean", "A boolean value is required", path);
     case "string":
@@ -6116,6 +6496,15 @@ function admitStructValue(spec2, value, path) {
 function admitted(value) {
   return { admitted: true, value };
 }
+function precedingSpec(spec2, value) {
+  if (spec2.type !== "union")
+    return spec2;
+  for (const member of spec2.members) {
+    if (admitValue(member, value).admitted)
+      return member;
+  }
+  return void 0;
+}
 function violation(code, detail, path) {
   return { admitted: false, violation: { code, detail, path } };
 }
@@ -6125,6 +6514,12 @@ var UNKNOWN = { kind: "unknown" };
 function judgeOneTimeLanding(source, destination) {
   if (!source)
     return UNKNOWN;
+  if (destination.type === "union" && source.kind !== "site" && source.kind !== "literal") {
+    const judgments = destination.members.map((member) => judgeOneTimeLanding(source, member));
+    if (judgments.some((judgment) => judgment.kind === "compatible"))
+      return COMPATIBLE;
+    return judgments.every((judgment) => judgment.kind === "incompatible") ? INCOMPATIBLE : UNKNOWN;
+  }
   switch (source.kind) {
     case "site":
       return judgeSpecLanding(source.spec, destination);
@@ -6162,7 +6557,24 @@ function reduceAlternativeJudgments(judgments) {
     return UNKNOWN;
   return COMPATIBLE;
 }
+function reduceUnionJudgments(judgments) {
+  if (judgments.every((judgment) => judgment.kind === "compatible"))
+    return COMPATIBLE;
+  if (judgments.every((judgment) => judgment.kind === "incompatible"))
+    return INCOMPATIBLE;
+  return UNKNOWN;
+}
+function reduceOverUnion(union, judge) {
+  return reduceUnionJudgments(union.members.map((spec2) => judge(resolvedFact({ kind: "site", spec: spec2 }))));
+}
 function reusableSpecCompatible(provider, receiver) {
+  if (provider.type === "union")
+    return provider.members.every((member) => reusableSpecCompatible(member, receiver));
+  if (receiver.type === "union") {
+    if (provider.type === "enum")
+      return provider.values.every((value) => admitValue(receiver, value).admitted);
+    return receiver.members.some((member) => reusableSpecCompatible(provider, member));
+  }
   if (provider.type === "index" && receiver.type === "number")
     return true;
   if (provider.type === "enum" && receiver.type === "string")
@@ -6187,6 +6599,11 @@ function sameFieldNames(left, right) {
 function judgeSpecLanding(source, destination) {
   if (reusableSpecCompatible(source, destination))
     return COMPATIBLE;
+  if (source.type === "union")
+    return reduceUnionJudgments(source.members.map((member) => judgeSpecLanding(member, destination)));
+  if (destination.type === "union") {
+    return destination.members.every((member) => judgeSpecLanding(source, member).kind === "incompatible") ? INCOMPATIBLE : UNKNOWN;
+  }
   if (source.type === "number" && destination.type === "index")
     return UNKNOWN;
   if (source.type === "string" && destination.type === "enum")
@@ -6260,6 +6677,8 @@ function resolveProducer(expression, context) {
       };
     case "template-string":
       return resolvedFact(interpolationRule.result);
+    case "fmt":
+      return resolvedFact(fmtRule.result);
     case "scope":
     case "interruptionId":
     case "interruptionReason":
@@ -6326,7 +6745,7 @@ function judgeHostArgument(argument, destination, context) {
   if (argument.kind === "semantic") {
     if (destination.type === "semanticText")
       return { kind: "compatible" };
-    if (destination.type !== "string" && destination.type !== "enum") {
+    if (destination.type !== "string" && destination.type !== "enum" && destination.type !== "union") {
       return { kind: "incompatible" };
     }
     return judgeSemanticArgument(argument.value, destination, context);
@@ -6458,6 +6877,15 @@ var artifactPathRule = {
     provenance: "artifact"
   }
 };
+var fmtRule = {
+  checkProducer(operand, context) {
+    return checkFmtEvidence(resolveProducer(operand, context));
+  },
+  projectValue(evidence, value, config) {
+    return fmtValue(evidence, value, config, admitValue);
+  },
+  result: { kind: "carrier", carrier: "string" }
+};
 var interpolationRule = {
   checkProducer(operand, context) {
     return judgeInterpolationEvidence(resolveProducer(operand, context));
@@ -6491,60 +6919,294 @@ var comparisonRule = {
     return decideComparison(op, resolveProducer(left, context), resolveProducer(right, context));
   },
   admitValues(op, decision2, left, right) {
-    switch (decision2.mode) {
-      case "enum": {
-        const spec2 = {
-          type: "enum",
-          values: [...decision2.enumValues ?? []]
-        };
-        const admittedLeft = admitValue(spec2, left);
-        const admittedRight = admitValue(spec2, right);
-        if (!admittedLeft.admitted || !admittedRight.admitted) {
-          return operationViolation("invalid-enum-value", "Enum comparison requires values in the selected Enum domain");
-        }
-        return operationAdmitted({ left, right });
-      }
-      case "number": {
-        const admittedLeft = admitValue({ type: "number" }, left);
-        const admittedRight = admitValue({ type: "number" }, right);
-        if (!admittedLeft.admitted || !admittedRight.admitted) {
-          const nonFinite = typeof left === "number" && !Number.isFinite(left) || typeof right === "number" && !Number.isFinite(right);
-          return operationViolation(nonFinite ? "non-finite-number" : "invalid-numeric-comparison", nonFinite ? "Numeric value must be finite before numeric comparison" : "Numeric comparison requires finite numeric operands");
-        }
-        return operationAdmitted({ left, right });
-      }
-      case "string":
-        return typeof left === "string" && typeof right === "string" ? operationAdmitted({ left, right }) : operationViolation("invalid-string-comparison", "String comparison requires string operands");
-      case "boolean":
-        return typeof left === "boolean" && typeof right === "boolean" ? operationAdmitted({ left, right }) : operationViolation("invalid-boolean-comparison", "Boolean equality requires boolean operands");
-      case "artifact":
-        return isArtifactValue(left) && isArtifactValue(right) ? operationAdmitted({ left, right }) : operationViolation("invalid-artifact-value", "Artifact equality requires valid Artifact values");
-      case "array":
-        return admitArrayComparisonValues(decision2.arrayElementFamily, left, right);
-      case "struct":
-        return isPlainRecord(left) && isPlainRecord(right) ? operationAdmitted({ left, right }) : operationViolation("invalid-struct-comparison", "Struct equality requires Struct operands");
-      case "dynamic":
-        if (Array.isArray(left) || Array.isArray(right)) {
-          return admitArrayComparisonValues(void 0, left, right);
-        }
-        if (typeof left === "number" || typeof right === "number") {
-          const admittedLeft = admitValue({ type: "number" }, left);
-          const admittedRight = admitValue({ type: "number" }, right);
-          if (admittedLeft.admitted && admittedRight.admitted) {
-            return operationAdmitted({ left, right });
-          }
-          const nonFinite = typeof left === "number" && !Number.isFinite(left) || typeof right === "number" && !Number.isFinite(right);
-          return operationViolation(nonFinite ? "non-finite-number" : "invalid-numeric-comparison", nonFinite ? "Numeric value must be finite before numeric comparison" : "Numeric comparison requires finite numeric operands");
-        }
-        if (op !== "==" && op !== "!=") {
-          return typeof left === "string" && typeof right === "string" ? operationAdmitted({ left, right }) : operationViolation("invalid-comparison-operands", "Ordering requires two finite numbers or two strings");
-        }
-        return operationAdmitted({ left, right });
-    }
+    return decision2.mode === "by-value" ? admitUnionComparisonValues(op, decision2.operands.left, decision2.operands.right, left, right) : admitSelectedComparison(op, decision2, left, right);
   },
   result: { kind: "carrier", carrier: "boolean" }
 };
+function incoherentComparison() {
+  return operationViolation("invalid-comparison-operands", "Comparison operands do not have a coherent shared domain");
+}
+function admitSelectedComparison(op, selected, left, right) {
+  if (selected.judgment.kind === "incompatible")
+    return incoherentComparison();
+  const admitted2 = admitComparisonOperands(op, selected, left, right);
+  return admitted2.admitted ? operationAdmitted({ left, right, decision: selected }) : admitted2;
+}
+function admitComparisonOperands(op, selected, left, right) {
+  switch (selected.mode) {
+    case "cross-type":
+      return operationAdmitted({ left, right });
+    case "enum": {
+      const spec2 = {
+        type: "enum",
+        values: [...selected.enumValues ?? []]
+      };
+      const admittedLeft = admitValue(spec2, left);
+      const admittedRight = admitValue(spec2, right);
+      if (!admittedLeft.admitted || !admittedRight.admitted) {
+        return operationViolation("invalid-enum-value", "Enum comparison requires values in the selected Enum domain");
+      }
+      return operationAdmitted({ left, right });
+    }
+    case "number": {
+      const admittedLeft = admitValue({ type: "number" }, left);
+      const admittedRight = admitValue({ type: "number" }, right);
+      if (!admittedLeft.admitted || !admittedRight.admitted) {
+        const nonFinite = typeof left === "number" && !Number.isFinite(left) || typeof right === "number" && !Number.isFinite(right);
+        return operationViolation(nonFinite ? "non-finite-number" : "invalid-numeric-comparison", nonFinite ? "Numeric value must be finite before numeric comparison" : "Numeric comparison requires finite numeric operands");
+      }
+      return operationAdmitted({ left, right });
+    }
+    case "string":
+      return typeof left === "string" && typeof right === "string" ? operationAdmitted({ left, right }) : operationViolation("invalid-string-comparison", "String comparison requires string operands");
+    case "boolean":
+      return typeof left === "boolean" && typeof right === "boolean" ? operationAdmitted({ left, right }) : operationViolation("invalid-boolean-comparison", "Boolean equality requires boolean operands");
+    case "artifact":
+      return isArtifactValue(left) && isArtifactValue(right) ? operationAdmitted({ left, right }) : operationViolation("invalid-artifact-value", "Artifact equality requires valid Artifact values");
+    case "array":
+      return admitArrayComparisonValues(selected.arrayElementFamily, left, right);
+    case "struct":
+      return isPlainRecord(left) && isPlainRecord(right) ? operationAdmitted({ left, right }) : operationViolation("invalid-struct-comparison", "Struct equality requires Struct operands");
+    case "dynamic":
+      if (Array.isArray(left) || Array.isArray(right)) {
+        return admitArrayComparisonValues(void 0, left, right);
+      }
+      if (typeof left === "number" || typeof right === "number") {
+        const admittedLeft = admitValue({ type: "number" }, left);
+        const admittedRight = admitValue({ type: "number" }, right);
+        if (admittedLeft.admitted && admittedRight.admitted) {
+          return operationAdmitted({ left, right });
+        }
+        const nonFinite = typeof left === "number" && !Number.isFinite(left) || typeof right === "number" && !Number.isFinite(right);
+        return operationViolation(nonFinite ? "non-finite-number" : "invalid-numeric-comparison", nonFinite ? "Numeric value must be finite before numeric comparison" : "Numeric comparison requires finite numeric operands");
+      }
+      if (op !== "==" && op !== "!=") {
+        return typeof left === "string" && typeof right === "string" ? operationAdmitted({ left, right }) : operationViolation("invalid-comparison-operands", "Ordering requires two finite numbers or two strings");
+      }
+      return operationAdmitted({ left, right });
+  }
+}
+function hasUnionEvidence(evidence) {
+  switch (evidence.kind) {
+    case "fact":
+      return evidence.fact.kind === "site" ? hasUnionSpec(evidence.fact.spec) : evidence.fact.kind === "array" && evidence.fact.elements.some((fact) => hasUnionEvidence(resolvedFact(fact)));
+    case "alternatives":
+      return evidence.alternatives.some(hasUnionEvidence);
+    case "array":
+      return evidence.elements.some(hasUnionEvidence);
+    case "struct":
+      return Object.values(evidence.fields ?? {}).some(hasUnionEvidence);
+    default:
+      return false;
+  }
+}
+function hasUnionSpec(spec2) {
+  return spec2.type === "union" || spec2.type === "array" && hasUnionSpec(spec2.element) || spec2.type === "struct" && Object.values(spec2.fields).some(hasUnionSpec);
+}
+function declaredUnion(evidence) {
+  return evidence.kind === "fact" && evidence.fact.kind === "site" && evidence.fact.spec.type === "union" ? evidence.fact.spec : void 0;
+}
+function precedingAlternatives(spec2) {
+  return spec2.members.flatMap((member, index) => {
+    const earlier = spec2.members.slice(0, index);
+    const shadowed = member.type === "enum" ? member.values.every((value) => earlier.some((prior) => admitValue(prior, value).admitted)) : earlier.some((prior) => reusableSpecCompatible(member, prior));
+    return shadowed ? [] : [resolvedFact({ kind: "site", spec: member })];
+  });
+}
+function coveredByUnion(evidence, union) {
+  if (evidence.kind !== "fact")
+    return false;
+  const fact = evidence.fact;
+  if (fact.kind === "literal")
+    return admitValue(union, fact.value).admitted;
+  if (fact.kind === "site")
+    return reusableSpecCompatible(fact.spec, union);
+  if (fact.kind === "carrier")
+    return reusableSpecCompatible({ type: fact.carrier }, union);
+  return fact.kind === "provenance" && fact.provenance === "index" && reusableSpecCompatible({ type: "index" }, union);
+}
+function sameUnionPair(left, right, unions) {
+  return unions.some((union) => coveredByUnion(left, union) && coveredByUnion(right, union));
+}
 function decideComparison(op, left, right) {
+  if (!hasUnionEvidence(left) && !hasUnionEvidence(right))
+    return decideOrdinaryComparison(op, left, right);
+  return {
+    judgment: judgeUnionComparison(op, left, right),
+    mode: "by-value",
+    operands: { left, right }
+  };
+}
+function decideUnionPair(op, left, right, unions) {
+  const ordinary = decideOrdinaryComparison(op, left, right);
+  return ordinary.judgment.kind === "incompatible" && (op === "==" || op === "!=") && sameUnionPair(left, right, unions) ? decision("compatible", "cross-type") : ordinary;
+}
+function declaredUnions(left, right) {
+  return [declaredUnion(left), declaredUnion(right)].filter((spec2) => spec2 !== void 0);
+}
+function judgeUnionComparison(op, left, right) {
+  if (left.kind === "alternatives") {
+    return reduceAlternativeJudgments(left.alternatives.map((alternative) => decideComparison(op, alternative, right).judgment));
+  }
+  if (right.kind === "alternatives") {
+    return reduceAlternativeJudgments(right.alternatives.map((alternative) => decideComparison(op, left, alternative).judgment));
+  }
+  const unions = declaredUnions(left, right);
+  if (unions.length > 0) {
+    const leftUnion = declaredUnion(left);
+    const rightUnion = declaredUnion(right);
+    return reduceUnionJudgments((leftUnion ? precedingAlternatives(leftUnion) : [left]).flatMap((lhs) => (rightUnion ? precedingAlternatives(rightUnion) : [right]).map((rhs) => decideUnionPair(op, lhs, rhs, unions).judgment)));
+  }
+  const leftFamily = stableFamily(left);
+  const rightFamily = stableFamily(right);
+  if (leftFamily === "array" || rightFamily === "array") {
+    if (op !== "==" && op !== "!=")
+      return INCOMPATIBLE;
+    if (leftFamily === "dynamic" || rightFamily === "dynamic")
+      return UNKNOWN;
+    if (leftFamily !== "array" || rightFamily !== "array")
+      return INCOMPATIBLE;
+    return reduceAlternativeJudgments(alignedElementEvidence(left, right).map(([lhs, rhs]) => decideComparison(op, lhs, rhs).judgment));
+  }
+  if (leftFamily === "struct" || rightFamily === "struct") {
+    return op === "==" || op === "!=" ? judgeStructEquality(left, right) : INCOMPATIBLE;
+  }
+  return decideOrdinaryComparison(op, left, right).judgment;
+}
+function evidenceAdmitsValue(evidence, value) {
+  switch (evidence.kind) {
+    case "dynamic":
+      return true;
+    case "unusable":
+      return false;
+    case "alternatives":
+      return evidence.alternatives.some((alternative) => evidenceAdmitsValue(alternative, value));
+    case "array":
+      return Array.isArray(value) && value.length === evidence.elements.length && evidence.elements.every((element, index) => evidenceAdmitsValue(element, value[index]));
+    case "struct":
+      return isPlainRecord(value) && (evidence.fields === void 0 || sameFieldNames(evidence.fields, value) && Object.entries(evidence.fields).every(([name2, field]) => evidenceAdmitsValue(field, value[name2])));
+    case "fact": {
+      const fact = evidence.fact;
+      switch (fact.kind) {
+        case "site":
+          return admitValue(fact.spec, value).admitted;
+        case "literal":
+          return value === fact.value;
+        case "carrier":
+          return typeof value === fact.carrier;
+        case "empty-array":
+          return Array.isArray(value) && value.length === 0;
+        case "array":
+          return evidenceAdmitsValue({ kind: "array", elements: fact.elements.map(resolvedFact) }, value);
+        case "provenance":
+          return admitValue({
+            type: fact.provenance === "dialog-cursor" ? "dialogCursor" : fact.provenance
+          }, value).admitted;
+      }
+    }
+  }
+}
+function elementEvidenceAt(evidence, index) {
+  if (evidence.kind === "array")
+    return evidence.elements[index] ?? { kind: "unusable" };
+  if (evidence.kind === "fact") {
+    if (evidence.fact.kind === "site" && evidence.fact.spec.type === "array")
+      return resolvedFact({ kind: "site", spec: evidence.fact.spec.element });
+    if (evidence.fact.kind === "array")
+      return evidence.fact.elements[index] ? resolvedFact(evidence.fact.elements[index]) : { kind: "unusable" };
+  }
+  return { kind: "dynamic" };
+}
+function alignedElementEvidence(left, right) {
+  const lengths = [left, right].flatMap((evidence) => {
+    const length = literalArrayLength(evidence);
+    return length === void 0 ? [] : [length];
+  });
+  const count = lengths.length > 0 ? Math.min(...lengths) : 1;
+  return Array.from({ length: count }, (_, index) => [
+    elementEvidenceAt(left, index),
+    elementEvidenceAt(right, index)
+  ]);
+}
+function literalArrayLength(evidence) {
+  if (evidence.kind === "array")
+    return evidence.elements.length;
+  if (evidence.kind !== "fact")
+    return void 0;
+  if (evidence.fact.kind === "array")
+    return evidence.fact.elements.length;
+  return evidence.fact.kind === "empty-array" ? 0 : void 0;
+}
+function admitUnionComparisonValues(op, leftEvidence, rightEvidence, left, right) {
+  const nonFinite = firstNonFiniteNumberPath(left) ?? firstNonFiniteNumberPath(right);
+  if (nonFinite !== void 0)
+    return operationViolation("non-finite-number", `Numeric value must be finite before numeric comparison at ${nonFinite}`);
+  if (firstInvalidPayloadValue(left) || firstInvalidPayloadValue(right) || !evidenceAdmitsValue(leftEvidence, left) || !evidenceAdmitsValue(rightEvidence, right))
+    return incoherentComparison();
+  return selectUnionComparison(op, leftEvidence, rightEvidence, left, right);
+}
+function selectUnionComparison(op, leftEvidence, rightEvidence, left, right) {
+  if (leftEvidence.kind === "alternatives" || rightEvidence.kind === "alternatives") {
+    const leftAlternatives = leftEvidence.kind === "alternatives" ? leftEvidence.alternatives.filter((evidence) => evidenceAdmitsValue(evidence, left)) : [leftEvidence];
+    const rightAlternatives = rightEvidence.kind === "alternatives" ? rightEvidence.alternatives.filter((evidence) => evidenceAdmitsValue(evidence, right)) : [rightEvidence];
+    let selected;
+    for (const lhs of leftAlternatives)
+      for (const rhs of rightAlternatives) {
+        const result = selectUnionComparison(op, lhs, rhs, left, right);
+        if (!result.admitted)
+          return result;
+        if (selected && (selected.decision.mode !== result.value.decision.mode || !sameEnumDomain(selected.decision.enumValues ?? [], result.value.decision.enumValues ?? []))) {
+          return operationViolation("invalid-comparison-operands", "Conditional alternatives do not establish one unambiguous comparison domain");
+        }
+        selected = result.value;
+      }
+    return selected ? operationAdmitted(selected) : incoherentComparison();
+  }
+  const unions = declaredUnions(leftEvidence, rightEvidence);
+  if (unions.length > 0) {
+    const leftUnion = declaredUnion(leftEvidence);
+    const rightUnion = declaredUnion(rightEvidence);
+    const lhs = leftUnion ? resolvedFact({ kind: "site", spec: precedingSpec(leftUnion, left) }) : leftEvidence;
+    const rhs = rightUnion ? resolvedFact({ kind: "site", spec: precedingSpec(rightUnion, right) }) : rightEvidence;
+    return admitSelectedComparison(op, decideUnionPair(op, lhs, rhs, unions), left, right);
+  }
+  if ((hasUnionEvidence(leftEvidence) || hasUnionEvidence(rightEvidence)) && (Array.isArray(left) || Array.isArray(right))) {
+    if (!Array.isArray(left) || !Array.isArray(right) || op !== "==" && op !== "!=")
+      return incoherentComparison();
+    for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+      const admitted2 = selectUnionComparison("==", elementEvidenceAt(leftEvidence, index), elementEvidenceAt(rightEvidence, index), left[index], right[index]);
+      if (!admitted2.admitted)
+        return admitted2;
+    }
+    return operationAdmitted({
+      left,
+      right,
+      decision: decision("compatible", "array")
+    });
+  }
+  if ((hasUnionEvidence(leftEvidence) || hasUnionEvidence(rightEvidence)) && (isPlainRecord(left) || isPlainRecord(right))) {
+    if (!isPlainRecord(left) || !isPlainRecord(right) || !sameFieldNames(left, right) || op !== "==" && op !== "!=")
+      return incoherentComparison();
+    const leftFields = structOperandFields(leftEvidence);
+    const rightFields = structOperandFields(rightEvidence);
+    if (!leftFields || !rightFields)
+      return incoherentComparison();
+    for (const name2 of Object.keys(left)) {
+      const lhs = leftFields === "dynamic" ? { kind: "dynamic" } : leftFields[name2];
+      const rhs = rightFields === "dynamic" ? { kind: "dynamic" } : rightFields[name2];
+      const admitted2 = selectUnionComparison("==", lhs, rhs, left[name2], right[name2]);
+      if (!admitted2.admitted)
+        return admitted2;
+    }
+    return operationAdmitted({
+      left,
+      right,
+      decision: decision("compatible", "struct")
+    });
+  }
+  return admitSelectedComparison(op, decideOrdinaryComparison(op, leftEvidence, rightEvidence), left, right);
+}
+function decideOrdinaryComparison(op, left, right) {
   const ordering = op !== "==" && op !== "!=";
   const leftEnum = provenEnumDomain(left);
   const rightEnum = provenEnumDomain(right);
@@ -6751,6 +7413,10 @@ function stableFamily(evidence) {
           return "array";
         case "struct":
           return "struct";
+        case "union": {
+          const families = fact.spec.members.map((spec2) => stableFamily(resolvedFact({ kind: "site", spec: spec2 })));
+          return families.every((family) => family === families[0]) ? families[0] : "dynamic";
+        }
       }
     }
   }
@@ -6830,12 +7496,15 @@ function judgeScalarComparisonEvidence(evidence, family) {
   return stable === "boolean" || stable === "string" || stable === "number" || stable === "artifact" ? { kind: "compatible" } : { kind: "incompatible" };
 }
 function arrayElementFamily(spec2) {
-  return spec2.type === "enum" ? "string" : spec2.type;
+  return stableFamily({ kind: "fact", fact: { kind: "site", spec: spec2 } });
 }
 function isArrayComparisonFamily(family) {
   return family === "boolean" || family === "string" || family === "number" || family === "artifact" || family === "struct";
 }
 function judgeFamily(evidence, family) {
+  const union = declaredUnion(evidence);
+  if (union)
+    return reduceOverUnion(union, (member) => judgeFamily(member, family));
   switch (evidence.kind) {
     case "dynamic":
       return { kind: "unknown" };
@@ -6938,6 +7607,9 @@ function judgeStringEvidence(evidence) {
   return judgeFamily(evidence, "string");
 }
 function judgeInterpolationEvidence(evidence) {
+  const union = declaredUnion(evidence);
+  if (union)
+    return reduceOverUnion(union, judgeInterpolationEvidence);
   switch (evidence.kind) {
     case "dynamic":
       return { kind: "unknown" };
@@ -6964,6 +7636,9 @@ function judgeInterpolationEvidence(evidence) {
   }
 }
 function judgePrimitiveArrayElementInterpolation(evidence) {
+  const union = declaredUnion(evidence);
+  if (union)
+    return reduceOverUnion(union, judgePrimitiveArrayElementInterpolation);
   switch (evidence.kind) {
     case "dynamic":
       return { kind: "unknown" };
@@ -6982,6 +7657,9 @@ function operationViolation(code, detail) {
   return { admitted: false, violation: { code, detail } };
 }
 function judgeNumericEvidence(evidence) {
+  const union = declaredUnion(evidence);
+  if (union)
+    return reduceOverUnion(union, judgeNumericEvidence);
   switch (evidence.kind) {
     case "dynamic":
       return { kind: "unknown" };
@@ -7023,14 +7701,16 @@ function hostParameterChannelSpec(spec2) {
       return { type: spec2.type };
     case "enum":
       return { type: "enum", values: spec2.values };
+    case "union":
+      return spec2;
     case "array": {
       const element = spec2.element;
-      if (element.type !== "boolean" && element.type !== "string" && element.type !== "enum" && element.type !== "number" && element.type !== "artifact") {
+      if (element.type !== "boolean" && element.type !== "string" && element.type !== "enum" && element.type !== "number" && element.type !== "union" && element.type !== "artifact") {
         return void 0;
       }
       return {
         type: "array",
-        element: element.type === "enum" ? { type: "enum", values: element.values } : { type: element.type }
+        element
       };
     }
     case "tuple":
@@ -7057,9 +7737,8 @@ function judgeSemanticArgument(semantic, destination, context) {
     if (producerMayProduceArtifact(evidence))
       dynamic = true;
   }
-  if (destination.type === "enum")
-    return { kind: "unknown" };
-  return dynamic ? { kind: "unknown" } : { kind: "compatible" };
+  const landing = judgeOneTimeLanding({ kind: "carrier", carrier: "string" }, destination);
+  return landing.kind === "incompatible" ? landing : dynamic ? UNKNOWN : landing;
 }
 function producerMayProduceArtifact(evidence) {
   switch (evidence.kind) {
@@ -7121,8 +7800,18 @@ function isStructFieldName(name2) {
   return isHostStructFieldName(name2) && !name2.startsWith("$") && name2 !== "isUnset";
 }
 
-// node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/types/parser.js
+// node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/types/ir.js
 var UNSTAMPED_ID = "";
+function mapResultsCell(target2) {
+  if (typeof target2 === "string")
+    return target2;
+  return target2.receiver.kind === "cell" ? target2.receiver.name : void 0;
+}
+function mapResultsLabel(target2) {
+  if (typeof target2 === "string")
+    return target2;
+  return [mapResultsCell(target2) ?? "", ...target2.path].join(".");
+}
 function observingQuestions(declaration) {
   switch (declaration.type) {
     case "array":
@@ -7142,18 +7831,8 @@ function isObservableCell(cell) {
 function isArrayCell(cell) {
   return cell.type === "array";
 }
-function isScalarObservableCell(cell) {
-  return isObservableCell(cell) && cell.type !== "array" && cell.type !== "struct";
-}
-function mapResultsCell(target2) {
-  if (typeof target2 === "string")
-    return target2;
-  return target2.receiver.kind === "cell" ? target2.receiver.name : void 0;
-}
-function mapResultsLabel(target2) {
-  if (typeof target2 === "string")
-    return target2;
-  return [mapResultsCell(target2) ?? "", ...target2.path].join(".");
+function isScalarCell(cell) {
+  return isObservableCell(cell) && cell.type !== "union" && cell.type !== "array" && cell.type !== "struct";
 }
 function isValueExpressionCell(cell) {
   return isObservableCell(cell) || cell.type === "array" || cell.type === "dialogCursor" || cell.type === "artifact";
@@ -7633,6 +8312,17 @@ function parseExpression(node2, availableHostModules = /* @__PURE__ */ new Map()
     };
   }
   if (node2.type === "CallExpression") {
+    if (node2.callee.type === "Identifier" && node2.callee.name === "fmt") {
+      const value = node2.arguments[0];
+      if (!value || value.type === "SpreadElement" || node2.arguments.length > 2) {
+        throw Object.assign(new Error("Invalid fmt arguments: expected a value and an optional configuration object"), { code: "INVALID_FMT_ARGUMENTS", loc: locOf(node2) });
+      }
+      return {
+        kind: "fmt",
+        value: parseExpression(value, availableHostModules, briefable, context),
+        config: parseFmtConfig(node2)
+      };
+    }
     if (node2.callee.type === "Identifier" && node2.callee.name === "Artifact") {
       return parseArtifactConstructCall(node2, "Artifact value", availableHostModules, briefable, context);
     }
@@ -7811,6 +8501,42 @@ function isNumIsFiniteCall(node2, availableHostModules) {
 function isDeflectionEscapedCall(node2) {
   return node2.callee.type === "MemberExpression" && !node2.callee.computed && node2.callee.object.type === "MemberExpression" && !node2.callee.object.computed && node2.callee.object.object.type === "ThisExpression" && node2.callee.object.property.type === "Identifier" && node2.callee.object.property.name === "deflection" && node2.callee.property.type === "Identifier" && node2.callee.property.name === "escaped";
 }
+function parseFmtConfig(call) {
+  const invalid = (detail) => {
+    throw Object.assign(new Error(`Invalid fmt configuration: ${detail}`), {
+      code: "INVALID_FMT_CONFIG",
+      loc: locOf(call)
+    });
+  };
+  if (call.arguments.length === 1)
+    return {};
+  const argument = call.arguments[1];
+  if (!argument || argument.type !== "ObjectExpression")
+    return invalid("expected a static object literal");
+  const read = (object) => {
+    const result = /* @__PURE__ */ Object.create(null);
+    for (const property of object.properties) {
+      if (property.type !== "Property" || property.computed || property.method || property.shorthand || property.kind !== "init")
+        return invalid("settings must be explicit non-computed data properties");
+      const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" && typeof property.key.value === "string" ? property.key.value : void 0;
+      if (key === void 0 || Object.hasOwn(result, key))
+        return invalid("invalid or duplicate setting name");
+      const value = property.value;
+      if (value.type === "ObjectExpression")
+        result[key] = read(value);
+      else if (value.type === "Literal" && typeof value.value === "string")
+        result[key] = value.value;
+      else
+        return invalid("setting values must be string or object literals");
+    }
+    return result;
+  };
+  const config = read(argument);
+  const issue2 = validateFmtConfig(config);
+  if (issue2)
+    return invalid(`${issue2.detail} at ${issue2.path}`);
+  return config;
+}
 function parseHostCallTarget(expression, availableHostModules) {
   if (expression.type !== "MemberExpression")
     return void 0;
@@ -7880,9 +8606,6 @@ function parseDialogTurnsSinceCall(node2, availableHostModules, briefable) {
     throw new Error("Unsupported cursor turn-difference method");
   }
   const receiverNode = callee.object;
-  if (receiverNode.type === "Identifier" && receiverNode.name === "Dialog") {
-    throw new Error(`Dialog.${operation}() was replaced by cursor methods; call ${operation}() on a cursor value, e.g. Dialog.cursor.${operation}(startedAt)`);
-  }
   if (node2.arguments.length !== 1) {
     throw new Error(`.${operation}() accepts exactly one cursor`);
   }
@@ -7955,6 +8678,8 @@ function parseHostCallArgument(expression, availableHostModules = /* @__PURE__ *
 }
 function containsBriefableExpression(expression) {
   switch (expression.kind) {
+    case "fmt":
+      return containsBriefableExpression(expression.value);
     case "judge":
     case "host-call":
       return true;
@@ -8177,6 +8902,27 @@ function validateHostParameterSpec(value, path, context, issues, state) {
       hostSpecIssue(issues, `${path}.type`, "spec type must be a string");
       return;
     }
+    if (type === "union") {
+      if (!exactHostSpecKeys(object, ["type", "members"], path, issues))
+        return;
+      const members = inspectHostSpecArray(object.members, `${path}.members`, issues);
+      if (!members)
+        return;
+      if (members.length < 2)
+        hostSpecIssue(issues, path, "Union requires at least two members");
+      members.forEach((member, index) => {
+        const memberPath = `${path}.members[${index}]`;
+        const entry = inspectHostSpecObject(member, memberPath, issues);
+        if (!entry)
+          return;
+        if (!isUnionMemberSpec(entry)) {
+          hostSpecIssue(issues, memberPath, "Union member must be an eligible scalar Arc spec");
+          return;
+        }
+        validateHostParameterSpec(member, memberPath, "argument", issues, state);
+      });
+      return;
+    }
     if (type === "omittable") {
       if (context !== "parameter" && context !== "field") {
         hostSpecIssue(issues, path, "omittable specs are only valid around a whole parameter or Struct field");
@@ -8195,7 +8941,7 @@ function validateHostParameterSpec(value, path, context, issues, state) {
         const element = inspectHostSpecObject(object.element, `${path}.element`, issues);
         if (!element)
           return;
-        if (element.type !== "boolean" && element.type !== "string" && element.type !== "enum" && element.type !== "number" && element.type !== "artifact" && element.type !== "struct") {
+        if (element.type !== "boolean" && element.type !== "string" && element.type !== "enum" && element.type !== "number" && element.type !== "union" && element.type !== "artifact" && element.type !== "struct") {
           hostSpecIssue(issues, `${path}.element`, "result array element must be a scalar, Artifact, or Struct Arc spec");
           return;
         }
@@ -8285,7 +9031,7 @@ function validateHostStructResultSpec(object, path, issues, state) {
       continue;
     const elementType = fieldObject.type === "array" && isPlainRecord(fieldObject.element) ? fieldObject.element.type : void 0;
     if (fieldObject.type === "artifact" || fieldObject.type === "dialogCursor" || fieldObject.type === "index" || fieldObject.type === "omittable" || elementType === "artifact") {
-      hostSpecIssue(issues, fieldPath2, "Struct result fields must be observable scalars, observable arrays, or Structs");
+      hostSpecIssue(issues, fieldPath2, "Struct result fields must be observable scalars, Unions, observable arrays, or Structs");
       continue;
     }
     validateHostParameterSpec(field, fieldPath2, "result", issues, state);
@@ -8373,14 +9119,46 @@ function exactHostSpecKeys(object, allowed, path, issues, optional2 = []) {
 function hostSpecIssue(issues, path, detail) {
   issues.push({ code: "invalid-host-module-spec", path, detail });
 }
-function validateSpec(spec2) {
+function validateSpec(spec2, visiting = /* @__PURE__ */ new WeakSet()) {
   if (!spec2 || typeof spec2 !== "object" || Array.isArray(spec2)) {
     return {
       code: "invalid-spec-shape",
       detail: "Spec must be an object"
     };
   }
-  const object = spec2;
+  if (visiting.has(spec2))
+    return {
+      code: "invalid-spec-shape",
+      detail: "Spec cannot contain a cycle"
+    };
+  visiting.add(spec2);
+  try {
+    return validateSpecRecord(spec2, visiting);
+  } finally {
+    visiting.delete(spec2);
+  }
+}
+function validateSpecRecord(object, visiting) {
+  if (object.type === "union") {
+    if (!Array.isArray(object.members) || object.members.length < 2) {
+      return {
+        code: "invalid-spec-shape",
+        detail: "Union requires at least two scalar members"
+      };
+    }
+    for (const member of object.members) {
+      const violation2 = validateSpec(member, visiting);
+      if (violation2)
+        return violation2;
+      if (!isUnionMemberSpec(member)) {
+        return {
+          code: "invalid-spec-shape",
+          detail: "Union members must be scalar specs"
+        };
+      }
+    }
+    return void 0;
+  }
   if (object.type === "array") {
     if (!("element" in object)) {
       return {
@@ -8388,11 +9166,11 @@ function validateSpec(spec2) {
         detail: "Array spec requires an element spec"
       };
     }
-    const elementViolation = validateSpec(object.element);
+    const elementViolation = validateSpec(object.element, visiting);
     if (elementViolation)
       return elementViolation;
     const elementType = object.element.type;
-    if (elementType !== "boolean" && elementType !== "string" && elementType !== "enum" && elementType !== "number" && elementType !== "artifact" && elementType !== "struct") {
+    if (elementType !== "boolean" && elementType !== "string" && elementType !== "enum" && elementType !== "number" && elementType !== "union" && elementType !== "artifact" && elementType !== "struct") {
       return {
         code: "invalid-spec-shape",
         detail: "Array element spec must be scalar, Artifact, or Struct"
@@ -8401,7 +9179,7 @@ function validateSpec(spec2) {
     return void 0;
   }
   if (object.type === "struct") {
-    return validateStructSpec(object);
+    return validateStructSpec(object, visiting);
   }
   if (object.type === "enum") {
     if (!Array.isArray(object.values) || object.values.some((value) => typeof value !== "string")) {
@@ -8433,7 +9211,7 @@ function validateSpec(spec2) {
   }
   return void 0;
 }
-function validateStructSpec(object) {
+function validateStructSpec(object, visiting) {
   const fields = object.fields;
   if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
     return {
@@ -8448,7 +9226,7 @@ function validateStructSpec(object) {
         detail: `Invalid Struct field name ${JSON.stringify(name2)}`
       };
     }
-    const violation2 = validateSpec(field);
+    const violation2 = validateSpec(field, visiting);
     if (violation2)
       return violation2;
     if (!isPlainRecord(field))
@@ -8553,9 +9331,9 @@ function map(rule, keyRule = name) {
       return;
     }
     for (const [key, item] of Object.entries(value)) {
-      const at2 = fieldPath(path, key);
-      keyRule(key, at2, issues);
-      rule(item, at2, issues);
+      const at3 = fieldPath(path, key);
+      keyRule(key, at3, issues);
+      rule(item, at3, issues);
     }
   };
 }
@@ -8743,6 +9521,15 @@ var expressionRules = {
       }
     }
   }),
+  fmt: expr({
+    kind: oneOf("fmt"),
+    value: valueChild,
+    config: (value, path, issues) => {
+      const invalid = validateFmtConfig(value, path);
+      if (invalid)
+        issue(issues, invalid.path, invalid.detail, "INVALID_FMT_CONFIG");
+    }
+  }),
   "template-string": expr({
     kind: oneOf("template-string"),
     parts: array(lazy(() => valuePart))
@@ -8918,6 +9705,7 @@ var specTypes = {
   string: true,
   enum: true,
   number: true,
+  union: true,
   artifact: true,
   dialogCursor: true,
   index: true,
@@ -8930,12 +9718,8 @@ function spec(role) {
       issue(issues, path, "expected a spec record", "INVALID_SPEC");
       return;
     }
-    if (value.type === "rangedInt") {
-      issue(issues, path, 'Source / IR numeric spec must use type "number"; found "rangedInt"', "NON_CANONICAL_NUMERIC_SPEC");
-      return;
-    }
     const type = value.type;
-    if (typeof type !== "string" || !Object.hasOwn(specTypes, type) || role === "cell" && type === "index" || role.endsWith("element") && ["array", "index", "dialogCursor"].includes(type) || role.endsWith("field") && ["artifact", "index", "dialogCursor"].includes(type)) {
+    if (typeof type !== "string" || !Object.hasOwn(specTypes, type) || role.startsWith("cell") && type === "index" || role.endsWith("member") && !isUnionMemberSpec({ type }) || role.endsWith("element") && ["array", "index", "dialogCursor"].includes(type) || role.endsWith("field") && ["artifact", "index", "dialogCursor"].includes(type)) {
       issue(issues, path, "unsupported spec type for this role", "INVALID_SPEC");
       return;
     }
@@ -8944,7 +9728,10 @@ function spec(role) {
       Object.assign(fields, { name, loc: optional(location) });
     if (type === "enum")
       fields.values = array(string);
-    const cellRole = role === "cell" || role === "cell-element" || role === "cell-field";
+    const cellRole = role.startsWith("cell");
+    if (type === "union") {
+      fields.members = array(spec(cellRole ? "cell-union-member" : "channel-union-member"), 2);
+    }
     if (type === "array")
       fields.element = role.endsWith("field") ? refine(spec(cellRole ? "cell-element" : "channel-element"), (v, p, i) => {
         if (isRecord(v) && v.type === "artifact")
@@ -8955,8 +9742,8 @@ function spec(role) {
       if (cellRole)
         fields.observing = optional(semanticChild);
     }
-    const observable = cellRole && ["boolean", "string", "enum", "number"].includes(type);
-    if (observable)
+    const observable = cellRole && ["boolean", "string", "enum", "number", "union"].includes(type);
+    if (observable && role !== "cell-union-member")
       fields.observing = optional(semanticChild);
     if (observable && type === "number")
       fields.observeAs = optional(observeAs);
@@ -9564,6 +10351,12 @@ function expressionContainsBareCellBoolean(expression, booleanPosition) {
       return expressionContainsBareCellBoolean(expression.receiver, false) || expressionContainsBareCellBoolean(expression.baseline, false);
     case "template-string":
       return expression.parts.some((part) => part.kind === "expression" && expressionContainsBareCellBoolean(part.expression, false));
+    case "fmt":
+      return expressionContainsBareCellBoolean(expression.value, false);
+    case "arrayLiteral":
+      return expression.elements.some((element) => expressionContainsBareCellBoolean(element, false));
+    case "structLiteral":
+      return Object.values(expression.fields).some((field) => expressionContainsBareCellBoolean(field, false));
     case "artifact":
       return expressionContainsBareCellBoolean(expression.path, false);
     case "judge":
@@ -9735,6 +10528,12 @@ function collectExpressionReads(expression, into) {
           collectExpressionReads(part.expression, into);
         }
       }
+      return;
+    case "fmt":
+      collectExpressionReads(expression.value, into);
+      return;
+    case "judge":
+      collectSemanticStringReads(expression.question, into);
       return;
     case "artifact":
       collectExpressionReads(expression.path, into);
@@ -10165,7 +10964,10 @@ var ARC_RESERVED_IMPORT_ALIAS_NAMES = /* @__PURE__ */ new Set([
   "RangedInt",
   "State",
   "Str",
+  "Struct",
+  "Union",
   "args",
+  "fmt",
   "forgetful",
   "invoke",
   "judge",
@@ -10418,8 +11220,8 @@ function parseNode(fn, availableImports, availableHostModules, visibleNodeNames,
   if (!fn.id?.name) {
     throw new Error("Node declarations must be named");
   }
-  if (fn.id.name === "invoke") {
-    throw new Error("invoke is a reserved name and cannot name a node");
+  if (fn.id.name === "invoke" || fn.id.name === "fmt") {
+    throw new Error(`${fn.id.name} is a reserved name and cannot name a node`);
   }
   const signature2 = parseNodeSignature(fn.params);
   const declarationStatements = fn.body.body.filter((statement2) => statement2.type === "VariableDeclaration");
@@ -10580,8 +11382,8 @@ function parseNodeBody(fn, identifier, signature2, cells, declarationStatements,
       if (!cell) {
         throw new Error(`Unknown cell for observing assignment: ${member.object}`);
       }
-      if (!isScalarObservableCell(cell)) {
-        throw new Error(`${member.object}.observing is only supported for scalar observable cells`);
+      if (cell.type !== "union" && !isScalarCell(cell)) {
+        throw new Error(`${member.object}.observing is only supported for scalar observable cells and Union cells`);
       }
       if (cell.observing !== void 0) {
         throw new Error(`Duplicate cell config assignment: ${member.object}.observing`);
@@ -10714,6 +11516,19 @@ function parseChannelSpec(expression, owner) {
     throw new Error(`${owner} must be a channel spec constructor`);
   }
   const name2 = callee.name;
+  if (name2 === "Union") {
+    if (expression.arguments.length !== 1) {
+      throw new Error(`${owner} Union() channel spec takes one member array`);
+    }
+    const members = unionMemberCalls(expression.arguments[0], owner).map((member, index) => {
+      const spec2 = parseChannelSpec(member, `${owner} member ${index}`);
+      if (!isUnionMemberSpec(spec2)) {
+        throw new Error(`${owner} Union members must be scalar specs`);
+      }
+      return spec2;
+    });
+    return { type: "union", members };
+  }
   if (name2 === "Artifact") {
     if (expression.arguments.length !== 0) {
       throw new Error(`${owner} Artifact() channel spec takes no arguments`);
@@ -10773,7 +11588,7 @@ function parseChannelSpec(expression, owner) {
       throw new Error(`${owner} Array() channel spec cannot nest arrays`);
     }
     if (element.type === "index" || element.type === "dialogCursor") {
-      throw new Error(`${owner} Array() element must be a scalar, Artifact, or Struct channel type`);
+      throw new Error(`${owner} Array() element must be a scalar, Union, Artifact, or Struct channel type`);
     }
     return { type: "array", element };
   }
@@ -10798,7 +11613,7 @@ function parseStructChannelSpec(expression, owner) {
     }
     const field = parseChannelSpec(property.value, `${owner}.${name2}`);
     if (!isObservableFieldSpec(field)) {
-      throw new Error(`${owner}.${name2} must be an observable scalar, observable array, or Struct`);
+      throw new Error(`${owner}.${name2} must be a scalar, Union, observable array, or Struct`);
     }
     fields[name2] = field;
   }
@@ -10965,6 +11780,13 @@ function applyExpressionIds(expression, nextExpressionId, verify) {
         }
       }
       return;
+    case "fmt":
+      applyExpressionIds(expression.value, nextExpressionId, verify);
+      return;
+    case "structLiteral":
+      for (const field of Object.values(expression.fields))
+        applyExpressionIds(field, nextExpressionId, verify);
+      return;
     case "artifact":
       applyExpressionIds(expression.path, nextExpressionId, verify);
       return;
@@ -11024,8 +11846,8 @@ function parseCellDeclarations(statement2, context) {
     if (!declaration.init || declaration.init.type !== "CallExpression" || id2.type !== "Identifier") {
       continue;
     }
-    if (id2.name === "invoke") {
-      throw new Error("invoke is a reserved name and cannot name a cell");
+    if (id2.name === "invoke" || id2.name === "fmt") {
+      throw new Error(`${id2.name} is a reserved name and cannot name a cell`);
     }
     const callee = declaration.init.callee;
     if (callee.type === "MemberExpression" && !callee.computed && callee.object.type === "Identifier" && callee.object.name === "Dialog" && callee.property.type === "Identifier") {
@@ -11071,6 +11893,14 @@ function parseCellDeclarations(statement2, context) {
     }
     if (callee.name === "Index") {
       throw new Error(`Index() is a channel-only type and cannot declare the cell ${id2.name}`);
+    }
+    if (callee.name === "Union") {
+      cells.push({
+        name: id2.name,
+        ...parseUnionDeclaration(declaration.init, id2.name, context),
+        loc: locOf(id2)
+      });
+      continue;
     }
     if (callee.name === "Struct") {
       cells.push({
@@ -11139,6 +11969,9 @@ function parseStructFieldDeclaration(expression, owner, context) {
     throw new Error(`Struct field ${owner} must be a constructed observable field, e.g. Str()`);
   }
   const callee = expression.callee;
+  if (callee.type === "Identifier" && callee.name === "Union") {
+    return parseUnionDeclaration(expression, owner, context);
+  }
   if (callee.type === "Identifier" && callee.name === "Struct") {
     return parseStructDeclaration(expression, owner, context);
   }
@@ -11151,9 +11984,28 @@ function parseStructFieldDeclaration(expression, owner, context) {
   }
   const scalar = parseScalarConstructorSpec(expression, owner, context);
   if (!scalar) {
-    throw new Error(`Struct field ${owner} must be an observable scalar, observable array, or Struct constructor`);
+    throw new Error(`Struct field ${owner} must be a scalar, Union, observable Array, or Struct constructor`);
   }
   return scalar;
+}
+function parseUnionDeclaration(call, owner, context) {
+  if (call.arguments.length > 2) {
+    throw new Error(`Union cell ${owner} takes a member array and optional config`);
+  }
+  const members = unionMemberCalls(call.arguments[0], owner).map((member, index) => {
+    const scalar = parseScalarConstructorSpec(member, `${owner} member ${index}`, context);
+    if (!scalar)
+      throw new Error(`Union cell ${owner} members must be scalar constructors`);
+    if (scalar.observing !== void 0) {
+      throw new Error(`Union cell ${owner} members cannot declare observing; put the question on the Union`);
+    }
+    return scalar;
+  });
+  return {
+    type: "union",
+    members,
+    ...parseCellConfig(owner, "Union", call.arguments[1], context)
+  };
 }
 function parseScalarConstructorSpec(call, owner, context) {
   if (call.callee.type !== "Identifier")
@@ -11211,13 +12063,24 @@ function parseScalarConstructorSpec(call, owner, context) {
   }
   return void 0;
 }
+function unionMemberCalls(argument, owner) {
+  if (argument?.type !== "ArrayExpression" || argument.elements.length < 2) {
+    throw new Error(`Union ${owner} requires an array of at least two member constructors`);
+  }
+  return argument.elements.map((member) => {
+    if (member?.type !== "CallExpression") {
+      throw new Error(`Union ${owner} members must be constructed scalar specs`);
+    }
+    return member;
+  });
+}
 function parseArrayElementSpec(cellName, args, context) {
   const arg = args[0];
   if (args.length !== 1 || !arg || arg.type === "SpreadElement") {
     throw new Error(`Array cell ${cellName} takes exactly one element constructor`);
   }
   if (arg.type !== "CallExpression") {
-    throw new Error(`Array cell ${cellName} element must be a constructed scalar cell, e.g. Array(Str())`);
+    throw new Error(`Array cell ${cellName} element must be a constructed declaration, e.g. Array(Str())`);
   }
   if (arg.callee.type === "Identifier" && arg.callee.name === "Array") {
     throw new Error(`Array cell ${cellName} cannot nest arrays`);
@@ -11228,12 +12091,15 @@ function parseArrayElementSpec(cellName, args, context) {
     }
     return { type: "artifact" };
   }
+  if (arg.callee.type === "Identifier" && arg.callee.name === "Union") {
+    return parseUnionDeclaration(arg, `${cellName}[]`, context);
+  }
   if (arg.callee.type === "Identifier" && arg.callee.name === "Struct") {
     return parseStructDeclaration(arg, `${cellName}[]`, context);
   }
   const element = parseScalarConstructorSpec(arg, cellName, context);
   if (!element) {
-    throw new Error(`Array cell ${cellName} element must be a scalar, Artifact, or Struct cell constructor`);
+    throw new Error(`Array cell ${cellName} element must be a scalar, Union, Artifact, or Struct cell constructor`);
   }
   return element;
 }
@@ -11286,14 +12152,14 @@ function parseNumericCellConfig(cellName, typeName, arg, context) {
       if (config.observeAs !== void 0) {
         throw new Error(`Duplicate cell config assignment: ${cellName}.observeAs`);
       }
-      config.observeAs = parseNumericObserveAs(property.value, cellName);
+      config.observeAs = parseNumberObserveAsConstraint(property.value, cellName);
       continue;
     }
     throw new Error(`${typeName} cell ${cellName} has unsupported config key: ${key ?? "<computed>"}`);
   }
   return config;
 }
-function parseNumericObserveAs(expression, cellName) {
+function parseNumberObserveAsConstraint(expression, cellName) {
   if (expression.type !== "ObjectExpression") {
     throw new Error(`Num cell ${cellName} observeAs must be an object literal`);
   }
@@ -12514,19 +13380,19 @@ function validateDocumentShape(document, issues) {
   }
 }
 function validateNodeShape(node2, documentImportNames, issues) {
-  if (node2.identifier === "invoke") {
+  if (node2.identifier === "invoke" || node2.identifier === "fmt") {
     issues.push({
       code: "RESERVED_NAME",
-      message: "invoke is a reserved name and cannot name a node",
+      message: `${node2.identifier} is a reserved name and cannot name a node`,
       loc: node2.loc
     });
   }
   const cells = /* @__PURE__ */ new Set();
   for (const cell of node2.cells) {
-    if (cell.name === "invoke") {
+    if (cell.name === "invoke" || cell.name === "fmt") {
       issues.push({
         code: "RESERVED_NAME",
-        message: "invoke is a reserved name and cannot name a cell",
+        message: `${cell.name} is a reserved name and cannot name a cell`,
         loc: cell.loc
       });
     }
@@ -13711,6 +14577,15 @@ function briefableExpressionLoc(expression) {
         }
       }
       return void 0;
+    case "fmt":
+      return briefableExpressionLoc(expression.value);
+    case "structLiteral":
+      for (const field of Object.values(expression.fields)) {
+        const loc = briefableExpressionLoc(field);
+        if (loc)
+          return loc;
+      }
+      return void 0;
     case "artifact":
       return briefableExpressionLoc(expression.path);
     case "arrayElementRead":
@@ -14047,6 +14922,16 @@ function validateExpression(expression, cells, nodes, issues, options = {}) {
         }
       }
       return;
+    case "fmt":
+      validateExpression(expression.value, cells, nodes, issues, options);
+      if (fmtRule.checkProducer(expression.value, producerContext(cells, signature2, options)).kind === "incompatible") {
+        issues.push({
+          code: "INVALID_FMT_OPERAND",
+          message: "Formatting requires a supported value with unambiguous authority",
+          loc: briefableExpressionLoc(expression.value)
+        });
+      }
+      return;
     case "artifact":
       validateExpression(expression.path, cells, nodes, issues, options);
       {
@@ -14233,6 +15118,20 @@ function enumToken(values) {
   }
   return createToken(spec2);
 }
+function unionToken(members) {
+  const path = activeCapture?.path ?? "$";
+  const children = inspectTokenArray(members, path, "Union");
+  if (children.length < 2) {
+    declarationError(path, "Union requires at least two scalar members");
+  }
+  const specs = children.map((child) => {
+    const spec2 = valueTokenSpec(child, path, "Union");
+    if (isUnionMemberSpec(spec2))
+      return spec2;
+    declarationError(path, "Union members must be Bool, Str, Enum, or Num markers");
+  });
+  return createToken({ type: "union", members: specs }, children);
+}
 function arrayToken(element) {
   const spec2 = valueTokenSpec(element, activeCapture?.path ?? "$", "Array");
   return createToken({
@@ -14348,6 +15247,7 @@ function isChannelSpec(spec2) {
     case "index":
     case "artifact":
     case "dialogCursor":
+    case "union":
       return true;
     case "array":
       return spec2.element.type === "boolean" || spec2.element.type === "string" || spec2.element.type === "enum" || spec2.element.type === "number" || spec2.element.type === "artifact" || isObservableFieldSpec2(spec2.element);
@@ -14365,6 +15265,7 @@ function isObservableFieldSpec2(spec2) {
     case "string":
     case "enum":
     case "number":
+    case "union":
       return true;
     case "array":
       return spec2.element.type !== "array" && isObservableFieldSpec2(spec2.element);
@@ -14395,6 +15296,7 @@ var hmd = Object.freeze({
   Str: () => scalarToken({ type: "string" }),
   Enum: enumToken,
   Num: () => scalarToken({ type: "number" }),
+  Union: unionToken,
   Index: () => scalarToken({ type: "index" }),
   Artifact: () => scalarToken({ type: "artifact" }),
   Dialog: Object.freeze({

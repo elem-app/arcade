@@ -33,6 +33,7 @@ function harness(): Harness {
     sessionKey: "arc-1:researcher",
     task: { kind: "instruction" } as unknown as Task,
     outboundAudienceReferences: [],
+    questionAudienceReferences: [],
     diagnostics: {
       writeText: async () => undefined,
       writeJson: async () => undefined,

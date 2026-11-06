@@ -1,5 +1,5 @@
 /**
- * Behavioral scenarios for grouped, array, and Struct observations and the
+ * Behavioral scenarios for grouped, array, struct, and union observations and the
  * grouped ask path, shared by the OpenAI and Claude general SDK evals.
  *
  * Each case is decided by Arc control flow over observed cell values: the Arc
@@ -17,7 +17,10 @@
  */
 
 import type { ObservedValue } from "@elem-app/arc/runtime";
+import type { OutboundMessage } from "../src/types/messaging.js";
+import { expect } from "./assertions.js";
 import { structObservationCases } from "./struct-observation-cases.js";
+import { unionObservationCases } from "./union-observation-cases.js";
 
 /** One shared observation scenario. */
 export type ObservationCase = {
@@ -26,8 +29,8 @@ export type ObservationCase = {
   inbound: string;
   /** Arc source whose branch is decided by the observed cell values. */
   arcSource: string;
-  /** Observed values the Arc must hold, keyed by cell name. */
-  observed: Record<string, ObservedValue>;
+  /** Expected stored values, with `undefined` for a cell that must stay unset. */
+  observed: Record<string, ObservedValue | undefined>;
   /** Relative artifact path the selected branch writes. */
   artifact: string;
   /** Substrings the produced artifact must carry. */
@@ -35,10 +38,10 @@ export type ObservationCase = {
   /** Relative artifact path an unselected branch would have written. */
   unselectedArtifact: string;
   /**
-   * The cell whose fact the inbound withholds, with the fixed answer supplied
-   * when the worker asks for it. Cases without it forbid questions.
+   * Facts withheld from the inbound, supplied only by their assigned audiences.
+   * Cases without withheld facts forbid questions.
    */
-  withheld?: { cell: string; answer: string };
+  withheld?: readonly { cell: string; audience: string; answer: string }[];
 };
 
 /**
@@ -181,11 +184,112 @@ function Main() {
   artifact: "plan.md",
   requiredArtifactFacts: ["window=Saturday 02:00-04:00 UTC"],
   unselectedArtifact: "unowned.md",
-  withheld: {
-    cell: "maintenanceWindow",
-    answer: "Saturday 02:00-04:00 UTC",
-  },
+  withheld: [
+    {
+      cell: "maintenanceWindow",
+      audience: "originator",
+      answer: "Saturday 02:00-04:00 UTC",
+    },
+  ],
 };
+
+/** Single and grouped observations that require named participants. */
+const PARTICIPANT_ASK: ObservationCase = {
+  name: "participant-observe-or-ask",
+  inbound: "Please record the approved project budget and prepare the plan.",
+  observed: { budget: 4700 },
+  withheld: [{ cell: "budget", audience: "supervisor", answer: "4700" }],
+  artifact: "selected.md",
+  requiredArtifactFacts: ["budget=4700"],
+  unselectedArtifact: "other.md",
+  arcSource: `"arc";
+import Audience from "host:audience";
+function Main() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "writer" };
+  let budget = Num({ observing: \`the project budget approved by \${Audience.supervisor}; ask \${Audience.supervisor} if it is missing\` });
+  let selected = Artifact("selected.md");
+  let other = Artifact("other.md");
+  $observeOrAsk(budget);
+  if (budget == 4700) {
+    $instruct(\`Create \${selected} whose entire content is exactly this one line: budget=\${budget}\`);
+  } else {
+    $instruct(\`Create \${other} whose entire content is exactly this one line: budget=\${budget}\`);
+  }
+}`,
+};
+
+const GROUPED_PARTICIPANT_ASK: ObservationCase = {
+  name: "grouped-participant-observe-or-ask",
+  inbound:
+    "Please collect the approved budget and review lead time, then prepare the project plan.",
+  observed: { budget: 4700, leadDays: 12 },
+  withheld: [
+    { cell: "budget", audience: "supervisor", answer: "4700" },
+    { cell: "leadDays", audience: "reviewer", answer: "12" },
+  ],
+  artifact: "selected.md",
+  requiredArtifactFacts: ["budget=4700", "leadDays=12"],
+  unselectedArtifact: "other.md",
+  arcSource: `"arc";
+import Audience from "host:audience";
+function Main() {
+  this.trigger = () => true;
+  this.hostParams = { workerRole: "writer" };
+  let budget = Num({ observing: \`the project budget approved by \${Audience.supervisor}; ask \${Audience.supervisor} if it is missing\` });
+  let leadDays = Num({ observing: \`the number of review lead days required by \${Audience.reviewer}; ask \${Audience.reviewer} if it is missing\` });
+  let selected = Artifact("selected.md");
+  let other = Artifact("other.md");
+  $observeOrAsk({ budget, leadDays });
+  if (budget == 4700 && leadDays == 12) {
+    $instruct(\`Create \${selected} whose entire content is exactly this one line: budget=\${budget}; leadDays=\${leadDays}\`);
+  } else {
+    $instruct(\`Create \${other} whose entire content is exactly this one line: budget=\${budget}; leadDays=\${leadDays}\`);
+  }
+}`,
+};
+
+/** Track attempted recipients and successfully correlated answers independently. */
+export function trackObservationAnswers(item: ObservationCase) {
+  const attempts: OutboundMessage[] = [];
+  const unexpected: OutboundMessage[] = [];
+  const answered: OutboundMessage[] = [];
+  return {
+    attempts,
+    answered,
+    async answer(
+      message: OutboundMessage,
+      deliver: (answer: string) => Promise<void>,
+    ): Promise<void> {
+      attempts.push(message);
+      const entry = item.withheld?.find(
+        (entry) => entry.audience === message.situation.audience,
+      );
+      if (!entry) {
+        unexpected.push(message);
+        throw new Error(
+          `${item.name}: unexpected question recipient ${message.situation.audience}`,
+        );
+      }
+      await deliver(entry.answer);
+      answered.push(message);
+    },
+    assertComplete(): void {
+      expect(
+        unexpected.map((message) => message.situation.audience),
+        `${item.name}: unexpected question recipients`,
+      ).toEqual([]);
+      for (const entry of item.withheld ?? []) {
+        expect(
+          answered.some(
+            (message) => message.situation.audience === entry.audience,
+          ),
+          `${item.name}: correlated answer for ${entry.cell} from ${entry.audience}`,
+        ).toBe(true);
+      }
+    },
+  };
+}
 
 /** The shared observation scenario corpus. */
 export function observationCases(): ObservationCase[] {
@@ -193,7 +297,10 @@ export function observationCases(): ObservationCase[] {
     GROUPED_OBSERVATION,
     ARRAY_OBSERVATION,
     GROUPED_ASK,
+    PARTICIPANT_ASK,
+    GROUPED_PARTICIPANT_ASK,
     GUIDED_OBSERVATION,
+    ...unionObservationCases(),
     ...structObservationCases().map(
       (item): ObservationCase => ({
         name: item.name,

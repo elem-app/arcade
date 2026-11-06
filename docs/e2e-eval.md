@@ -79,11 +79,25 @@ OpenAI targets require `ARCADE_OPENAI_API_KEY`. Claude SDK targets use ambient C
 
 The `standing-guidance-instruction` and `standing-guidance-observation` cases check guidance-dependent reply formatting, audience selection, and record extraction on both general SDKs; their distinguishing policies appear only in `this.guidance`. The `standing-guidance-trigger` case checks both fast-trigger backends against conflicting action guidance: selection follows the authored trigger questions while node guidance stays outside the prompts.
 
-The `struct-observation` and `struct-array-observation` cases run on both general SDKs. They extract a complete nested record or ordered record array, branch on nested enum, boolean, numeric, and array values, write the observed fields into the selected branch's artifact, and compare the complete committed cells with the expected values. The `struct-trigger-observation` and `struct-array-trigger-observation` cases run on both fast-trigger backends, reject a nonmatching input, activate on matching nested values, and compare the complete committed cell with the expected record after activation. All four cases are in the extended tier. Their shared fixtures include Structs containing Struct arrays and Struct arrays containing nested Structs; the original field questions remain the source of extraction semantics.
+The `struct-observation` and `struct-array-observation` cases run on both general SDKs. They extract a complete nested record or ordered record array, branch on nested enum, boolean, numeric, and array values, write the observed fields into the selected branch's artifact, and compare the complete committed cells with the expected values. The `struct-trigger-observation` and `struct-array-trigger-observation` cases run on both fast-trigger backends, reject a nonmatching input, activate on matching nested values, and compare the complete committed cell with the expected record after activation. All four cases are in the extended tier. Their shared fixtures include structs containing struct arrays and struct arrays containing nested structs; the original field questions remain the source of extraction semantics.
 
 ```sh
 pnpm eval --dry-run --targets=all --cases=struct-observation,struct-array-observation,struct-trigger-observation,struct-array-trigger-observation
 pnpm eval --targets=all --cases=struct-observation,struct-array-observation,struct-trigger-observation,struct-array-trigger-observation
+```
+
+The `participant-observe-or-ask` and `grouped-participant-observe-or-ask` cases run on both general SDKs in the extended tier. The first obtains a missing numeric budget from `supervisor`. The second obtains that budget from `supervisor` and a distinct review lead time from `reviewer`, then verifies both values in the committed cells and selected artifact. Each participant supplies only its assigned answer. The harness rejects unexpected recipients before supplying an answer, retains every attempt, and checks recipient failures outside the callback so later recovery cannot erase them. Every required participant must supply a correlated answer. Deterministic coverage also verifies that either pending grouped field prevents all writes and that a rejected answer does not count as supplied.
+
+```sh
+pnpm eval --dry-run --targets=claude-sdk,openai-sdk --cases=participant-observe-or-ask,grouped-participant-observe-or-ask,union-observe-or-ask,union-unknown-observation,grouped-observe-or-ask,audience-question --repetitions=1
+pnpm eval --targets=claude-sdk,openai-sdk --cases=participant-observe-or-ask,grouped-participant-observe-or-ask,union-observe-or-ask,union-unknown-observation,grouped-observe-or-ask,audience-question --repetitions=1 --keep
+```
+
+The union cases run on both providers in the extended tier. `union-observation` extracts a number accepted by overlapping members, a number accepted only by a later member's observation bounds, and an explicit no-preference answer. `union-container-observation` extracts union values in a struct's array and an array of structs. `union-unknown-observation` requires an unanswered union to remain unset; `union-observe-or-ask` requires a question before accepting the supplied no-preference reply. The two corresponding trigger cases reject missing or nonmatching answers, then activate on matching answers and check the complete committed cells. Action cases also check committed cells, the selected artifact and its contents, and whether a question was required.
+
+```sh
+pnpm eval --dry-run --targets=all --cases=union-observation,union-container-observation,union-unknown-observation,union-observe-or-ask,union-trigger-observation,union-container-trigger-observation
+pnpm eval --targets=all --cases=union-observation,union-container-observation,union-unknown-observation,union-observe-or-ask,union-trigger-observation,union-container-trigger-observation
 ```
 
 ### Behavioral eval rules

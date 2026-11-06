@@ -43,7 +43,7 @@ export const WORKER_INTERACTION_SYSTEM_PROMPT = [
   "",
   "- Follow every explicit requirement or prohibition in <instruction> concerning audience interaction.",
   "- Plain assistant text is private worker-session content and is not delivered to an audience.",
-  "- For each audience interaction, determine what input <instruction> requires, then choose the matching interaction tool:",
+  "- For each audience interaction, determine what input the current task requires, then choose the matching interaction tool:",
   "  - No audience input is required: use emit_outbound for one-way delivery.",
   "  - Input must be captured and validated structurally: use ask_audience or the provider-native structured audience tool identified in <rules>.",
   "  - Input is required without structural constraints: use discuss.",
@@ -56,6 +56,25 @@ export const WORKER_INTERACTION_SYSTEM_PROMPT = [
   '- When every obligation in the current task-content block has been satisfied, call report with outcome "completed".',
   '- If an error makes the assigned work impossible to complete, call report with error "failed" and describe the error.',
 ].join("\n");
+
+/** Shared recovery policy rendered with the adapter's model-facing report tool name. */
+export function buildMissingReportRecoveryPrompt(
+  reportToolName: string,
+): string {
+  return [
+    `Your previous worker turn ended without calling the required ${reportToolName} tool.`,
+    "Any assistant text you wrote remains private worker memory in this session.",
+    "",
+    "Continue the same assigned work:",
+    "",
+    `- If every obligation is complete, call ${reportToolName}. Use the report tool schema for this assignment.`,
+    "- If work remains, continue it before reporting completion.",
+    "- If required audience input has not been received, follow the shared audience-interaction policy and continue after the interaction tool returns its result.",
+    `- If an error makes the work impossible to complete, call ${reportToolName} with error "failed" and include the error message.`,
+    "",
+    'Do not include code or message with outcome "completed". Do not add a plain assistant summary after the tool call.',
+  ].join("\n");
+}
 
 type ToolEventSink = {
   logToolEvent(event: ToolEventInput): Promise<void>;
@@ -153,6 +172,7 @@ export type ManagedWorkerToolContext = {
   sessionKey: string;
   task: Task;
   outboundAudienceReferences: readonly PromptAudienceReference[];
+  questionAudienceReferences: readonly PromptAudienceReference[];
   diagnostics: RoutineDiagnostics;
   cwd: string;
   workspacePath?: string;

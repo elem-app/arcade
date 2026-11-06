@@ -8,6 +8,7 @@ import {
   renderDialogPriming,
   renderInstructionTaskText,
   renderInstructionTaskTextForPrompt,
+  renderQuestionAudienceReferencesForPrompt,
   renderSemanticRequestForPrompt,
   renderTaskForPrompt,
 } from "../src/service/task-renderer.js";
@@ -16,6 +17,9 @@ import {
   type RoutineContext,
   type SemanticRequest,
 } from "../src/testing.js";
+
+import { participantObservationTask } from "./backend-helpers.js";
+import { firstTask } from "./helpers.js";
 
 describe("task renderer", () => {
   it("rejects instruction tasks whose texts or guidance are misaligned with brief ids", () => {
@@ -419,3 +423,240 @@ function context(): RoutineContext {
     workspaceBundle: {},
   };
 }
+
+it("renders the Union target question and preserves ordered metadata and explicit answers", () => {
+  const request: SemanticRequest = {
+    kind: "observation",
+    briefId: "observe:preferences",
+    role: "researcher",
+    cell: "preferences",
+    mode: "observeOrAsk",
+    question: "preferences",
+    currentValue: { hours: [9, "no_preference"] },
+    meta: {
+      type: "struct",
+      fields: {
+        hours: {
+          question: [
+            { kind: "text", value: "hours from " },
+            { kind: "artifact", path: "preferences.md" },
+          ],
+          meta: {
+            type: "array",
+            element: {
+              type: "union",
+              members: [
+                { type: "number" },
+                { type: "enum", values: ["no_preference"] },
+                { type: "string" },
+              ],
+            },
+          },
+        },
+      },
+    },
+    tool: {
+      type: "function",
+      name: "resolve",
+      description: "Resolve.",
+      parameters: {},
+      strict: true,
+    },
+    sourceRef: "node:test:Main",
+  };
+  const rendered = renderSemanticRequestForPrompt(
+    request,
+    context(),
+    { kind: "sandbox", sandboxRoot: "/workspace" },
+    "action",
+  );
+  expect(rendered).toMatchObject({
+    currentValue: { hours: [9, "no_preference"] },
+    meta: {
+      fields: {
+        hours: {
+          question: "hours from /workspace/preferences.md",
+          meta: {
+            element: {
+              type: "union",
+              members: [
+                { type: "number" },
+                { type: "enum", values: ["no_preference"] },
+                { type: "string" },
+              ],
+            },
+          },
+        },
+      },
+    },
+  });
+});
+
+it("retains question audiences through grouped and recursive observation metadata", async () => {
+  const base = participantObservationTask(await firstTask(), "supervisor");
+  const request = base.requests[0]!;
+  if (request.kind !== "observation") throw new Error("expected observation");
+  const participant = (audience: string): SemanticText => [
+    { kind: "hostVar", module: "audience", path: [audience] },
+  ];
+  const observation: SemanticRequest = {
+    ...request,
+    guidance: [
+      { kind: "entity", name: "user" },
+      { kind: "hostVar", module: "audience", path: ["guide"] },
+    ],
+    meta: {
+      type: "struct",
+      fields: {
+        nested: {
+          question: participant("supervisor"),
+          meta: {
+            type: "struct",
+            fields: {
+              rows: {
+                question: participant("reviewer"),
+                meta: {
+                  type: "array",
+                  element: {
+                    type: "struct",
+                    fields: {
+                      value: {
+                        question: participant("approver"),
+                        meta: { type: "number" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+  const grouped: SemanticRequest = {
+    kind: "observation-group",
+    briefId: "group",
+    mode: "observeOrAsk",
+    role: request.role,
+    sourceRef: request.sourceRef,
+    tool: request.tool,
+    guidance: observation.guidance,
+    fields: [
+      {
+        cell: "record",
+        question: observation.question,
+        meta: observation.meta,
+      },
+      {
+        cell: "other",
+        question: participant("other"),
+        meta: { type: "string" },
+      },
+    ],
+  };
+  for (const target of [
+    { kind: "host" },
+    { kind: "sandbox", sandboxRoot: "/workspace" },
+  ] as const) {
+    for (const current of [observation, grouped]) {
+      const rendered = renderSemanticRequestForPrompt(
+        current,
+        context(),
+        target,
+        "action",
+      );
+      if (rendered.kind === "judgment") throw new Error("expected observation");
+      const expected = [
+        { marker: "user", audience: "originator" },
+        ...[
+          "guide",
+          "supervisor",
+          "reviewer",
+          "approver",
+          ...(current.kind === "observation-group" ? ["other"] : []),
+        ].map((audience) => ({ marker: `<audience:${audience}>`, audience })),
+      ];
+      expect(rendered.audienceReferences).toEqual(expected);
+      expect(
+        renderQuestionAudienceReferencesForPrompt(
+          { ...base, requests: [current, current] },
+          context(),
+          target,
+        ),
+      ).toEqual(expected);
+      const plain = renderSemanticRequestForPrompt(
+        { ...current, mode: "observe" },
+        context(),
+        target,
+        "action",
+      );
+      const trigger = renderSemanticRequestForPrompt(
+        current,
+        context(),
+        target,
+        "trigger",
+      );
+      expect(plain).not.toHaveProperty("audienceReferences");
+      expect(trigger).not.toHaveProperty("audienceReferences");
+    }
+  }
+});
+
+it("limits question audiences to current eligible requests and instruction guidance", async () => {
+  const instruction = await firstTask();
+  const task = participantObservationTask(instruction, "supervisor");
+  const request = task.requests[0]!;
+  if (request.kind !== "observation") throw new Error("expected observation");
+  const marker = (name: string): SemanticText => [
+    { kind: "hostVar", module: "audience", path: [name] },
+  ];
+  const activeInstruction: InstructionTask = {
+    ...instruction,
+    texts: [marker("prior")],
+    guidance: [marker("prior-guide")],
+  };
+  const mixed = {
+    ...task,
+    activeInstruction,
+    requests: [
+      request,
+      {
+        ...request,
+        mode: "observe" as const,
+        question: marker("plain"),
+        guidance: marker("plain-guide"),
+      },
+      {
+        kind: "judgment" as const,
+        briefId: "judge",
+        role: request.role,
+        sourceRef: request.sourceRef,
+        tool: request.tool,
+        question: marker("judgment"),
+        guidance: marker("judgment-guide"),
+      },
+    ],
+  };
+  const target = { kind: "host" } as const;
+  expect(
+    renderQuestionAudienceReferencesForPrompt(mixed, context(), target),
+  ).toEqual([{ marker: "<audience:supervisor>", audience: "supervisor" }]);
+  expect(
+    renderQuestionAudienceReferencesForPrompt(
+      { ...mixed, stage: "trigger" },
+      context(),
+      target,
+    ),
+  ).toEqual([]);
+  expect(
+    renderQuestionAudienceReferencesForPrompt(
+      activeInstruction,
+      context(),
+      target,
+    ),
+  ).toEqual([
+    { marker: "<audience:prior>", audience: "prior" },
+    { marker: "<audience:prior-guide>", audience: "prior-guide" },
+  ]);
+});

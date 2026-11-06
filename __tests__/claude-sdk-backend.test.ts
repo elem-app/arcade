@@ -26,6 +26,7 @@ import {
   callSdkReport,
   noopDiagnostics,
   outbound,
+  participantObservationTask,
   routine,
   runBackend,
 } from "./backend-helpers.js";
@@ -49,6 +50,132 @@ import {
 const execFileAsync = promisify(execFile);
 
 describe("ClaudeSdkWorker", () => {
+  it("routes current Claude observation participants through waiting input tools across session reuse", async () => {
+    const instruction = await firstTask();
+    const recipients = ["supervisor", "reviewer"];
+    const emitted: OutboundMessage[] = [];
+    const gates = Array.from({ length: 4 }, () => deferred<string>());
+    const exercise = async (
+      call: (name: string, input: Record<string, unknown>) => Promise<unknown>,
+      index: number,
+    ) => {
+      const audience = recipients[index]!;
+      await call("emit_outbound", { audience, content: "Must stay private." });
+      expect(emitted).toHaveLength(index * 2);
+      for (const unavailable of [
+        "outsider",
+        ...(index === 1 ? ["supervisor"] : []),
+      ]) {
+        for (const name of ["discuss", "ask_audience"]) {
+          const args =
+            name === "discuss"
+              ? { audience: unavailable, question: "Missing?" }
+              : {
+                  audience: unavailable,
+                  questions: [structuredQuestionFixture()],
+                };
+          await expect(call(name, args)).rejects.toThrow("current task");
+        }
+      }
+      const values: string[] = [];
+      for (const [offset, name] of ["discuss", "ask_audience"].entries()) {
+        let settled = false;
+        const pending = call(
+          name,
+          name === "discuss"
+            ? {
+                audience: `<audience:${audience}>`,
+                question: "What is the answer?",
+              }
+            : { audience, questions: [structuredQuestionFixture()] },
+        ).finally(() => {
+          settled = true;
+        });
+        const position = index * 2 + offset;
+        await waitFor(() => emitted.length === position + 1);
+        expect(settled).toBe(false);
+        expect(emitted[position]!.situation).toMatchObject({
+          audience,
+          cause: "question",
+        });
+        gates[position]!.resolve(offset === 0 ? "One" : "Two");
+        const result = (await pending) as {
+          answer?: string;
+          answers?: Record<string, string>;
+        };
+        values.push(
+          name === "discuss" ? result.answer! : result.answers!["Choose one?"]!,
+        );
+      }
+      return {
+        outcome: "completed" as const,
+        semantic: {
+          observations: {
+            "observe:answer": {
+              status: "resolved" as const,
+              value: values.join("/"),
+            },
+          },
+        },
+      };
+    };
+    const { query, states } = streamingQueryReturning(
+      [undefined],
+      async (params, index) => {
+        const report = await exercise(async (name, input) => {
+          const raw = (await callSdkTool(params, name, input)) as {
+            content: { text: string }[];
+          };
+          return JSON.parse(raw.content[0]!.text) as unknown;
+        }, index);
+        await callSdkReport(params, report);
+      },
+    );
+    const backend = new ClaudeSdkWorker({
+      query,
+      sessionCache: { maxPreparedStarts: 0 },
+    });
+    try {
+      for (const [index, audience] of recipients.entries()) {
+        const task = participantObservationTask(instruction, audience);
+        const report = await runBackend(
+          backend,
+          routine(task, { id: `observation-${index}` }),
+          context(),
+          noopRoutineEffects({
+            emit: async (message) => {
+              emitted.push(outbound(message));
+              return gates[emitted.length - 1]!.promise;
+            },
+          }),
+          noopDiagnostics,
+        );
+        expect(report).toMatchObject({
+          outcome: "completed",
+          semantic: {
+            observations: {
+              "observe:answer": { status: "resolved", value: "One/Two" },
+            },
+          },
+        });
+      }
+      expect(query).toHaveBeenCalledTimes(1);
+      for (const [index, audience] of recipients.entries()) {
+        const prompt = states[0]!.prompts[index]!;
+        expect(prompt).not.toContain("<active-instruction>");
+        expect(prompt).toContain(`<audience:${audience}> -> ${audience}`);
+        expect(prompt).toContain("participant identified by each question");
+        expect(prompt).toContain(
+          "Structured originator input: AskUserQuestion",
+        );
+        expect(prompt).toContain("mcp__arcade_internal__ask_audience");
+      }
+    } finally {
+      gates.forEach((gate) => gate.resolve("Two"));
+      await backend.stop();
+    }
+  });
+
   it("reuses a warm Claude session with fresh routine effects while its approvals expire", async () => {
     const task = await firstTask();
     const seen: string[] = [];
@@ -1622,6 +1749,9 @@ describe("ClaudeSdkWorker", () => {
     expect(prompt).toContain("mcp__arcade_internal__ask_audience");
     expect(prompt).toContain("Structured originator input: AskUserQuestion");
     expect(prompt).toContain("Execute only the current assigned task.");
+    expect(prompt).toContain(
+      "After creating or editing a file, verify that it exists and contains the expected content before reporting completion.",
+    );
     expect(prompt).not.toContain("current Arc instruction task");
     expect(prompt).toContain("Do not create, edit, delete, or move");
     expect(prompt).toContain(
@@ -1703,7 +1833,7 @@ describe("ClaudeSdkWorker", () => {
 
     const options = query.mock.calls[0]![0].options!;
     expect((options.systemPrompt as { append: string }).append).toContain(
-      "For each audience interaction, determine what input <instruction> requires",
+      "For each audience interaction, determine what input the current task requires",
     );
     expect(states[0]!.prompts[0]).not.toContain("Audience references:");
     expect(states[0]!.prompts[0]).toContain(
@@ -2726,7 +2856,12 @@ describe("ClaudeSdkWorker", () => {
       "interaction tool returns its result",
     );
     expect(states[0]!.prompts[1]).toContain("Continue the same assigned work");
-    expect(states[0]!.prompts[1]).toContain("mcp__arcade_internal__report");
+    expect(states[0]!.prompts[1]).toContain(
+      "If every obligation is complete, call mcp__arcade_internal__report.",
+    );
+    expect(states[0]!.prompts[1]).toContain(
+      'call mcp__arcade_internal__report with error "failed"',
+    );
     expect(emit).not.toHaveBeenCalled();
     expect(records).toContainEqual(
       expect.objectContaining({
@@ -2921,6 +3056,12 @@ describe("ClaudeSdkWorker", () => {
     expect(prompt).toContain("</rules>");
     expect(prompt).toContain("Resolve this action semantic work.");
     expect(prompt).toContain("Call report using its declared schema");
+    expect(prompt).toContain(
+      "For observeOrAsk, collect missing information from the participant identified by each question",
+    );
+    expect(prompt).toContain(
+      'For observe, use "unknown" when the value cannot be determined, without asking a participant',
+    );
     expect(prompt).not.toContain("Dialog:");
     const call = query.mock.calls[0]![0];
     expect(call.options?.cwd).toBe(workspace);
@@ -2932,6 +3073,16 @@ describe("ClaudeSdkWorker", () => {
     expect(call.options?.systemPrompt).toMatchObject({
       append: expect.stringContaining(
         "without repeating its work or audience interactions",
+      ),
+    });
+    expect(call.options?.systemPrompt).toMatchObject({
+      append: expect.stringContaining(
+        "For each audience interaction, determine what input the current task requires",
+      ),
+    });
+    expect(call.options?.systemPrompt).toMatchObject({
+      append: expect.stringContaining(
+        "An input obligation is satisfied when that result is received",
       ),
     });
     expect(call.options?.tools).toEqual({

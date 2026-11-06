@@ -177,11 +177,13 @@ console.log(JSON.stringify(summary));
 
   it("registers unique case ids and disjoint smoke/extended plans", () => {
     const cases = listEvalCases();
-    expect(cases).toHaveLength(33);
-    expect(new Set(cases.map((item) => item.id)).size).toBe(33);
+    expect(cases).toHaveLength(41);
+    expect(new Set(cases.map((item) => item.id)).size).toBe(cases.length);
     for (const id of [
       "struct-trigger-observation",
       "struct-array-trigger-observation",
+      "union-trigger-observation",
+      "union-container-trigger-observation",
     ]) {
       expect(
         Object.keys(cases.find((item) => item.id === id)!.executions).sort(),
@@ -195,8 +197,8 @@ console.log(JSON.stringify(summary));
     );
     const all = planEvalExecutions(invocation(), cases);
     expect(smoke.executions).toHaveLength(19);
-    expect(extended.executions).toHaveLength(42);
-    expect(all.executions).toHaveLength(61);
+    expect(extended.executions).toHaveLength(58);
+    expect(all.executions).toHaveLength(77);
     const smokeIds = new Set(
       smoke.executions.map((execution) => execution.caseId),
     );

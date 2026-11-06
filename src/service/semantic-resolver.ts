@@ -40,6 +40,7 @@ export function buildSemanticSystemPrompt(
     "Resolve every requested judgment or observation using the supplied report schema.",
     'Use "resolved" when the complete cell value can be determined, "unknown" when it cannot, and "needs-user" only for observeOrAsk when a user reply would help.',
     "Interpret each observed field using its question and metadata. Preserve the requested array order.",
+    "A Union requests one value satisfying any member, using the target question and member constraints. Overlapping matches are valid. An explicit Enum answer such as no preference requires evidence; missing information remains unknown.",
     reporting === "tool"
       ? "Submit the result by calling report with its declared schema."
       : "Return only the JSON object required by the response schema.",

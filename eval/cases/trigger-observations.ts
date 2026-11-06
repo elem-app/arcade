@@ -33,6 +33,10 @@ import {
 } from "../struct-observation-cases.js";
 import { ownedSubmissionEvents } from "../submission-events.js";
 import { EVAL_CLAUDE_TST_MODEL, EVAL_OPENAI_TST_MODEL } from "../targets.js";
+import {
+  unionTriggerSource,
+  unionValueCases,
+} from "../union-observation-cases.js";
 
 for (const target of ["claude-sdk-tst", "openai-sdk-tst"] as const) {
   defineManagedEvalGroup(
@@ -41,18 +45,32 @@ for (const target of ["claude-sdk-tst", "openai-sdk-tst"] as const) {
       cases: [
         CASES.structTriggerObservation,
         CASES.structArrayTriggerObservation,
+        CASES.unionTriggerObservation,
+        CASES.unionContainerTriggerObservation,
       ],
       timeoutMs: 240_000,
       requires: ["semantic-trigger"],
     },
     async () => {
       const caseId = selectedEvalCaseId();
-      const item = structObservationCases().find(
+      const item = [
+        ...structObservationCases().map((candidate) => ({
+          name: candidate.name,
+          source: structTriggerSource(candidate),
+          inbound: candidate.inbound,
+          negativeInbound: candidate.negativeInbound,
+          observed: { [candidate.cell]: candidate.value },
+        })),
+        ...unionValueCases().map((candidate) => ({
+          ...candidate,
+          source: unionTriggerSource(candidate),
+        })),
+      ].find(
         (candidate) =>
           candidate.name.replace("-observation", "-trigger-observation") ===
           caseId,
       );
-      if (!item) throw new Error(`Unknown Struct trigger case ${caseId}.`);
+      if (!item) throw new Error(`Unknown observation trigger case ${caseId}.`);
       const root = await createEvalFixtureDirectory(`${target}-${caseId}-`);
       const logger = createEvalLogger();
       const store = new InMemoryArcHostStore();
@@ -93,7 +111,7 @@ for (const target of ["claude-sdk-tst", "openai-sdk-tst"] as const) {
         },
       });
       const questions = trackUnexpectedQuestions(workerHub);
-      await arcHost.registerArc(caseId, parse(structTriggerSource(item)));
+      await arcHost.registerArc(caseId, parse(item.source));
 
       const negative = await collectLifecycle(
         ownedSubmissionEvents(workerHub, {
@@ -103,7 +121,7 @@ for (const target of ["claude-sdk-tst", "openai-sdk-tst"] as const) {
       );
       expect(
         negative,
-        "nonmatching nested values do not activate",
+        "nonmatching or missing observations do not activate",
       ).toHaveLength(0);
 
       const positive = await collectLifecycle(
@@ -114,19 +132,22 @@ for (const target of ["claude-sdk-tst", "openai-sdk-tst"] as const) {
       );
       expect(
         positive.map((event) => event.kind),
-        "matching nested values activate once",
+        "matching observations activate once",
       ).toEqual(["activated"]);
       const activation = positive.find((event) => event.kind === "activated");
       if (activation) {
         const state = await store.getState(arcRunKey(activation.arcRunId));
         const ref = toArcRef(caseId, "Main");
         expect(state?.arcRef, "the expected root activates").toBe(ref);
+        const cells = state?.traversals.find(
+          (traversal) => traversal.ref === ref,
+        )?.cells;
         expect(
-          state?.traversals.find((traversal) => traversal.ref === ref)?.cells[
-            item.cell
-          ],
-          "the complete observation survives trigger admission and activation",
-        ).toEqual(item.value);
+          Object.fromEntries(
+            Object.keys(item.observed).map((cell) => [cell, cells?.[cell]]),
+          ),
+          "complete observations survive trigger admission and activation",
+        ).toEqual(item.observed);
       }
       expect(
         questions,

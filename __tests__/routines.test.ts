@@ -324,12 +324,10 @@ function Watch() {
     expect(advanceInputs[0]).toMatchObject({ reports: [report] });
   });
 
-  it("rejects status-shaped and multiply discriminated routine reports", async () => {
-    expect(() => validateRoutineReport({ status: "queued" })).toThrow(
-      "failed validation",
-    );
+  it("rejects malformed and multiply discriminated routine reports", async () => {
+    expect(() => validateRoutineReport({})).toThrow("failed validation");
     expect(() =>
-      validateRoutineReport({ outcome: "completed", status: "queued" }),
+      validateRoutineReport({ outcome: "completed", unexpected: true }),
     ).toThrow("failed validation");
     expect(() =>
       validateRoutineReport({ outcome: "completed", suspension: "paused" }),
@@ -339,7 +337,8 @@ function Watch() {
     const { workerHub, routineStore } = makeWorkerHub({
       arcHost,
       workers: {
-        researcher: async () => ({ status: "queued" }) as never,
+        researcher: async () =>
+          ({ outcome: "completed", semantic: "invalid" }) as never,
       },
     });
     const { routine } = await settleFirstRoutine(workerHub, routineStore);

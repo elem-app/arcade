@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { parse } from "@elem-app/arc/parser";
 import { toNodeRef } from "@elem-app/arc/runtime";
 import { describe, expect, it } from "vitest";
+import { modelReportContract } from "../src/service/semantic-schema.js";
 import type { HostCall } from "../src/types/host-module.js";
 import {
   createTestArcHost,
@@ -2122,4 +2123,75 @@ function Main() {
       ),
     ).toBe(true);
   });
+});
+
+it("commits schema-validated Union answers through the Arcade adapter into Arc", async () => {
+  const host = await makeArcHostWithSource(
+    "union-observe",
+    `
+    "arc"; function Preferences() {
+      this.trigger = () => true;
+      let choice = Union([Enum(["none"]), Num()]);
+      let record = Struct({ hours: Array(Union([Num(), Enum(["none"])])) });
+      $observeOrAsk({ choice, record });
+      if (choice == "none") { $instruct(\`Choice \${choice}; hours \${record.hours}\`); }
+    }
+  `,
+  );
+  const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+  let driver = await beginActivatedDriver(host, dialog);
+  let view = driver.frontier;
+  let task = view.tasks[0];
+  if (task?.kind !== "semantic") throw new Error("Expected semantic task");
+  const id = view.briefs.observations[0]!.id;
+  const pending = modelReportContract(task, true).parse({
+    report: {
+      outcome: "completed",
+      semantic: {
+        observations: {
+          [id]: {
+            fields: {
+              choice: { status: "unknown" },
+              record: { status: "resolved", value: { hours: [9, "none"] } },
+            },
+          },
+        },
+      },
+    },
+  });
+  driver = (
+    await driver.advance({
+      dialog,
+      input: { instructionCoverage: {}, reports: [pending] },
+    })
+  ).driver;
+  view = driver.frontier;
+  task = view.tasks[0];
+  if (task?.kind !== "semantic")
+    throw new Error("Expected unresolved semantic task");
+  const report = modelReportContract(task, true).parse({
+    report: {
+      outcome: "completed",
+      semantic: {
+        observations: {
+          [view.briefs.observations[0]!.id]: {
+            fields: {
+              choice: { status: "resolved", value: "none" },
+              record: { status: "resolved", value: { hours: [9, "none"] } },
+            },
+          },
+        },
+      },
+    },
+  });
+  const committed = await advanceView(driver, dialog, {
+    instructionCoverage: {},
+    reports: [report],
+  });
+  expect(committed.tasks).toContainEqual(
+    expect.objectContaining({
+      kind: "instruction",
+      texts: ["Choice none; hours 9,none"],
+    }),
+  );
 });

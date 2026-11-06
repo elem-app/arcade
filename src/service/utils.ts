@@ -109,11 +109,11 @@ export function normalizeReplyAudience(
  * A question is blocking — the worker waits for an answer — so it must always
  * resolve to a real recipient. An unspecified audience defaults to the
  * originator; a named one is normalized to the canonical audience the current
- * instruction exposes. An explicit `originator` is always allowed even when the
- * instruction does not list it, since it is a built-in recipient.
+ * task exposes. An explicit `originator` is always allowed even when the
+ * task does not list it, since it is a built-in recipient.
  *
  * Any other unrecognized audience is rejected. Addressing a question to a
- * audience the instruction never named is a worker error; passing it onward
+ * audience the task never named is a worker error; passing it onward
  * would only fail later with an opaque "no outbound handler" delivery error, so
  * we surface a clear, actionable failure here instead.
  */
@@ -131,7 +131,7 @@ export function normalizeQuestionAudience(
       ? ` Name one of: ${markers.join(", ")}, or omit it to address the originator.`
       : " Omit the audience to address the originator.";
   throw new Error(
-    `Question audience ${JSON.stringify(audience)} is not named by the current instruction.${options}`,
+    `Question audience ${JSON.stringify(audience)} is not named by the current task.${options}`,
   );
 }
 
@@ -157,9 +157,9 @@ export function normalizeNonOriginatorQuestionAudience(
   const options =
     audiences.length > 0
       ? ` Name one of: ${audiences.join(", ")}.`
-      : " The current instruction names no non-originator audience.";
+      : " The current task names no non-originator audience.";
   throw new Error(
-    `Question audience ${JSON.stringify(audience)} must name a non-originator audience from the current instruction.${options}`,
+    `Question audience ${JSON.stringify(audience)} must name a non-originator audience from the current task.${options}`,
   );
 }
 

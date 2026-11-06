@@ -346,9 +346,10 @@ function Watch() {
     });
   });
 
-  it("rejects removed status reports from stock and injected PI runners", async () => {
+  it("rejects malformed reports from stock and injected PI runners", async () => {
     resetFakeAgent();
-    fakeAgent.response = '{"report":{"status":"queued"}}';
+    fakeAgent.response =
+      '{"report":{"outcome":"completed","semantic":"invalid"}}';
     const stockHost = await makeArcHostWithSource("watch", WATCH_SOURCE);
     const stock = await makePiHub(stockHost, createPiAgentBackend());
     const { routine: stockRoutine } = await settleFirstRoutine(
@@ -364,7 +365,8 @@ function Watch() {
     const injected = await makePiHub(
       injectedHost,
       createPiAgentBackend({
-        runner: async () => ({ status: "queued" }) as never,
+        runner: async () =>
+          ({ outcome: "completed", semantic: "invalid" }) as never,
       }),
     );
     const { routine } = await settleFirstRoutine(

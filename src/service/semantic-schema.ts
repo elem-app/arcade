@@ -105,7 +105,7 @@ function scalarObservationValueSchema(
 }
 
 /**
- * Tool schema for a Struct value: an object carrying every declared field, each
+ * Tool schema for a struct value: an object carrying every declared field, each
  * with its own value schema, so a resolved report is a complete record.
  */
 function structObservationValueSchema(
@@ -129,13 +129,14 @@ function observationValueSchema(
   meta: ObservationMeta,
 ): Record<string, unknown> {
   switch (meta.type) {
+    case "union":
+      return {
+        anyOf: meta.members.map(scalarObservationValueSchema),
+      };
     case "array":
       return {
         type: "array",
-        items:
-          meta.element.type === "struct"
-            ? structObservationValueSchema(meta.element)
-            : scalarObservationValueSchema(meta.element),
+        items: observationValueSchema(meta.element),
       };
     case "struct":
       return structObservationValueSchema(meta);

@@ -145,16 +145,11 @@ describe("parseAppConfig", () => {
     ).toThrow(/backend/);
   });
 
-  it("rejects removed worker hub scheduling configuration", () => {
+  it("rejects unknown top-level fields in App and Arcade config", () => {
     for (const parse of [parseAppConfig, parseArcadeConfig]) {
-      for (const workerHub of [
-        {},
-        { scheduling: { default: { concurrency: 1, maxQueueSize: 64 } } },
-      ]) {
-        expect(() =>
-          parse(JSON.stringify({ workerHub }), "removed-scheduling.jsonc"),
-        ).toThrow(/unrecognized key/i);
-      }
+      expect(() =>
+        parse(JSON.stringify({ unexpected: true }), "unknown-field.jsonc"),
+      ).toThrow(/unrecognized key/i);
     }
   });
 
@@ -189,15 +184,6 @@ describe("parseAppConfig", () => {
         "non-finite.jsonc",
       ),
     ).toThrow(/finite numbers/);
-  });
-
-  it("rejects the removed top-level backend-options map", () => {
-    expect(() =>
-      parseAppConfig(
-        JSON.stringify({ backends: { "pi-agent": { workerCount: 2 } } }),
-        "legacy-backends.jsonc",
-      ),
-    ).toThrow(/unrecognized key/i);
   });
 
   it("validates secret provider configuration", () => {

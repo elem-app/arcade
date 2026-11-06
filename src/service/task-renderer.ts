@@ -13,7 +13,9 @@ import type {
   DialogTurn,
   ObservationMeta,
   ScalarObservationMeta,
+  SemanticText,
   StructObservationMeta,
+  UnionObservationMeta,
 } from "@elem-app/arc/runtime";
 
 import type { RoutineContext } from "../types/routine.js";
@@ -43,6 +45,7 @@ export type RenderedObservationRequestForPrompt = {
   id: SemanticRequest["briefId"];
   kind: "observation";
   guidance?: string;
+  audienceReferences?: readonly PromptAudienceReference[];
   cell: Extract<SemanticRequest, { kind: "observation" }>["cell"];
   mode: Extract<SemanticRequest, { kind: "observation" }>["mode"];
   question: string;
@@ -65,13 +68,17 @@ export type RenderedObservationGroupFieldForPrompt = {
 
 /**
  * Observation metadata as a worker prompt shows it: the brief's metadata with
- * every Struct field question rendered to text.
+ * every struct field question rendered to text.
  */
 export type RenderedObservationMetaForPrompt =
   | ScalarObservationMeta
+  | UnionObservationMeta
   | {
       type: "array";
-      element: ScalarObservationMeta | RenderedStructObservationMetaForPrompt;
+      element:
+        | ScalarObservationMeta
+        | UnionObservationMeta
+        | RenderedStructObservationMetaForPrompt;
     }
   | RenderedStructObservationMetaForPrompt;
 
@@ -88,6 +95,7 @@ export type RenderedObservationGroupRequestForPrompt = {
   id: SemanticRequest["briefId"];
   kind: "observation-group";
   guidance?: string;
+  audienceReferences?: readonly PromptAudienceReference[];
   mode: Extract<SemanticRequest, { kind: "observation-group" }>["mode"];
   fields: RenderedObservationGroupFieldForPrompt[];
 };
@@ -170,6 +178,14 @@ export const INSTRUCTION_EXECUTION_BOUNDARY_RULES = [
   "Execute only the current assigned task.",
   "Do not create, edit, delete, or move durable workspace files unless this instruction explicitly names that file operation or the file is only a scratch/output artifact required by this instruction.",
   "When the instruction asks you to read, scope, prepare, inspect, summarize, or analyze, report the result for this task without applying document changes unless the same instruction explicitly asks for those changes.",
+  "After creating or editing a file, verify that it exists and contains the expected content before reporting completion.",
+];
+
+/** Observation obligations for action assignments with audience-input tools. */
+export const OBSERVATION_EXECUTION_RULES = [
+  'Resolve observations from available context first. Use "resolved" when the complete cell value can be determined.',
+  'For observe, use "unknown" when the value cannot be determined, without asking a participant.',
+  'For observeOrAsk, collect missing information from the participant identified by each question before reporting the observation. Apply the request\'s standing guidance. When no participant is specified, ask the originator. Use "unknown" or "needs-user" only if the value remains unresolved after that interaction; neither status performs the interaction.',
 ];
 
 export function renderInstructionTaskText(
@@ -240,13 +256,34 @@ export function renderInstructionAudienceReferencesForPrompt(
     .audienceReferences;
 }
 
+/** Audience mappings admitted by input tools for the current assignment. */
+export function renderQuestionAudienceReferencesForPrompt(
+  task: Task,
+  context: RoutineContext,
+  target: ArtifactPathRenderTarget,
+): readonly PromptAudienceReference[] {
+  if (task.kind === "instruction") {
+    return renderInstructionAudienceReferencesForPrompt(task, context, target);
+  }
+  if (task.stage === "trigger") return [];
+  return collectAudienceReferences(
+    task.requests
+      .map((request) =>
+        renderSemanticRequestForPrompt(request, context, target, task.stage),
+      )
+      .filter((request) => request.kind !== "judgment"),
+  );
+}
+
 function collectAudienceReferences(
-  rendered: readonly RenderedSemanticText[],
+  rendered: readonly {
+    audienceReferences?: readonly PromptAudienceReference[];
+  }[],
 ): PromptAudienceReference[] {
   const seen = new Set<string>();
   const refs: PromptAudienceReference[] = [];
   for (const item of rendered) {
-    for (const ref of item.audienceReferences) {
+    for (const ref of item.audienceReferences ?? []) {
       if (seen.has(ref.marker)) continue;
       seen.add(ref.marker);
       refs.push(ref);
@@ -292,13 +329,24 @@ export function renderSemanticRequestForPrompt(
   target: ArtifactPathRenderTarget,
   stage: SemanticTask["stage"],
 ): RenderedSemanticRequestForPrompt {
+  const rendered: RenderedSemanticText[] = [];
+  const renderText = (text: SemanticText): string => {
+    const item = renderAgentSemanticText(text, context, target);
+    rendered.push(item);
+    return item.text;
+  };
   const guidance =
     stage === "trigger" || request.guidance === undefined
       ? {}
       : {
-          guidance: renderAgentSemanticText(request.guidance, context, target)
-            .text,
+          guidance: renderText(request.guidance),
         };
+  const questionReferences = () =>
+    stage === "action" &&
+    request.kind !== "judgment" &&
+    request.mode === "observeOrAsk"
+      ? optionalAudienceReferences(collectAudienceReferences(rendered))
+      : {};
   if (request.kind === "observation-group") {
     return {
       id: request.briefId,
@@ -307,17 +355,14 @@ export function renderSemanticRequestForPrompt(
       mode: request.mode,
       fields: request.fields.map((field) => ({
         cell: field.cell,
-        question: renderAgentSemanticText(field.question, context, target).text,
+        question: renderText(field.question),
         currentValue: field.currentValue,
-        meta: renderObservationMetaForPrompt(field.meta, context, target),
+        meta: renderObservationMetaForPrompt(field.meta, renderText),
       })),
+      ...questionReferences(),
     };
   }
-  const question = renderAgentSemanticText(
-    request.question,
-    context,
-    target,
-  ).text;
+  const question = renderText(request.question);
   if (request.kind === "judgment") {
     return {
       id: request.briefId,
@@ -334,15 +379,15 @@ export function renderSemanticRequestForPrompt(
     question,
     ...guidance,
     currentValue: request.currentValue,
-    meta: renderObservationMetaForPrompt(request.meta, context, target),
+    meta: renderObservationMetaForPrompt(request.meta, renderText),
+    ...questionReferences(),
   };
 }
 
-/** Renders every Struct field question in observation metadata for a target. */
+/** Renders the struct field questions in observation metadata for a target. */
 function renderObservationMetaForPrompt(
   meta: ObservationMeta,
-  context: RoutineContext,
-  target: ArtifactPathRenderTarget,
+  renderText: (text: SemanticText) => string,
 ): RenderedObservationMetaForPrompt {
   switch (meta.type) {
     case "array": {
@@ -351,12 +396,12 @@ function renderObservationMetaForPrompt(
         type: "array",
         element:
           element.type === "struct"
-            ? renderStructObservationMetaForPrompt(element, context, target)
+            ? renderStructObservationMetaForPrompt(element, renderText)
             : element,
       };
     }
     case "struct":
-      return renderStructObservationMetaForPrompt(meta, context, target);
+      return renderStructObservationMetaForPrompt(meta, renderText);
     default:
       return meta;
   }
@@ -364,8 +409,7 @@ function renderObservationMetaForPrompt(
 
 function renderStructObservationMetaForPrompt(
   meta: StructObservationMeta,
-  context: RoutineContext,
-  target: ArtifactPathRenderTarget,
+  renderText: (text: SemanticText) => string,
 ): RenderedStructObservationMetaForPrompt {
   return {
     type: "struct",
@@ -373,9 +417,8 @@ function renderStructObservationMetaForPrompt(
       Object.entries(meta.fields).map(([name, field]) => [
         name,
         {
-          question: renderAgentSemanticText(field.question, context, target)
-            .text,
-          meta: renderObservationMetaForPrompt(field.meta, context, target),
+          question: renderText(field.question),
+          meta: renderObservationMetaForPrompt(field.meta, renderText),
         },
       ]),
     ),

@@ -352,10 +352,10 @@ export function lifecycleReader(
 
 function exampleObservationValue(meta: ObservationMeta): ObservedValue {
   switch (meta.type) {
+    case "union":
+      return exampleScalarObservationValue(meta.members[0]!);
     case "array":
-      return meta.element.type === "struct"
-        ? [exampleStructObservationValue(meta.element)]
-        : [exampleScalarObservationValue(meta.element)];
+      return [exampleObservationValue(meta.element)] as ObservedValue;
     case "struct":
       return exampleStructObservationValue(meta);
     default:

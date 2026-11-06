@@ -58,7 +58,10 @@ import {
   freeformQuestionEvalArc,
   promptlessDiscussionEvalArc,
 } from "../instruction-communication-cases.js";
-import { observationCases } from "../observation-cases.js";
+import {
+  observationCases,
+  trackObservationAnswers,
+} from "../observation-cases.js";
 import {
   behavioralScenarios,
   containsFact,
@@ -993,18 +996,14 @@ defineManagedEvalGroup(
         logger,
       });
       registerPermissionAutoAllow(workerHub);
-      // A case that withholds a fact expects the worker to ask for it and is
-      // answered with the case's fixed answer; every other case forbids
-      // questions, so its facts must come from the conversation alone.
-      const asked: OutboundMessage[] = [];
-      const withheld = item.withheld;
-      const questions = withheld ? asked : trackUnexpectedQuestions(workerHub);
-      if (withheld) {
-        registerQuestionAutoAnswer(workerHub, (message) => {
-          asked.push(message);
-          return withheld.answer;
-        });
-      }
+      const answers = trackObservationAnswers(item);
+      workerHub.registerOutboundHandler(
+        { role: "writer", audience: "*", cause: "question" },
+        (message) =>
+          answers.answer(message, (answer) =>
+            submitCorrelatedAnswer(workerHub, message, answer),
+          ),
+      );
       await arcHost.registerArc(
         `claude-sdk-observation-${item.name}`,
         parse(item.arcSource),
@@ -1052,11 +1051,7 @@ defineManagedEvalGroup(
         (routine) => routine.arcRunId === arcRunId && routine.error,
       );
       expect(failed, item.name).toHaveLength(0);
-      if (withheld) {
-        expect(questions.length, item.name).toBeGreaterThan(0);
-      } else {
-        expect(questions, item.name).toHaveLength(0);
-      }
+      answers.assertComplete();
     }
   },
 );

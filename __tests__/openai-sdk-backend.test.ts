@@ -24,10 +24,17 @@ import {
 import {
   noopDiagnostics,
   outbound,
+  participantObservationTask,
   routine,
   runBackend,
 } from "./backend-helpers.js";
-import { ARC_RUN_ID, createCapturingLogger, firstTask } from "./helpers.js";
+import {
+  ARC_RUN_ID,
+  createCapturingLogger,
+  deferred,
+  firstTask,
+  waitFor,
+} from "./helpers.js";
 
 const workspaces: string[] = [];
 
@@ -141,6 +148,129 @@ describe("OpenAiSdkWorker", () => {
       }
     },
   );
+
+  it("routes current OpenAI observation participants through waiting input tools across session reuse", async () => {
+    const instruction = await firstTask();
+    const recipients = ["supervisor", "reviewer"];
+    const emitted: OutboundMessage[] = [];
+    const gates = Array.from({ length: 4 }, () => deferred<string>());
+    const exercise = async (
+      call: (name: string, input: Record<string, unknown>) => Promise<unknown>,
+      index: number,
+    ) => {
+      const audience = recipients[index]!;
+      await call("emit_outbound", { audience, content: "Must stay private." });
+      expect(emitted).toHaveLength(index * 2);
+      for (const unavailable of [
+        "outsider",
+        ...(index === 1 ? ["supervisor"] : []),
+      ]) {
+        for (const name of ["discuss", "ask_audience"]) {
+          const args =
+            name === "discuss"
+              ? { audience: unavailable, question: "Missing?" }
+              : {
+                  audience: unavailable,
+                  questions: [structuredQuestionFixture()],
+                };
+          expect(String(await call(name, args))).toContain("current task");
+        }
+      }
+      const values: string[] = [];
+      for (const [offset, name] of ["discuss", "ask_audience"].entries()) {
+        let settled = false;
+        const pending = call(
+          name,
+          name === "discuss"
+            ? {
+                audience: `<audience:${audience}>`,
+                question: "What is the answer?",
+              }
+            : { audience, questions: [structuredQuestionFixture()] },
+        ).finally(() => {
+          settled = true;
+        });
+        const position = index * 2 + offset;
+        await waitFor(() => emitted.length === position + 1);
+        expect(settled).toBe(false);
+        expect(emitted[position]!.situation).toMatchObject({
+          audience,
+          cause: "question",
+        });
+        gates[position]!.resolve(offset === 0 ? "One" : "Two");
+        const result = (await pending) as {
+          answer?: string;
+          answers?: Record<string, string>;
+        };
+        values.push(
+          name === "discuss" ? result.answer! : result.answers!["Choose one?"]!,
+        );
+      }
+      return {
+        outcome: "completed" as const,
+        semantic: {
+          observations: {
+            "observe:answer": {
+              status: "resolved" as const,
+              value: values.join("/"),
+            },
+          },
+        },
+      };
+    };
+    let invocation = 0;
+    const run = vi.fn<OpenAiSdkRunFn>(async (input) => {
+      const index = invocation++;
+      const report = await exercise(async (name, args) => {
+        const raw = await callOpenAiToolRaw(input.agent, name, args);
+        if (typeof raw !== "string") return raw;
+        try {
+          return JSON.parse(raw) as unknown;
+        } catch {
+          return raw;
+        }
+      }, index);
+      await callOpenAiTool(input.agent, "report", report);
+      return { lastResponseId: `participant-${index}` };
+    });
+    const backend = durableOpenAiWorker({ apiKey: "sk-test", run });
+    try {
+      for (const [index, audience] of recipients.entries()) {
+        const task = participantObservationTask(instruction, audience);
+        const report = await runBackend(
+          backend,
+          routine(task, { id: `observation-${index}` }),
+          context(),
+          noopRoutineEffects({
+            emit: async (message) => {
+              emitted.push(outbound(message));
+              return gates[emitted.length - 1]!.promise;
+            },
+          }),
+          noopDiagnostics,
+        );
+        expect(report).toMatchObject({
+          outcome: "completed",
+          semantic: {
+            observations: {
+              "observe:answer": { status: "resolved", value: "One/Two" },
+            },
+          },
+        });
+      }
+      expect(run.mock.calls[1]![0].previousResponseId).toBe("participant-0");
+      for (const [index, audience] of recipients.entries()) {
+        const prompt = run.mock.calls[index]![0].prompt!;
+        expect(prompt).not.toContain("<active-instruction>");
+        expect(prompt).toContain(`<audience:${audience}> -> ${audience}`);
+        expect(prompt).toContain("participant identified by each question");
+        expect(prompt).toContain("Structured audience input: ask_audience");
+      }
+    } finally {
+      gates.forEach((gate) => gate.resolve("Two"));
+      await backend.stop();
+    }
+  });
 
   it("releases OpenAI bundle copies with their last routine across worker slots", async () => {
     const root = await mkdtemp(join(tmpdir(), "openai-bundle-ownership-"));
@@ -471,6 +601,9 @@ describe("OpenAiSdkWorker", () => {
       "<guidance>\nFollow /workspace/policy.md.\n</guidance>",
     );
     expect(call.prompt).toContain("Execute only the current assigned task.");
+    expect(call.prompt).toContain(
+      "After creating or editing a file, verify that it exists and contains the expected content before reporting completion.",
+    );
     expect(call.prompt).not.toContain("current Arc instruction task");
     expect(call.prompt).toContain("Do not create, edit, delete, or move");
     expect(call.prompt).toContain(
@@ -642,7 +775,7 @@ describe("OpenAiSdkWorker", () => {
     );
 
     expect(String((run.mock.calls[0]![0].agent as any).instructions)).toContain(
-      "For each audience interaction, determine what input <instruction> requires",
+      "For each audience interaction, determine what input the current task requires",
     );
     expect(run.mock.calls[0]![0].prompt).not.toContain("Audience references:");
     expect(run.mock.calls[0]![0].prompt).toContain(
@@ -972,6 +1105,18 @@ describe("OpenAiSdkWorker", () => {
     expect(call.agent.instructions).toContain(
       "without repeating its work or audience interactions",
     );
+    expect(call.agent.instructions).toContain(
+      "For each audience interaction, determine what input the current task requires",
+    );
+    expect(call.agent.instructions).toContain(
+      "An input obligation is satisfied when that result is received",
+    );
+    expect(call.prompt).toContain(
+      "For observeOrAsk, collect missing information from the participant identified by each question",
+    );
+    expect(call.prompt).toContain(
+      'For observe, use "unknown" when the value cannot be determined, without asking a participant',
+    );
     expect(call.prompt).toContain('"cells"');
     expect(call.prompt).toContain('"ticker": "LITE"');
   });
@@ -1146,6 +1291,12 @@ describe("OpenAiSdkWorker", () => {
     });
     expect(run).toHaveBeenCalledTimes(2);
     expect(run.mock.calls[1]![0].prompt).toContain("required report tool");
+    expect(run.mock.calls[1]![0].prompt).toContain(
+      "If every obligation is complete, call report.",
+    );
+    expect(run.mock.calls[1]![0].prompt).toContain(
+      'call report with error "failed"',
+    );
     expect(run.mock.calls[1]![0].prompt).toContain("private worker memory");
     expect(run.mock.calls[1]![0].prompt).toContain(
       "Use the report tool schema for this assignment.",
@@ -1676,7 +1827,7 @@ describe("OpenAiSdkWorker", () => {
         ],
       });
       expect(String(failure)).toContain(
-        'Question audience "supervisor" is not named by the current instruction',
+        'Question audience "supervisor" is not named by the current task',
       );
       await callOpenAiTool(input.agent, "report", { outcome: "completed" });
       return { lastResponseId: "resp-rejected-question" };

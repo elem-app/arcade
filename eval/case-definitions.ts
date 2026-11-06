@@ -127,6 +127,38 @@ export const CASES = {
     "commits observed and asked values together",
     true,
   ),
+  participantObserveOrAsk: definition(
+    "participant-observe-or-ask",
+    "asks a named participant for a missing numeric observation",
+  ),
+  groupedParticipantObserveOrAsk: definition(
+    "grouped-participant-observe-or-ask",
+    "asks distinct participants and commits their answers to the corresponding grouped cells",
+  ),
+  unionObservation: definition(
+    "union-observation",
+    "extracts overlapping numeric alternatives and an explicit no-preference answer",
+  ),
+  unionContainerObservation: definition(
+    "union-container-observation",
+    "commits union values inside structs and ordered arrays",
+  ),
+  unionUnknownObservation: definition(
+    "union-unknown-observation",
+    "keeps a missing union answer unset instead of inferring no preference",
+  ),
+  unionObserveOrAsk: definition(
+    "union-observe-or-ask",
+    "asks for a missing union answer and commits an explicit no-preference reply",
+  ),
+  unionTriggerObservation: definition(
+    "union-trigger-observation",
+    "activates on explicit union answers while missing information stays unknown",
+  ),
+  unionContainerTriggerObservation: definition(
+    "union-container-trigger-observation",
+    "selects a trigger from union values in nested containers",
+  ),
   claudePreparedInstructionStart: definition(
     "claude-prepared-instruction-start",
     "uses a prepared Claude instruction start",
@@ -182,4 +214,10 @@ export const OBSERVATION_CASES = [
   CASES.structObservation,
   CASES.structArrayObservation,
   CASES.groupedObserveOrAsk,
+  CASES.participantObserveOrAsk,
+  CASES.groupedParticipantObserveOrAsk,
+  CASES.unionObservation,
+  CASES.unionContainerObservation,
+  CASES.unionUnknownObservation,
+  CASES.unionObserveOrAsk,
 ] as const;

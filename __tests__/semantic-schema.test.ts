@@ -218,3 +218,65 @@ describe("model report schema", () => {
     ).toThrow();
   });
 });
+
+it("binds Union observations to any-of schemas inside complete containers", () => {
+  const current = task();
+  const request = current.requests[1]!;
+  if (request.kind !== "observation") throw new Error("Expected observation");
+  current.requests = [
+    {
+      ...request,
+      mode: "observeOrAsk",
+      meta: {
+        type: "struct",
+        fields: {
+          choices: {
+            question: "choices",
+            meta: {
+              type: "array",
+              element: {
+                type: "union",
+                members: [
+                  { type: "rangedInt", min: 1, max: 5 },
+                  { type: "number", min: 3, max: 10 },
+                  { type: "enum", values: ["no_preference"] },
+                ],
+              },
+            },
+          },
+        },
+      },
+    },
+  ];
+  const contract = modelReportContract(current, true);
+  const provider = fromJSONSchema(contract.jsonSchema);
+  const report = (outcome: unknown) => ({
+    report: {
+      outcome: "completed",
+      semantic: { observations: { [request.briefId]: outcome } },
+    },
+  });
+  for (const outcome of [
+    { status: "resolved", value: { choices: [4, 7.5, "no_preference"] } },
+    { status: "unknown" },
+    { status: "needs-user" },
+  ]) {
+    expect(provider.safeParse(report(outcome)).success).toBe(true);
+    expect(contract.parse(report(outcome))).toEqual(report(outcome).report);
+  }
+  for (const value of [
+    {},
+    { choices: [11] },
+    { choices: [false] },
+    { choices: ["outside"] },
+    { choices: [null] },
+  ]) {
+    expect(
+      provider.safeParse(report({ status: "resolved", value })).success,
+    ).toBe(false);
+    expect(() =>
+      contract.parse(report({ status: "resolved", value })),
+    ).toThrow();
+  }
+  expect(JSON.stringify(contract.jsonSchema)).not.toContain('"oneOf"');
+});

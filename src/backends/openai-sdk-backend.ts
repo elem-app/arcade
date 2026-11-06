@@ -46,10 +46,12 @@ import {
 } from "../service/semantic-text-renderer.js";
 import {
   INSTRUCTION_EXECUTION_BOUNDARY_RULES,
+  OBSERVATION_EXECUTION_RULES,
   renderActiveInstructionForPrompt,
   renderDialogPriming,
   renderInstructionAudienceReferencesForPrompt,
   renderInstructionTaskTextForPrompt,
+  renderQuestionAudienceReferencesForPrompt,
   renderSemanticRequestForPrompt,
   xmlBlock,
 } from "../service/task-renderer.js";
@@ -98,6 +100,7 @@ import {
   answersForQuestionForm,
   ASK_AUDIENCE_TOOL_NAME,
   AskAudienceInputSchema,
+  buildMissingReportRecoveryPrompt,
   DISCUSS_TOOL_NAME,
   DiscussInputSchema,
   EmitOutboundInputSchema,
@@ -130,19 +133,8 @@ const OpenAiWorkerSlotSchema = createWorkerSlotSchema({
   apiKeySecret: z.string().min(1).optional(),
 });
 
-const MISSING_REPORT_RECOVERY_PROMPT = [
-  "Your previous worker turn ended without calling the required report tool.",
-  "Any assistant text you wrote remains private worker memory in this session.",
-  "",
-  "Continue the same assigned work:",
-  "",
-  "- If every obligation is complete, call report. Use the report tool schema for this assignment.",
-  "- If work remains, continue it before reporting completion.",
-  "- If required audience input has not been received, follow the shared audience-interaction policy and continue after the interaction tool returns its result.",
-  '- If an error makes the work impossible to complete, call report with error "failed" and include the error message.',
-  "",
-  'Do not include code or message with outcome "completed". Do not add a plain assistant summary after the tool call.',
-].join("\n");
+const MISSING_REPORT_RECOVERY_PROMPT =
+  buildMissingReportRecoveryPrompt(REPORT_TOOL_NAME);
 
 /** OpenAI-private delivery through a parked SDK `RunState`. */
 type OpenAiSdkResumeContext =
@@ -260,7 +252,6 @@ function buildInstructionPrompt(
   const rules = [
     "- Use the available workspace tools as needed.",
     ...INSTRUCTION_EXECUTION_BOUNDARY_RULES.map((rule) => `- ${rule}`),
-    "- After creating or editing a file, verify that it exists and contains the expected content before reporting completion.",
   ];
   if (audienceReferences.length > 0) {
     rules.push(
@@ -330,9 +321,33 @@ function buildSemanticPrompt(
   const rules = [
     `Resolve this ${task.stage} semantic work.`,
     "Call report using its declared schema to submit the completed semantic assignment.",
-    'Use "resolved" when the complete cell value can be determined, "unknown" when it cannot, and "needs-user" only for observeOrAsk when a user reply would help.',
+    ...(task.stage === "action"
+      ? OBSERVATION_EXECUTION_RULES
+      : [
+          'Use "resolved" when the complete cell value can be determined, "unknown" when it cannot, and "needs-user" only for observeOrAsk when a user reply would help.',
+        ]),
     "Interpret each observed field using its question and metadata. Preserve the requested array order.",
   ];
+  if (
+    task.stage === "action" &&
+    task.requests.some(
+      (request) =>
+        request.kind !== "judgment" && request.mode === "observeOrAsk",
+    )
+  ) {
+    const references = renderQuestionAudienceReferencesForPrompt(
+      task,
+      context,
+      { kind: "sandbox", sandboxRoot: WORKSPACE_SANDBOX_ROOT },
+    );
+    rules.push(
+      "",
+      "Question audience references:",
+      ...references.map((ref) => `- ${ref.marker} -> ${ref.audience}`),
+      "Originator is implicitly available for input. Use the mapped audience value in audience-tool calls. Do not copy an audience marker into delivered question text.",
+      "Freeform audience input: discuss. Structured audience input: ask_audience.",
+    );
+  }
   parts.push("", xmlBlock("rules", rules.join("\n")));
   return parts.join("\n");
 }
@@ -355,6 +370,11 @@ function buildOpenAiSdkTools(
   onReport: (report: RoutineReport) => void,
   externalTools: readonly ExternalWorkerTool[],
 ): Tool[] {
+  const questionAudienceReferences = renderQuestionAudienceReferencesForPrompt(
+    routine.task,
+    context,
+    { kind: "sandbox", sandboxRoot: WORKSPACE_SANDBOX_ROOT },
+  );
   const outboundAudienceReferences =
     routine.task.kind === "instruction"
       ? renderInstructionAudienceReferencesForPrompt(routine.task, context, {
@@ -440,7 +460,7 @@ function buildOpenAiSdkTools(
               }
               const targetAudience = normalizeQuestionAudience(
                 parsed.audience,
-                outboundAudienceReferences,
+                questionAudienceReferences,
               );
               const answer = await emitWorkerQuestion(
                 effects.emit,
@@ -484,7 +504,7 @@ function buildOpenAiSdkTools(
               }
               const targetAudience = normalizeQuestionAudience(
                 parsed.audience,
-                outboundAudienceReferences,
+                questionAudienceReferences,
               );
               const answer = await emitWorkerQuestion(
                 effects.emit,
@@ -1357,6 +1377,11 @@ export class OpenAiSdkWorker implements Worker {
       backend: "openai-sdk",
       sessionKey,
       task: routine.task,
+      questionAudienceReferences: renderQuestionAudienceReferencesForPrompt(
+        routine.task,
+        context,
+        { kind: "sandbox", sandboxRoot: WORKSPACE_SANDBOX_ROOT },
+      ),
       outboundAudienceReferences:
         routine.task.kind === "instruction"
           ? renderInstructionAudienceReferencesForPrompt(

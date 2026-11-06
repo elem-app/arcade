@@ -25,10 +25,12 @@ import {
 import { modelReportContract } from "../service/semantic-schema.js";
 import {
   INSTRUCTION_EXECUTION_BOUNDARY_RULES,
+  OBSERVATION_EXECUTION_RULES,
   renderActiveInstructionForPrompt,
   renderDialogPriming,
   renderInstructionAudienceReferencesForPrompt,
   renderInstructionTaskTextForPrompt,
+  renderQuestionAudienceReferencesForPrompt,
   renderSemanticRequestForPrompt,
   xmlBlock,
 } from "../service/task-renderer.js";
@@ -75,6 +77,7 @@ import {
   appendManagedWorkerToolDiagnostic,
   ASK_AUDIENCE_TOOL_NAME,
   AskAudienceInputSchema,
+  buildMissingReportRecoveryPrompt,
   DISCUSS_TOOL_NAME,
   DiscussInputSchema,
   EmitOutboundInputSchema,
@@ -100,20 +103,9 @@ const CLAUDE_SDK_THINKING = {
 } as const;
 /** MCP server name registered by the Claude managed-worker adapter. */
 const WORKER_MCP_SERVER_NAME = "arcade_internal";
-const MISSING_REPORT_RECOVERY_PROMPT = [
-  "Your previous worker turn ended without calling the required",
-  `mcp__${WORKER_MCP_SERVER_NAME}__${REPORT_TOOL_NAME} tool.`,
-  "Any assistant text you wrote remains private worker memory in this session.",
-  "",
-  "Continue the same assigned work:",
-  "",
-  `- If every obligation is complete, call mcp__${WORKER_MCP_SERVER_NAME}__${REPORT_TOOL_NAME}. Use the report tool schema for this assignment.`,
-  "- If work remains, continue it before reporting completion.",
-  "- If required audience input has not been received, follow the shared audience-interaction policy and continue after the interaction tool returns its result.",
-  `- If an error makes the work impossible to complete, call mcp__${WORKER_MCP_SERVER_NAME}__${REPORT_TOOL_NAME} with error "failed" and include the error message.`,
-  "",
-  'Do not include code or message with outcome "completed". Do not add a plain assistant summary after the tool call.',
-].join("\n");
+const MISSING_REPORT_RECOVERY_PROMPT = buildMissingReportRecoveryPrompt(
+  `mcp__${WORKER_MCP_SERVER_NAME}__${REPORT_TOOL_NAME}`,
+);
 const NATIVE_ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion";
 const SDK_PERMISSION_CONTROLLED_TOOLS = new Set([
   "Read",
@@ -250,9 +242,35 @@ function buildSemanticPrompt(
     `Resolve this ${task.stage} semantic work.`,
     "Use workspace and Claude Code tools as needed.",
     "Call report using its declared schema to submit the completed semantic assignment.",
-    'Use "resolved" when the complete cell value can be determined, "unknown" when it cannot, and "needs-user" only for observeOrAsk when a user reply would help.',
+    ...(task.stage === "action"
+      ? OBSERVATION_EXECUTION_RULES
+      : [
+          'Use "resolved" when the complete cell value can be determined, "unknown" when it cannot, and "needs-user" only for observeOrAsk when a user reply would help.',
+        ]),
     "Interpret each observed field using its question and metadata. Preserve the requested array order.",
   ];
+  if (
+    task.stage === "action" &&
+    task.requests.some(
+      (request) =>
+        request.kind !== "judgment" && request.mode === "observeOrAsk",
+    )
+  ) {
+    const references = renderQuestionAudienceReferencesForPrompt(
+      task,
+      context,
+      { kind: "host" },
+    );
+    rules.push(
+      "",
+      "Question audience references:",
+      ...references.map((ref) => `- ${ref.marker} -> ${ref.audience}`),
+      "Originator is implicitly available for input. Use the mapped audience value in audience-tool calls. Do not copy an audience marker into delivered question text.",
+      `Freeform audience input: mcp__${WORKER_MCP_SERVER_NAME}__${DISCUSS_TOOL_NAME}.`,
+      "Structured originator input: AskUserQuestion.",
+      `Structured input from a named non-originator audience: mcp__${WORKER_MCP_SERVER_NAME}__${ASK_AUDIENCE_TOOL_NAME}.`,
+    );
+  }
   parts.push("", xmlBlock("rules", rules.join("\n")));
   return parts.join("\n");
 }
@@ -557,7 +575,7 @@ function buildClaudeSdkMcpServer(
               }
               const targetAudience = normalizeQuestionAudience(
                 parsed.audience,
-                currentCtx.outboundAudienceReferences,
+                currentCtx.questionAudienceReferences,
               );
               const answer = await emitWorkerQuestion(
                 currentCtx.emit,
@@ -602,7 +620,7 @@ function buildClaudeSdkMcpServer(
               }
               const targetAudience = normalizeNonOriginatorQuestionAudience(
                 parsed.audience ?? "",
-                currentCtx.outboundAudienceReferences,
+                currentCtx.questionAudienceReferences,
               );
               const answer = await emitWorkerQuestion(
                 currentCtx.emit,
@@ -1803,6 +1821,11 @@ export class ClaudeSdkWorker implements Worker {
       backend: "claude-sdk",
       sessionKey,
       task: routine.task,
+      questionAudienceReferences: renderQuestionAudienceReferencesForPrompt(
+        routine.task,
+        context,
+        { kind: "host" },
+      ),
       outboundAudienceReferences:
         routine.task.kind === "instruction"
           ? renderInstructionAudienceReferencesForPrompt(

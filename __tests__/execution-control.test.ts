@@ -1,4 +1,11 @@
 import { parse } from "@elem-app/arc/parser";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { createTestArcHost } from "./work-event-fixtures.js";
 
 import { describe, expect, it, vi } from "vitest";
@@ -16,22 +23,30 @@ import type {
   RoutineContext,
   RoutineState,
   Task,
-  WorkerHubService,
   WorkerHubStore,
+  WorkEvent,
 } from "../src/testing.js";
 import {
+  ArcHostService,
   arcRunKey,
   classifyTransportLoss,
   createArcadeLogger,
+  createOpenAiSdkBackendForTesting,
+  FileRoutineDiagnosticsStore,
   InMemoryArcHostStore,
   InMemoryHistoryStore,
   InMemoryReplayStore,
   InMemoryWorkerHubStore,
   InMemoryWorkEventStore,
+  JsonFileArcHostStore,
+  JsonFileHistoryStore,
+  JsonFileWorkerHubStore,
+  JsonFileWorkEventStore,
   probeRetention,
   RoutinePausedError,
   taskId,
   workerContextKey,
+  WorkerHubService,
   WorkEventService,
 } from "../src/testing.js";
 import { callOpenAiTool } from "./backend-helpers.js";
@@ -1181,65 +1196,295 @@ function Main() {
   );
 
   it.each(["capacity-limited", "transport-lost"] as const)(
-    "park.manual-resume rebuilds a %s park after a restart",
+    "park.durable-state persists a worker-produced %s park and completes it after file-backed restart",
     async (status) => {
-      const { arcHost, routineStore, task } = await persistedRun();
-      const timestamp = "2026-07-31T00:00:00.000Z";
-      const routineId = "routine:parked-before-restart";
-      await routineStore.putRoutine({
-        id: routineId,
-        role: task.role,
-        backend: "openai-sdk",
-        arcRunId: task.arcRunId,
-        status,
-        task,
-        updatedAt: timestamp,
+      const directory = await mkdtemp(join(tmpdir(), "arcade-park-restart-"));
+      const processes: Array<{
+        workerHub: WorkerHubService;
+        arcHost: ArcHostService;
+        workEvents: WorkEventService;
+      }> = [];
+      async function openProcess(run: OpenAiSdkRunFn) {
+        const store = new JsonFileArcHostStore({
+          dir: join(directory, "host"),
+        });
+        const routineStore = new JsonFileWorkerHubStore({
+          dir: join(directory, "hub"),
+        });
+        const historyStore = new JsonFileHistoryStore({
+          dir: join(directory, "history"),
+        });
+        const eventStore = new JsonFileWorkEventStore({
+          dir: join(directory, "events"),
+        });
+        const workEvents = new WorkEventService(
+          eventStore,
+          createArcadeLogger(),
+        );
+        const arcHost = new ArcHostService({
+          store,
+          executionControl: routineStore,
+          workEvents,
+          artifactRoot: join(directory, "artifacts"),
+        });
+        const workerHub = new WorkerHubService({
+          arcHost,
+          historyStore,
+          routineStore,
+          workEvents,
+          routineDiagnosticsStore: new FileRoutineDiagnosticsStore(
+            join(directory, "diagnostics"),
+          ),
+          capacityRetry: { enabled: false },
+        });
+        workerHub.addBackend(
+          "openai-sdk",
+          createOpenAiSdkBackendForTesting({ apiKey: "sk-test", run }),
+        );
+        await workerHub.start({
+          workers: {
+            roles: { researcher: { backend: "openai-sdk" } },
+            fastTrigger: null,
+          },
+        });
+        processes.push({ workerHub, arcHost, workEvents });
+        return {
+          store,
+          routineStore,
+          historyStore,
+          eventStore,
+          workEvents,
+          arcHost,
+          workerHub,
+        };
+      }
+      const successfulRun = vi.fn<OpenAiSdkRunFn>(async (input) => {
+        await callOpenAiTool(input.agent, "report", { outcome: "completed" });
+        return { lastResponseId: "response-after-restart" };
       });
-      await routineStore.putExecutionControl(
-        status === "capacity-limited"
-          ? {
-              arcRunId: task.arcRunId,
-              status,
-              capacityLimitedAt: timestamp,
-              capacityLimitedRoutineId: routineId,
-              capacityReason: {
-                reason: "api rate limit",
-                provider: "openai",
-                backend: "openai-sdk",
-                message: "Rate limit reached.",
+      try {
+        const script = join(directory, "park.mjs");
+        await writeFile(
+          script,
+          `
+import { join } from "node:path";
+import { parse } from ${JSON.stringify(createRequire(import.meta.url).resolve("@elem-app/arc/parser"))};
+import {
+  ArcHostService, WorkerHubService, WorkEventService, createArcadeLogger,
+  JsonFileArcHostStore, JsonFileWorkerHubStore, JsonFileHistoryStore,
+  JsonFileWorkEventStore, FileRoutineDiagnosticsStore,
+  createOpenAiSdkBackendForTesting, arcRunKey,
+} from ${JSON.stringify(new URL("../src/testing.ts", import.meta.url).href)};
+const directory = ${JSON.stringify(directory)};
+const status = ${JSON.stringify(status)};
+const logger = createArcadeLogger("silent");
+const store = new JsonFileArcHostStore({ dir: join(directory, "host") });
+const routineStore = new JsonFileWorkerHubStore({ dir: join(directory, "hub") });
+const eventStore = new JsonFileWorkEventStore({ dir: join(directory, "events") });
+const workEvents = new WorkEventService(eventStore, logger);
+const arcHost = new ArcHostService({ store, executionControl: routineStore, workEvents, artifactRoot: join(directory, "artifacts"), logger });
+const workerHub = new WorkerHubService({
+  arcHost, routineStore, workEvents, logger,
+  historyStore: new JsonFileHistoryStore({ dir: join(directory, "history") }),
+  routineDiagnosticsStore: new FileRoutineDiagnosticsStore(join(directory, "diagnostics")),
+  capacityRetry: { enabled: false },
+});
+let calls = 0;
+workerHub.addBackend("openai-sdk", createOpenAiSdkBackendForTesting({
+  apiKey: "sk-test", run: async () => {
+    calls++;
+    throw status === "capacity-limited"
+      ? Object.assign(new Error("Rate limit reached."), { status: 429, code: "rate_limit_exceeded" })
+      : Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+  },
+}));
+await workerHub.start({ workers: { roles: { researcher: { backend: "openai-sdk" } }, fastTrigger: null } });
+let resolvePark;
+const parkedEvent = new Promise((resolve) => { resolvePark = resolve; });
+workerHub.registerWorkEventHandler((event) => {
+  if (event.kind === "control:parked" && event.status === status) resolvePark();
+});
+await arcHost.registerArc("watch", parse(${JSON.stringify(WATCH_SOURCE)}));
+let arcRunId;
+for await (const event of workerHub.submitInbound({ content: "park this work", metadata: { principal: ${JSON.stringify(ALICE_OWNER)} } }))
+  if (event.kind === "activated") arcRunId = event.arcRunId;
+await parkedEvent;
+const routines = [];
+for await (const routine of routineStore.listRoutines(arcRunId)) routines.push(routine);
+const events = [];
+for await (const event of eventStore.listEvents(arcRunId)) events.push(event);
+const result = { arcRunId, calls, routines, events,
+  parked: await routineStore.getExecutionControl(arcRunId),
+  state: await store.getState(arcRunKey(arcRunId)),
+};
+// Model process loss: exit with committed files, without graceful retirement.
+process.stdout.write(JSON.stringify(result), () => process.exit(0));
+`,
+        );
+        const { stdout } = await promisify(execFile)(
+          process.execPath,
+          [
+            "--import",
+            fileURLToPath(
+              new URL("../node_modules/tsx/dist/loader.mjs", import.meta.url),
+            ),
+            script,
+          ],
+          { timeout: 10_000 },
+        );
+        const {
+          arcRunId,
+          calls,
+          routines: parkedRoutines,
+          events: parkedEvents,
+          parked,
+          state,
+        } = JSON.parse(stdout) as {
+          arcRunId: ArcRunId;
+          calls: number;
+          routines: RoutineState[];
+          events: WorkEvent[];
+          parked: Awaited<ReturnType<WorkerHubStore["getExecutionControl"]>>;
+          state: Awaited<ReturnType<JsonFileArcHostStore["getState"]>>;
+        };
+        expect(calls).toBe(1);
+        expect(parkedRoutines).toHaveLength(1);
+        const routine = parkedRoutines[0]!;
+        expect(routine).toMatchObject({
+          arcRunId,
+          backend: "openai-sdk",
+          status,
+        });
+        expect(parked).toMatchObject(
+          status === "capacity-limited"
+            ? {
+                status,
+                capacityLimitedRoutineId: routine.id,
+                capacityReason: {
+                  reason: "api rate limit",
+                  provider: "openai",
+                  backend: "openai-sdk",
+                  message: "Rate limit reached.",
+                },
+              }
+            : {
+                status,
+                transportLostRoutineId: routine.id,
+                transportReason: {
+                  reason: "connection reset",
+                  backend: "openai-sdk",
+                  message: "socket hang up",
+                },
               },
-              updatedAt: timestamp,
-            }
-          : {
-              arcRunId: task.arcRunId,
-              status,
-              transportLostAt: timestamp,
-              transportLostRoutineId: routineId,
-              transportReason: {
-                reason: "connection reset",
-                backend: "openai-sdk",
-                message: "socket hang up",
-              },
-              updatedAt: timestamp,
-            },
-      );
-      const worker = vi.fn<RoleWorker>(async () => ({ outcome: "completed" }));
-      const { workerHub } = makeWorkerHub({
-        arcHost,
-        routineStore,
-        workers: { researcher: worker },
-      });
+        );
+        const reason =
+          parked?.status === "capacity-limited"
+            ? { capacityReason: parked.capacityReason }
+            : parked?.status === "transport-lost"
+              ? { transportReason: parked.transportReason }
+              : {};
+        expect(parkedEvents).toContainEqual(
+          expect.objectContaining({
+            kind: `routine:${status}`,
+            routineId: routine.id,
+            ...reason,
+          }),
+        );
+        expect(
+          parkedEvents.some(
+            (event) =>
+              event.kind === "routine:failed" ||
+              event.kind === "run:poisoned" ||
+              event.kind === "run:completed",
+          ),
+        ).toBe(false);
+        expect(state).toMatchObject({
+          lifecycle: "active",
+          reactivationCount: 0,
+        });
 
-      await expect(workerHub.resume(task.arcRunId)).resolves.toMatchObject({
-        outcome: "resumed",
-        control: { status: "running" },
-      });
-      await waitFor(() => worker.mock.calls.length === 1);
-      await expect(routineStore.getRoutine(routineId)).resolves.toMatchObject({
-        status: "skipped",
-        error: { code: "execution-lost" },
-      });
+        // Every store and service is new; only the files cross this boundary.
+        const restarted = await openProcess(successfulRun);
+        await expect(
+          restarted.routineStore.getExecutionControl(arcRunId),
+        ).resolves.toEqual(parked);
+        await expect(
+          restarted.routineStore.getRoutine(routine!.id),
+        ).resolves.toEqual(routine);
+        await expect(
+          restarted.store.getState(arcRunKey(arcRunId)),
+        ).resolves.toEqual(state);
+        await expect(
+          restarted.workerHub.getExecutionControlView(arcRunId),
+        ).resolves.toMatchObject({ status, ...reason });
+        expect(
+          await collectAsync(restarted.eventStore.listEvents(arcRunId)),
+        ).toContainEqual(
+          expect.objectContaining({
+            kind: `routine:${status}`,
+            routineId: routine!.id,
+            ...reason,
+          }),
+        );
+        expect(successfulRun).not.toHaveBeenCalled();
+        await expect(
+          restarted.workerHub.resume(arcRunId),
+        ).resolves.toMatchObject({
+          outcome: "resumed",
+          control: { status: "running" },
+        });
+        await waitFor(
+          async () =>
+            (await restarted.arcHost.getRunView(arcRunId))?.stage ===
+              "actioning" &&
+            (await restarted.store.getState(arcRunKey(arcRunId)))?.lifecycle ===
+              "completed",
+        );
+        await expect(
+          restarted.routineStore.getRoutine(routine!.id),
+        ).resolves.toMatchObject({
+          status: "skipped",
+          error: { code: "execution-lost" },
+        });
+        const routines = await collectAsync(
+          restarted.routineStore.listRoutines(arcRunId),
+        );
+        expect(routines).toHaveLength(2);
+        const replacement = routines.find(
+          (candidate) => candidate.id !== routine!.id,
+        );
+        expect(replacement).toMatchObject({
+          arcRunId,
+          backend: "openai-sdk",
+          status: "finished",
+          task: { kind: "instruction" },
+        });
+        expect(
+          replacement!.task.kind === "instruction" &&
+            replacement!.task.briefIds,
+        ).toEqual(
+          routine!.task.kind === "instruction" && routine!.task.briefIds,
+        );
+        expect(successfulRun).toHaveBeenCalledTimes(1);
+        await expect(
+          new JsonFileArcHostStore({ dir: join(directory, "host") }).getState(
+            arcRunKey(arcRunId),
+          ),
+        ).resolves.toMatchObject({
+          lifecycle: "completed",
+          reactivationCount: 0,
+          snapshotId: state!.snapshotId,
+        });
+      } finally {
+        for (const process of processes.reverse()) {
+          process.workEvents.close();
+          await process.workerHub.stop();
+          await process.arcHost.stop();
+        }
+        await rm(directory, { recursive: true, force: true });
+      }
     },
+    15_000,
   );
 
   it("treats requestPause on a transport-lost run as a no-op", async () => {

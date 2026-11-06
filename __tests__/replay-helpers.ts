@@ -70,11 +70,10 @@ export const answeringWorker: RoleWorker = async (task) => {
 };
 
 function firstAdmissibleValue(meta: ObservationMeta): ObservedValue {
-  if (meta.type === "array") {
-    return meta.element.type === "struct"
-      ? [firstAdmissibleStructValue(meta.element)]
-      : [firstAdmissibleScalarValue(meta.element)];
-  }
+  if (meta.type === "union")
+    return firstAdmissibleScalarValue(meta.members[0]!);
+  if (meta.type === "array")
+    return [firstAdmissibleValue(meta.element)] as ObservedValue;
   if (meta.type === "struct") return firstAdmissibleStructValue(meta);
   return firstAdmissibleScalarValue(meta);
 }

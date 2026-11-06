@@ -12,11 +12,13 @@
 import type { RoutineDescriptor, RoutineInput, Worker } from "../src/index.js";
 import type {
   ClaudeSdkQueryFn,
+  InstructionTask,
   OutboundContent,
   OutboundMessage,
   RoutineContext,
   RoutineDiagnostics,
   RoutineReport,
+  SemanticTask,
   Task,
 } from "../src/testing.js";
 import { ARC_RUN_ID } from "./helpers.js";
@@ -96,6 +98,36 @@ export function semanticTool() {
     description: "Resolve semantic work.",
     parameters: { type: "object" },
     strict: true as const,
+  };
+}
+
+/** An observation assignment with a named question recipient and no instruction. */
+export function participantObservationTask(
+  instruction: InstructionTask,
+  audience: string,
+): SemanticTask {
+  return {
+    kind: "semantic",
+    arcRunId: instruction.arcRunId,
+    batchId: `batch:${audience}`,
+    role: instruction.role,
+    stage: "action",
+    contextIsolation: instruction.contextIsolation,
+    dialog: instruction.dialog,
+    allowedDispositions: [],
+    requests: [
+      {
+        kind: "observation",
+        briefId: "observe:answer",
+        role: instruction.role,
+        sourceRef: instruction.sourceRef,
+        cell: "answer",
+        mode: "observeOrAsk",
+        question: [{ kind: "hostVar", module: "audience", path: [audience] }],
+        meta: { type: "string" },
+        tool: semanticTool(),
+      },
+    ],
   };
 }
 
