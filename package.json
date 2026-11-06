@@ -1,6 +1,6 @@
 {
   "name": "@elem-app/arcade",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "type": "module",
   "files": [
@@ -43,7 +43,7 @@
     "jsonc-parser": "^3.3.1",
     "openai": "^6.39.1",
     "zod": "^4.4.3",
-    "@elem-app/arc": "git+ssh://git@github.com/elem-app/arc.git#v0.12.0"
+    "@elem-app/arc": "git+ssh://git@github.com/elem-app/arc.git#v0.13.0"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

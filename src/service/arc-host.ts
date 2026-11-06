@@ -25,6 +25,7 @@ import type {
 import {
   findActiveRoot,
   isArtifactValue,
+  pathOfArtifactValue,
   Runtime,
   toArcRef,
   toArcRefParts,
@@ -5584,7 +5585,7 @@ function collectArtifactPathsFromPayload(
 ): void {
   if (value === null || typeof value !== "object") return;
   if (isArtifactValue(value)) {
-    out.add(value.path);
+    out.add(pathOfArtifactValue(value));
     return;
   }
   if (Array.isArray(value)) {

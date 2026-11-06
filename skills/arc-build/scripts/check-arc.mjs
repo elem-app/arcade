@@ -5656,7 +5656,7 @@ function parse3(input, options) {
 
 // node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/spec/host-parameters.js
 function isHostStructFieldName(name2) {
-  return name2.length > 0 && name2 !== "__proto__" && name2 !== "prototype" && name2 !== "constructor";
+  return name2.length > 0 && !name2.startsWith("$") && name2 !== "__proto__" && name2 !== "prototype" && name2 !== "constructor";
 }
 function hostOperationArity(operation) {
   const firstOmittable = operation.parameters.findIndex((parameter) => parameter.type === "omittable");
@@ -5851,9 +5851,9 @@ function classifyArtifactValueShape(value) {
   if (!isPlainRecord(value))
     return "not-plain-object";
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== 1 || !keys.includes("path"))
+  if (keys.length !== 1 || !keys.includes("$path"))
     return "invalid-keys";
-  const path = Object.getOwnPropertyDescriptor(value, "path");
+  const path = Object.getOwnPropertyDescriptor(value, "$path");
   if (!path || !("value" in path) || !path.enumerable) {
     return "invalid-properties";
   }
@@ -5861,6 +5861,9 @@ function classifyArtifactValueShape(value) {
 }
 function isArtifactValue(value) {
   return classifyArtifactValue(value) === void 0;
+}
+function pathOfArtifactValue(value) {
+  return value.$path;
 }
 function describeArtifactPathIssue(issue2) {
   switch (issue2) {
@@ -5879,9 +5882,9 @@ function describeArtifactValueIssue(issue2) {
     case "not-plain-object":
       return "value must be a plain object";
     case "invalid-keys":
-      return "value must contain exactly path";
+      return "value must contain exactly $path";
     case "invalid-properties":
-      return "path must be an enumerable data property";
+      return "$path must be an enumerable data property";
     default:
       return describeArtifactPathIssue(issue2);
   }
@@ -6185,94 +6188,6 @@ function evidenceShape(evidence) {
       return evidence;
   }
 }
-var disjoint = { overlaps: false, ambiguous: false };
-var same = { overlaps: true, ambiguous: false };
-function scalarFamily(shape) {
-  return shape.spec.type === "enum" ? "string" : shape.spec.type === "index" ? "number" : shape.spec.type;
-}
-function exactScalars(shape) {
-  return shape.literal !== void 0 ? [shape.literal] : shape.spec.type === "enum" ? shape.spec.values : void 0;
-}
-function scalarContains(shape, value) {
-  if (shape.literal !== void 0 && value !== shape.literal)
-    return false;
-  if (shape.spec.type === "enum")
-    return typeof value === "string" && shape.spec.values.includes(value);
-  if (shape.spec.type === "index")
-    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-  return typeof value === shape.spec.type;
-}
-function artifactPathOverlap(shape) {
-  if (shape.kind === "dynamic")
-    return same;
-  if (shape.kind === "alternatives") {
-    const children = shape.alternatives.map(artifactPathOverlap);
-    return {
-      overlaps: children.some((child) => child.overlaps),
-      ambiguous: children.some((child) => child.ambiguous)
-    };
-  }
-  if (shape.kind !== "scalar" || scalarFamily(shape) !== "string")
-    return disjoint;
-  const values = exactScalars(shape);
-  return values && !values.some((value) => typeof value === "string" && classifyArtifactPath(value) === void 0) ? disjoint : { overlaps: true, ambiguous: true };
-}
-function overlap(left, right) {
-  if (left.kind === "alternatives" || right.kind === "alternatives") {
-    const pairs = (left.kind === "alternatives" ? left.alternatives : [left]).flatMap((a) => (right.kind === "alternatives" ? right.alternatives : [right]).map((b) => overlap(a, b)));
-    return {
-      overlaps: pairs.some((p) => p.overlaps),
-      ambiguous: pairs.some((p) => p.ambiguous)
-    };
-  }
-  if (left.kind === "unusable" || right.kind === "unusable")
-    return disjoint;
-  if (left.kind === "dynamic" || right.kind === "dynamic")
-    return same;
-  if (left.kind === "artifact" || right.kind === "artifact") {
-    if (left.kind === "artifact" && right.kind === "artifact")
-      return same;
-    const other = left.kind === "artifact" ? right : left;
-    if (other.kind !== "struct")
-      return disjoint;
-    if (!other.fields)
-      return same;
-    const keys = Object.keys(other.fields);
-    if (keys.length !== 1 || keys[0] !== "path")
-      return disjoint;
-    return artifactPathOverlap(other.fields.path);
-  }
-  if (left.kind === "scalar" || right.kind === "scalar") {
-    if (left.kind !== "scalar" || right.kind !== "scalar" || scalarFamily(left) !== scalarFamily(right))
-      return disjoint;
-    const a = exactScalars(left), b = exactScalars(right);
-    if (a && !a.some((value) => scalarContains(right, value)))
-      return disjoint;
-    if (b && !b.some((value) => scalarContains(left, value)))
-      return disjoint;
-    return same;
-  }
-  if (left.kind === "struct" || right.kind === "struct") {
-    if (left.kind !== "struct" || right.kind !== "struct")
-      return disjoint;
-    if (!left.fields || !right.fields)
-      return same;
-    const keys = Object.keys(left.fields);
-    if (keys.length !== Object.keys(right.fields).length || keys.some((key) => !Object.hasOwn(right.fields, key)))
-      return disjoint;
-    const children2 = keys.map((key) => overlap(left.fields[key], right.fields[key]));
-    return children2.some((p) => !p.overlaps) ? disjoint : { overlaps: true, ambiguous: children2.some((p) => p.ambiguous) };
-  }
-  if (left.kind === "list" && right.kind === "list") {
-    const child = overlap(left.element, right.element);
-    return { overlaps: true, ambiguous: child.ambiguous };
-  }
-  if (left.kind === "array" && right.kind === "array" && left.elements.length !== right.elements.length)
-    return disjoint;
-  const count = left.kind === "array" ? left.elements.length : right.kind === "array" ? right.elements.length : 0;
-  const children = Array.from({ length: count }, (_, i) => overlap(left.kind === "array" ? left.elements[i] : left.element, right.kind === "array" ? right.elements[i] : right.element));
-  return children.some((p) => !p.overlaps) ? disjoint : { overlaps: true, ambiguous: children.some((p) => p.ambiguous) };
-}
 function judgeShape(shape) {
   if (shape.kind === "unusable")
     return { kind: "incompatible" };
@@ -6284,8 +6199,6 @@ function judgeShape(shape) {
     return { kind: "incompatible" };
   if (judgments.some((j) => j.kind === "unknown"))
     return { kind: "unknown" };
-  if (shape.kind === "alternatives" && children.some((a, i) => children.slice(i + 1).some((b) => overlap(a, b).ambiguous)))
-    return { kind: "incompatible" };
   return { kind: "compatible" };
 }
 function checkFmtEvidence(evidence) {
@@ -6324,7 +6237,10 @@ function project(shape, value, path, admit) {
   }
   if (shape.kind === "artifact") {
     const admission = admit({ type: "artifact" }, value, path);
-    return admission.admitted ? { admitted: true, value: value.path } : fail(admission.violation.detail, path);
+    return admission.admitted ? {
+      admitted: true,
+      value: pathOfArtifactValue(value)
+    } : fail(admission.violation.detail, path);
   }
   if (shape.kind === "array" || shape.kind === "list") {
     if (!Array.isArray(value) || shape.kind === "array" && value.length !== shape.elements.length)
@@ -6895,7 +6811,7 @@ var interpolationRule = {
       return operationViolation("invalid-template-interpolation", "Value template interpolation cannot use an unset value");
     }
     if (producerGuaranteesArtifact(evidence)) {
-      return isArtifactValue(value) ? operationAdmitted(value.path) : operationViolation("invalid-artifact-value", "Artifact interpolation requires a valid Artifact value");
+      return isArtifactValue(value) ? operationAdmitted(pathOfArtifactValue(value)) : operationViolation("invalid-artifact-value", "Artifact interpolation requires a valid Artifact value");
     }
     if (isPrimitiveValue(value)) {
       if (typeof value === "number" && !Number.isFinite(value)) {
@@ -6916,26 +6832,39 @@ var interpolationRule = {
 };
 var comparisonRule = {
   checkProducers(op, left, right, context) {
-    return decideComparison(op, resolveProducer(left, context), resolveProducer(right, context));
+    const leftEvidence = resolveProducer(left, context);
+    const rightEvidence = resolveProducer(right, context);
+    return isEquality(op) ? decideEquality(leftEvidence, rightEvidence) : decideOrdering(leftEvidence, rightEvidence);
   },
   admitValues(op, decision2, left, right) {
-    return decision2.mode === "by-value" ? admitUnionComparisonValues(op, decision2.operands.left, decision2.operands.right, left, right) : admitSelectedComparison(op, decision2, left, right);
+    if (decision2.mode !== "by-value")
+      return admitSelectedOrdering(decision2, left, right);
+    const { left: leftEvidence, right: rightEvidence } = decision2.operands;
+    return isEquality(op) ? admitEqualityValues(leftEvidence, rightEvidence, left, right) : admitUnionOrderingValues(leftEvidence, rightEvidence, left, right);
+  },
+  /** Whether the operands of an equality decision could hold equal values. */
+  mayBeEqual(decision2) {
+    return decision2.mode !== "by-value" || mayEqual(decision2.operands.left, decision2.operands.right);
   },
   result: { kind: "carrier", carrier: "boolean" }
 };
+function isEquality(op) {
+  return op === "==" || op === "!=";
+}
 function incoherentComparison() {
   return operationViolation("invalid-comparison-operands", "Comparison operands do not have a coherent shared domain");
 }
-function admitSelectedComparison(op, selected, left, right) {
+function nonFiniteComparison(path) {
+  return operationViolation("non-finite-number", `Numeric value must be finite before numeric comparison${path === "$" ? "" : ` at ${path}`}`);
+}
+function admitSelectedOrdering(selected, left, right) {
   if (selected.judgment.kind === "incompatible")
     return incoherentComparison();
-  const admitted2 = admitComparisonOperands(op, selected, left, right);
+  const admitted2 = admitOrderingOperands(selected, left, right);
   return admitted2.admitted ? operationAdmitted({ left, right, decision: selected }) : admitted2;
 }
-function admitComparisonOperands(op, selected, left, right) {
+function admitOrderingOperands(selected, left, right) {
   switch (selected.mode) {
-    case "cross-type":
-      return operationAdmitted({ left, right });
     case "enum": {
       const spec2 = {
         type: "enum",
@@ -6953,23 +6882,16 @@ function admitComparisonOperands(op, selected, left, right) {
       const admittedRight = admitValue({ type: "number" }, right);
       if (!admittedLeft.admitted || !admittedRight.admitted) {
         const nonFinite = typeof left === "number" && !Number.isFinite(left) || typeof right === "number" && !Number.isFinite(right);
-        return operationViolation(nonFinite ? "non-finite-number" : "invalid-numeric-comparison", nonFinite ? "Numeric value must be finite before numeric comparison" : "Numeric comparison requires finite numeric operands");
+        return nonFinite ? nonFiniteComparison("$") : operationViolation("invalid-numeric-comparison", "Numeric comparison requires finite numeric operands");
       }
       return operationAdmitted({ left, right });
     }
     case "string":
       return typeof left === "string" && typeof right === "string" ? operationAdmitted({ left, right }) : operationViolation("invalid-string-comparison", "String comparison requires string operands");
-    case "boolean":
-      return typeof left === "boolean" && typeof right === "boolean" ? operationAdmitted({ left, right }) : operationViolation("invalid-boolean-comparison", "Boolean equality requires boolean operands");
-    case "artifact":
-      return isArtifactValue(left) && isArtifactValue(right) ? operationAdmitted({ left, right }) : operationViolation("invalid-artifact-value", "Artifact equality requires valid Artifact values");
-    case "array":
-      return admitArrayComparisonValues(selected.arrayElementFamily, left, right);
-    case "struct":
-      return isPlainRecord(left) && isPlainRecord(right) ? operationAdmitted({ left, right }) : operationViolation("invalid-struct-comparison", "Struct equality requires Struct operands");
     case "dynamic":
       if (Array.isArray(left) || Array.isArray(right)) {
-        return admitArrayComparisonValues(void 0, left, right);
+        const nonFinite = firstNonFiniteNumberPath(left) ?? firstNonFiniteNumberPath(right);
+        return nonFinite !== void 0 ? nonFiniteComparison(nonFinite) : operationViolation("invalid-array-operation", "Arrays cannot be ordered");
       }
       if (typeof left === "number" || typeof right === "number") {
         const admittedLeft = admitValue({ type: "number" }, left);
@@ -6978,30 +6900,13 @@ function admitComparisonOperands(op, selected, left, right) {
           return operationAdmitted({ left, right });
         }
         const nonFinite = typeof left === "number" && !Number.isFinite(left) || typeof right === "number" && !Number.isFinite(right);
-        return operationViolation(nonFinite ? "non-finite-number" : "invalid-numeric-comparison", nonFinite ? "Numeric value must be finite before numeric comparison" : "Numeric comparison requires finite numeric operands");
+        return nonFinite ? nonFiniteComparison("$") : operationViolation("invalid-numeric-comparison", "Numeric comparison requires finite numeric operands");
       }
-      if (op !== "==" && op !== "!=") {
-        return typeof left === "string" && typeof right === "string" ? operationAdmitted({ left, right }) : operationViolation("invalid-comparison-operands", "Ordering requires two finite numbers or two strings");
-      }
-      return operationAdmitted({ left, right });
+      return typeof left === "string" && typeof right === "string" ? operationAdmitted({ left, right }) : operationViolation("invalid-comparison-operands", "Ordering requires two finite numbers or two strings");
   }
 }
 function hasUnionEvidence(evidence) {
-  switch (evidence.kind) {
-    case "fact":
-      return evidence.fact.kind === "site" ? hasUnionSpec(evidence.fact.spec) : evidence.fact.kind === "array" && evidence.fact.elements.some((fact) => hasUnionEvidence(resolvedFact(fact)));
-    case "alternatives":
-      return evidence.alternatives.some(hasUnionEvidence);
-    case "array":
-      return evidence.elements.some(hasUnionEvidence);
-    case "struct":
-      return Object.values(evidence.fields ?? {}).some(hasUnionEvidence);
-    default:
-      return false;
-  }
-}
-function hasUnionSpec(spec2) {
-  return spec2.type === "union" || spec2.type === "array" && hasUnionSpec(spec2.element) || spec2.type === "struct" && Object.values(spec2.fields).some(hasUnionSpec);
+  return evidence.kind === "alternatives" ? evidence.alternatives.some(hasUnionEvidence) : declaredUnion(evidence) !== void 0;
 }
 function declaredUnion(evidence) {
   return evidence.kind === "fact" && evidence.fact.kind === "site" && evidence.fact.spec.type === "union" ? evidence.fact.spec : void 0;
@@ -7013,65 +6918,100 @@ function precedingAlternatives(spec2) {
     return shadowed ? [] : [resolvedFact({ kind: "site", spec: member })];
   });
 }
-function coveredByUnion(evidence, union) {
-  if (evidence.kind !== "fact")
-    return false;
-  const fact = evidence.fact;
-  if (fact.kind === "literal")
-    return admitValue(union, fact.value).admitted;
-  if (fact.kind === "site")
-    return reusableSpecCompatible(fact.spec, union);
-  if (fact.kind === "carrier")
-    return reusableSpecCompatible({ type: fact.carrier }, union);
-  return fact.kind === "provenance" && fact.provenance === "index" && reusableSpecCompatible({ type: "index" }, union);
-}
-function sameUnionPair(left, right, unions) {
-  return unions.some((union) => coveredByUnion(left, union) && coveredByUnion(right, union));
-}
-function decideComparison(op, left, right) {
-  if (!hasUnionEvidence(left) && !hasUnionEvidence(right))
-    return decideOrdinaryComparison(op, left, right);
+function decideEquality(left, right) {
   return {
-    judgment: judgeUnionComparison(op, left, right),
+    judgment: isEqualityOperand(left) && isEqualityOperand(right) ? COMPATIBLE : INCOMPATIBLE,
     mode: "by-value",
     operands: { left, right }
   };
 }
-function decideUnionPair(op, left, right, unions) {
-  const ordinary = decideOrdinaryComparison(op, left, right);
-  return ordinary.judgment.kind === "incompatible" && (op === "==" || op === "!=") && sameUnionPair(left, right, unions) ? decision("compatible", "cross-type") : ordinary;
+function isEqualityOperand(evidence) {
+  switch (evidence.kind) {
+    case "unusable":
+      return false;
+    case "alternatives":
+      return evidence.alternatives.every(isEqualityOperand);
+    case "array":
+      return evidence.elements.every(isEqualityOperand);
+    case "struct":
+      return Object.values(evidence.fields ?? {}).every(isEqualityOperand);
+    case "fact":
+      return evidence.fact.kind === "array" ? evidence.fact.elements.every((fact) => isEqualityOperand(resolvedFact(fact))) : stableFamily(evidence) !== "dialog-cursor";
+    case "dynamic":
+      return true;
+  }
 }
-function declaredUnions(left, right) {
-  return [declaredUnion(left), declaredUnion(right)].filter((spec2) => spec2 !== void 0);
+function admitEqualityValues(leftEvidence, rightEvidence, left, right) {
+  const nonFinite = firstNonFiniteNumberPath(left) ?? firstNonFiniteNumberPath(right);
+  if (nonFinite !== void 0)
+    return nonFiniteComparison(nonFinite);
+  if (firstInvalidPayloadValue(left) || firstInvalidPayloadValue(right) || !evidenceAdmitsValue(leftEvidence, left) || !evidenceAdmitsValue(rightEvidence, right))
+    return incoherentComparison();
+  return operationAdmitted({ left, right, decision: { mode: "equality" } });
 }
-function judgeUnionComparison(op, left, right) {
-  if (left.kind === "alternatives") {
-    return reduceAlternativeJudgments(left.alternatives.map((alternative) => decideComparison(op, alternative, right).judgment));
-  }
-  if (right.kind === "alternatives") {
-    return reduceAlternativeJudgments(right.alternatives.map((alternative) => decideComparison(op, left, alternative).judgment));
-  }
-  const unions = declaredUnions(left, right);
-  if (unions.length > 0) {
-    const leftUnion = declaredUnion(left);
-    const rightUnion = declaredUnion(right);
-    return reduceUnionJudgments((leftUnion ? precedingAlternatives(leftUnion) : [left]).flatMap((lhs) => (rightUnion ? precedingAlternatives(rightUnion) : [right]).map((rhs) => decideUnionPair(op, lhs, rhs, unions).judgment)));
-  }
+function mayEqual(left, right) {
+  if (left.kind === "alternatives")
+    return left.alternatives.some((alternative) => mayEqual(alternative, right));
+  if (right.kind === "alternatives")
+    return right.alternatives.some((alternative) => mayEqual(left, alternative));
+  const leftUnion = declaredUnion(left);
+  if (leftUnion)
+    return leftUnion.members.some((spec2) => mayEqual(resolvedFact({ kind: "site", spec: spec2 }), right));
+  const rightUnion = declaredUnion(right);
+  if (rightUnion)
+    return rightUnion.members.some((spec2) => mayEqual(left, resolvedFact({ kind: "site", spec: spec2 })));
   const leftFamily = stableFamily(left);
   const rightFamily = stableFamily(right);
-  if (leftFamily === "array" || rightFamily === "array") {
-    if (op !== "==" && op !== "!=")
-      return INCOMPATIBLE;
-    if (leftFamily === "dynamic" || rightFamily === "dynamic")
-      return UNKNOWN;
-    if (leftFamily !== "array" || rightFamily !== "array")
-      return INCOMPATIBLE;
-    return reduceAlternativeJudgments(alignedElementEvidence(left, right).map(([lhs, rhs]) => decideComparison(op, lhs, rhs).judgment));
+  if (leftFamily === "dynamic" || rightFamily === "dynamic")
+    return true;
+  if (leftFamily !== rightFamily)
+    return false;
+  if (leftFamily === "string") {
+    const leftStrings = knownStrings(left);
+    const rightStrings = knownStrings(right);
+    return !leftStrings || !rightStrings || leftStrings.some((value) => rightStrings.includes(value));
   }
-  if (leftFamily === "struct" || rightFamily === "struct") {
-    return op === "==" || op === "!=" ? judgeStructEquality(left, right) : INCOMPATIBLE;
+  if (leftFamily === "array") {
+    return alignedElementEvidence(left, right).every(([lhs, rhs]) => mayEqual(lhs, rhs));
   }
-  return decideOrdinaryComparison(op, left, right).judgment;
+  if (leftFamily === "struct") {
+    const leftFields = structOperandFields(left);
+    const rightFields = structOperandFields(right);
+    if (!leftFields || !rightFields)
+      return false;
+    if (leftFields === "dynamic" || rightFields === "dynamic")
+      return true;
+    return sameFieldNames(leftFields, rightFields) && Object.keys(leftFields).every((name2) => mayEqual(leftFields[name2], rightFields[name2]));
+  }
+  return true;
+}
+function knownStrings(evidence) {
+  if (evidence.kind !== "fact")
+    return void 0;
+  const fact = evidence.fact;
+  if (fact.kind === "literal")
+    return typeof fact.value === "string" ? [fact.value] : void 0;
+  return fact.kind === "site" && fact.spec.type === "enum" ? fact.spec.values : void 0;
+}
+function decideOrdering(left, right) {
+  if (!hasUnionEvidence(left) && !hasUnionEvidence(right))
+    return decideScalarOrdering(left, right);
+  return {
+    judgment: judgeUnionOrdering(left, right),
+    mode: "by-value",
+    operands: { left, right }
+  };
+}
+function judgeUnionOrdering(left, right) {
+  if (left.kind === "alternatives") {
+    return reduceAlternativeJudgments(left.alternatives.map((alternative) => decideOrdering(alternative, right).judgment));
+  }
+  if (right.kind === "alternatives") {
+    return reduceAlternativeJudgments(right.alternatives.map((alternative) => decideOrdering(left, alternative).judgment));
+  }
+  const leftUnion = declaredUnion(left);
+  const rightUnion = declaredUnion(right);
+  return reduceUnionJudgments((leftUnion ? precedingAlternatives(leftUnion) : [left]).flatMap((lhs) => (rightUnion ? precedingAlternatives(rightUnion) : [right]).map((rhs) => decideScalarOrdering(lhs, rhs).judgment)));
 }
 function evidenceAdmitsValue(evidence, value) {
   switch (evidence.kind) {
@@ -7137,22 +7077,22 @@ function literalArrayLength(evidence) {
     return evidence.fact.elements.length;
   return evidence.fact.kind === "empty-array" ? 0 : void 0;
 }
-function admitUnionComparisonValues(op, leftEvidence, rightEvidence, left, right) {
+function admitUnionOrderingValues(leftEvidence, rightEvidence, left, right) {
   const nonFinite = firstNonFiniteNumberPath(left) ?? firstNonFiniteNumberPath(right);
   if (nonFinite !== void 0)
-    return operationViolation("non-finite-number", `Numeric value must be finite before numeric comparison at ${nonFinite}`);
+    return nonFiniteComparison(nonFinite);
   if (firstInvalidPayloadValue(left) || firstInvalidPayloadValue(right) || !evidenceAdmitsValue(leftEvidence, left) || !evidenceAdmitsValue(rightEvidence, right))
     return incoherentComparison();
-  return selectUnionComparison(op, leftEvidence, rightEvidence, left, right);
+  return selectUnionOrdering(leftEvidence, rightEvidence, left, right);
 }
-function selectUnionComparison(op, leftEvidence, rightEvidence, left, right) {
+function selectUnionOrdering(leftEvidence, rightEvidence, left, right) {
   if (leftEvidence.kind === "alternatives" || rightEvidence.kind === "alternatives") {
     const leftAlternatives = leftEvidence.kind === "alternatives" ? leftEvidence.alternatives.filter((evidence) => evidenceAdmitsValue(evidence, left)) : [leftEvidence];
     const rightAlternatives = rightEvidence.kind === "alternatives" ? rightEvidence.alternatives.filter((evidence) => evidenceAdmitsValue(evidence, right)) : [rightEvidence];
     let selected;
     for (const lhs of leftAlternatives)
       for (const rhs of rightAlternatives) {
-        const result = selectUnionComparison(op, lhs, rhs, left, right);
+        const result = selectUnionOrdering(lhs, rhs, left, right);
         if (!result.admitted)
           return result;
         if (selected && (selected.decision.mode !== result.value.decision.mode || !sameEnumDomain(selected.decision.enumValues ?? [], result.value.decision.enumValues ?? []))) {
@@ -7162,55 +7102,20 @@ function selectUnionComparison(op, leftEvidence, rightEvidence, left, right) {
       }
     return selected ? operationAdmitted(selected) : incoherentComparison();
   }
-  const unions = declaredUnions(leftEvidence, rightEvidence);
-  if (unions.length > 0) {
-    const leftUnion = declaredUnion(leftEvidence);
-    const rightUnion = declaredUnion(rightEvidence);
-    const lhs = leftUnion ? resolvedFact({ kind: "site", spec: precedingSpec(leftUnion, left) }) : leftEvidence;
-    const rhs = rightUnion ? resolvedFact({ kind: "site", spec: precedingSpec(rightUnion, right) }) : rightEvidence;
-    return admitSelectedComparison(op, decideUnionPair(op, lhs, rhs, unions), left, right);
-  }
-  if ((hasUnionEvidence(leftEvidence) || hasUnionEvidence(rightEvidence)) && (Array.isArray(left) || Array.isArray(right))) {
-    if (!Array.isArray(left) || !Array.isArray(right) || op !== "==" && op !== "!=")
-      return incoherentComparison();
-    for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
-      const admitted2 = selectUnionComparison("==", elementEvidenceAt(leftEvidence, index), elementEvidenceAt(rightEvidence, index), left[index], right[index]);
-      if (!admitted2.admitted)
-        return admitted2;
-    }
-    return operationAdmitted({
-      left,
-      right,
-      decision: decision("compatible", "array")
-    });
-  }
-  if ((hasUnionEvidence(leftEvidence) || hasUnionEvidence(rightEvidence)) && (isPlainRecord(left) || isPlainRecord(right))) {
-    if (!isPlainRecord(left) || !isPlainRecord(right) || !sameFieldNames(left, right) || op !== "==" && op !== "!=")
-      return incoherentComparison();
-    const leftFields = structOperandFields(leftEvidence);
-    const rightFields = structOperandFields(rightEvidence);
-    if (!leftFields || !rightFields)
-      return incoherentComparison();
-    for (const name2 of Object.keys(left)) {
-      const lhs = leftFields === "dynamic" ? { kind: "dynamic" } : leftFields[name2];
-      const rhs = rightFields === "dynamic" ? { kind: "dynamic" } : rightFields[name2];
-      const admitted2 = selectUnionComparison("==", lhs, rhs, left[name2], right[name2]);
-      if (!admitted2.admitted)
-        return admitted2;
-    }
-    return operationAdmitted({
-      left,
-      right,
-      decision: decision("compatible", "struct")
-    });
-  }
-  return admitSelectedComparison(op, decideOrdinaryComparison(op, leftEvidence, rightEvidence), left, right);
+  const leftUnion = declaredUnion(leftEvidence);
+  const rightUnion = declaredUnion(rightEvidence);
+  return admitSelectedOrdering(decideScalarOrdering(leftUnion ? resolvedFact({
+    kind: "site",
+    spec: precedingSpec(leftUnion, left)
+  }) : leftEvidence, rightUnion ? resolvedFact({
+    kind: "site",
+    spec: precedingSpec(rightUnion, right)
+  }) : rightEvidence), left, right);
 }
-function decideOrdinaryComparison(op, left, right) {
-  const ordering = op !== "==" && op !== "!=";
+function decideScalarOrdering(left, right) {
   const leftEnum = provenEnumDomain(left);
   const rightEnum = provenEnumDomain(right);
-  if (ordering && (leftEnum || rightEnum)) {
+  if (leftEnum || rightEnum) {
     if (leftEnum && rightEnum && !sameEnumDomain(leftEnum, rightEnum)) {
       return decision("incompatible", "enum");
     }
@@ -7224,91 +7129,18 @@ function decideOrdinaryComparison(op, left, right) {
   const leftFamily = stableFamily(left);
   const rightFamily = stableFamily(right);
   const known = leftFamily === "dynamic" ? rightFamily : leftFamily;
-  if (known === "artifact") {
-    if (leftFamily === "dynamic" || rightFamily === "dynamic") {
-      return decision("unknown", "dynamic");
-    }
-    return leftFamily === "artifact" && rightFamily === "artifact" && !ordering ? decision("compatible", "artifact") : decision("incompatible", "artifact");
-  }
-  if (known === "array") {
-    if (ordering)
-      return decision("incompatible", "array");
-    const elementFamilies = /* @__PURE__ */ new Set();
-    collectArrayElementFamilies(left, elementFamilies);
-    collectArrayElementFamilies(right, elementFamilies);
-    if (elementFamilies.size > 1) {
-      return decision("incompatible", "array");
-    }
-    const arrayElementFamily2 = elementFamilies.values().next().value;
-    if (arrayElementFamily2 !== void 0 && !isArrayComparisonFamily(arrayElementFamily2)) {
-      return decision("incompatible", "array");
-    }
-    if (arrayElementFamily2 === "struct") {
-      return {
-        judgment: judgeStructArrayEquality(left, right),
-        mode: "array",
-        arrayElementFamily: arrayElementFamily2
-      };
-    }
+  if (known === "number" || known === "string") {
     const judgment = reduceAlternativeJudgments([
-      judgeArrayEvidence(left, arrayElementFamily2),
-      judgeArrayEvidence(right, arrayElementFamily2)
+      judgeFamily(left, known),
+      judgeFamily(right, known)
     ]);
-    return { judgment, mode: "array", arrayElementFamily: arrayElementFamily2 };
+    return { judgment, mode: known };
   }
-  if (known === "struct") {
-    return ordering ? decision("incompatible", "struct") : { judgment: judgeStructEquality(left, right), mode: "struct" };
-  }
-  if (known === "dialog-cursor" || known === "unusable") {
-    return decision("incompatible", "dynamic");
-  }
-  if (known === "boolean") {
-    if (ordering)
-      return decision("incompatible", "boolean");
-    const judgment = reduceAlternativeJudgments([
-      judgeFamily(left, "boolean"),
-      judgeFamily(right, "boolean")
-    ]);
-    return { judgment, mode: "boolean" };
-  }
-  if (known === "number") {
-    const judgment = reduceAlternativeJudgments([
-      judgeFamily(left, "number"),
-      judgeFamily(right, "number")
-    ]);
-    return { judgment, mode: "number" };
-  }
-  if (known === "string") {
-    const judgment = reduceAlternativeJudgments([
-      judgeFamily(left, "string"),
-      judgeFamily(right, "string")
-    ]);
-    return { judgment, mode: "string" };
-  }
-  return decision("unknown", "dynamic");
+  const undecided = known === "dynamic" || known === "artifact" && (leftFamily === "dynamic" || rightFamily === "dynamic");
+  return decision(undecided ? "unknown" : "incompatible", "dynamic");
 }
 function decision(kind, mode) {
   return { judgment: { kind }, mode };
-}
-function judgeStructEquality(left, right) {
-  if (left.kind === "alternatives") {
-    return reduceAlternativeJudgments(left.alternatives.map((alternative) => judgeStructEquality(alternative, right)));
-  }
-  if (right.kind === "alternatives") {
-    return reduceAlternativeJudgments(right.alternatives.map((alternative) => judgeStructEquality(left, alternative)));
-  }
-  const leftFields = structOperandFields(left);
-  const rightFields = structOperandFields(right);
-  if (leftFields === void 0 || rightFields === void 0) {
-    return INCOMPATIBLE;
-  }
-  if (leftFields === "dynamic" || rightFields === "dynamic")
-    return UNKNOWN;
-  const names = Object.keys(leftFields);
-  if (names.length !== Object.keys(rightFields).length || names.some((name2) => !Object.hasOwn(rightFields, name2))) {
-    return INCOMPATIBLE;
-  }
-  return reduceAlternativeJudgments(names.map((name2) => decideComparison("==", leftFields[name2], rightFields[name2]).judgment));
 }
 function structOperandFields(evidence) {
   switch (evidence.kind) {
@@ -7324,45 +7156,6 @@ function structOperandFields(evidence) {
     case "array":
     case "unusable":
       return void 0;
-  }
-}
-function judgeStructArrayEquality(left, right) {
-  const [first, ...rest] = [
-    ...arrayElementEvidence(left),
-    ...arrayElementEvidence(right)
-  ];
-  if (!first)
-    return COMPATIBLE;
-  return reduceAlternativeJudgments(rest.map((element) => judgeStructEquality(first, element)));
-}
-function arrayElementEvidence(evidence) {
-  switch (evidence.kind) {
-    case "array":
-      return evidence.elements;
-    case "alternatives":
-      return evidence.alternatives.flatMap(arrayElementEvidence);
-    case "dynamic":
-      return [evidence];
-    case "struct":
-    case "unusable":
-      return [{ kind: "unusable" }];
-    case "fact": {
-      const fact = evidence.fact;
-      if (fact.kind === "empty-array")
-        return [];
-      if (fact.kind === "array") {
-        return fact.elements.map((element) => ({
-          kind: "fact",
-          fact: element
-        }));
-      }
-      if (fact.kind === "site" && fact.spec.type === "array") {
-        return [
-          { kind: "fact", fact: { kind: "site", spec: fact.spec.element } }
-        ];
-      }
-      return [{ kind: "unusable" }];
-    }
   }
 }
 function stableFamily(evidence) {
@@ -7421,86 +7214,6 @@ function stableFamily(evidence) {
     }
   }
 }
-function collectArrayElementFamilies(evidence, families) {
-  switch (evidence.kind) {
-    case "alternatives":
-      for (const alternative of evidence.alternatives) {
-        collectArrayElementFamilies(alternative, families);
-      }
-      return;
-    case "array":
-      for (const element of evidence.elements) {
-        collectScalarComparisonFamilies(element, families);
-      }
-      return;
-    case "fact":
-      if (evidence.fact.kind === "site" && evidence.fact.spec.type === "array") {
-        families.add(arrayElementFamily(evidence.fact.spec.element));
-      } else if (evidence.fact.kind === "array") {
-        for (const element of evidence.fact.elements) {
-          collectScalarComparisonFamilies({ kind: "fact", fact: element }, families);
-        }
-      }
-      return;
-    case "dynamic":
-    case "struct":
-    case "unusable":
-      return;
-  }
-}
-function collectScalarComparisonFamilies(evidence, families) {
-  if (evidence.kind === "alternatives") {
-    for (const alternative of evidence.alternatives) {
-      collectScalarComparisonFamilies(alternative, families);
-    }
-    return;
-  }
-  const family = stableFamily(evidence);
-  if (isArrayComparisonFamily(family))
-    families.add(family);
-}
-function judgeArrayEvidence(evidence, elementFamily) {
-  switch (evidence.kind) {
-    case "dynamic":
-      return { kind: "unknown" };
-    case "alternatives":
-      return reduceAlternativeJudgments(evidence.alternatives.map((alternative) => judgeArrayEvidence(alternative, elementFamily)));
-    case "array":
-      return reduceAlternativeJudgments(evidence.elements.map((element) => judgeScalarComparisonEvidence(element, elementFamily)));
-    case "fact":
-      if (evidence.fact.kind === "empty-array") {
-        return { kind: "compatible" };
-      }
-      if (evidence.fact.kind === "array") {
-        return reduceAlternativeJudgments(evidence.fact.elements.map((element) => judgeScalarComparisonEvidence({ kind: "fact", fact: element }, elementFamily)));
-      }
-      if (evidence.fact.kind === "site" && evidence.fact.spec.type === "array") {
-        const family = arrayElementFamily(evidence.fact.spec.element);
-        return elementFamily === void 0 || family === elementFamily ? { kind: "compatible" } : { kind: "incompatible" };
-      }
-      return { kind: "incompatible" };
-    case "struct":
-    case "unusable":
-      return { kind: "incompatible" };
-  }
-}
-function judgeScalarComparisonEvidence(evidence, family) {
-  if (family !== void 0)
-    return judgeFamily(evidence, family);
-  if (evidence.kind === "dynamic")
-    return { kind: "unknown" };
-  if (evidence.kind === "alternatives") {
-    return reduceAlternativeJudgments(evidence.alternatives.map((alternative) => judgeScalarComparisonEvidence(alternative, family)));
-  }
-  const stable = stableFamily(evidence);
-  return stable === "boolean" || stable === "string" || stable === "number" || stable === "artifact" ? { kind: "compatible" } : { kind: "incompatible" };
-}
-function arrayElementFamily(spec2) {
-  return stableFamily({ kind: "fact", fact: { kind: "site", spec: spec2 } });
-}
-function isArrayComparisonFamily(family) {
-  return family === "boolean" || family === "string" || family === "number" || family === "artifact" || family === "struct";
-}
 function judgeFamily(evidence, family) {
   const union = declaredUnion(evidence);
   if (union)
@@ -7513,60 +7226,6 @@ function judgeFamily(evidence, family) {
     default:
       return stableFamily(evidence) === family ? { kind: "compatible" } : { kind: "incompatible" };
   }
-}
-function admitArrayComparisonValues(elementFamily, left, right) {
-  if (!Array.isArray(left) || !Array.isArray(right)) {
-    return operationViolation("invalid-array-operation", "Array equality requires array operands");
-  }
-  if (elementFamily === "struct") {
-    return left.every(isPlainRecord) && right.every(isPlainRecord) ? operationAdmitted({ left, right }) : operationViolation("invalid-array-operation", "Struct array equality requires Struct elements");
-  }
-  if (elementFamily === "artifact") {
-    const spec3 = {
-      type: "array",
-      element: { type: "artifact" }
-    };
-    const admittedLeft2 = admitValue(spec3, left);
-    const admittedRight2 = admitValue(spec3, right);
-    return admittedLeft2.admitted && admittedRight2.admitted ? operationAdmitted({ left, right }) : operationViolation("invalid-array-operation", "Artifact array equality requires valid Artifact elements");
-  }
-  const nonFinitePath = firstNonFiniteNumberPath(left) ?? firstNonFiniteNumberPath(right);
-  if (nonFinitePath !== void 0) {
-    return operationViolation("non-finite-number", `Numeric value must be finite before numeric comparison${nonFinitePath === "$" ? "" : ` at ${nonFinitePath}`}`);
-  }
-  const concreteFamily = concreteArrayElementFamily(left, right);
-  if (concreteFamily === "incompatible") {
-    return operationViolation("invalid-array-operation", "Array equality requires one shared boolean, string, or number element family");
-  }
-  const selectedFamily = elementFamily ?? concreteFamily;
-  if (selectedFamily === void 0) {
-    return operationAdmitted({ left, right });
-  }
-  if (elementFamily !== void 0 && concreteFamily !== void 0 && concreteFamily !== elementFamily) {
-    return operationViolation("invalid-array-operation", `Array equality requires ${elementFamily} elements`);
-  }
-  const spec2 = {
-    type: "array",
-    element: { type: selectedFamily }
-  };
-  const admittedLeft = admitValue(spec2, left);
-  const admittedRight = admitValue(spec2, right);
-  return admittedLeft.admitted && admittedRight.admitted ? operationAdmitted({ left, right }) : operationViolation("invalid-array-operation", `Array equality requires ${selectedFamily} elements`);
-}
-function concreteArrayElementFamily(left, right) {
-  let family;
-  for (const element of [...left, ...right]) {
-    const current2 = typeof element === "boolean" || typeof element === "string" || typeof element === "number" ? elementTypeFamily(element) : void 0;
-    if (current2 === void 0)
-      return "incompatible";
-    if (family !== void 0 && current2 !== family)
-      return "incompatible";
-    family = current2;
-  }
-  return family;
-}
-function elementTypeFamily(value) {
-  return typeof value === "boolean" ? "boolean" : typeof value === "string" ? "string" : "number";
 }
 function provenEnumDomain(evidence) {
   if (evidence.kind === "fact" && evidence.fact.kind === "site" && evidence.fact.spec.type === "enum") {
@@ -7797,7 +7456,7 @@ function findCell(context, name2) {
 
 // node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/spec/struct.js
 function isStructFieldName(name2) {
-  return isHostStructFieldName(name2) && !name2.startsWith("$") && name2 !== "isUnset";
+  return isHostStructFieldName(name2) && name2 !== "isUnset";
 }
 
 // node_modules/.pnpm/arc@file+..+arc/node_modules/arc/dist/types/ir.js
@@ -8658,7 +8317,7 @@ function parseHostCallArgument(expression, availableHostModules = /* @__PURE__ *
         throw new Error("Host call objects require identifier or string keys");
       }
       if (!isHostStructFieldName(key)) {
-        throw new Error("Host call object keys cannot be __proto__, prototype, or constructor");
+        throw new Error("Host call object keys cannot begin with $ or be __proto__, prototype, or constructor");
       }
       if (Object.hasOwn(value2, key)) {
         throw new Error(`Duplicate host call object key ${JSON.stringify(key)}`);
@@ -8976,7 +8635,7 @@ function validateHostParameterSpec(value, path, context, issues, state) {
       for (const [name2, field] of Object.entries(fields)) {
         const fieldPath2 = `${path}.fields[${JSON.stringify(name2)}]`;
         if (!isHostStructFieldName(name2)) {
-          hostSpecIssue(issues, fieldPath2, "Struct field names must be nonempty and cannot be __proto__, prototype, or constructor");
+          hostSpecIssue(issues, fieldPath2, "Struct field names must be nonempty, cannot begin with $, and cannot be __proto__, prototype, or constructor");
           continue;
         }
         validateHostParameterSpec(field, fieldPath2, "field", issues, state);
@@ -10148,6 +9807,10 @@ var LINT_RULES = {
     severity: "notice",
     message: "Bool cell is set to both true and false in this arc; action-graph $set() actions resolve and are remembered, so toggles and resets should be modeled deliberately."
   },
+  "comparison-never-equal": {
+    severity: "warning",
+    message: "Comparison operands share no possible value, so == is always false and != is always true; Arc does not coerce between types. Compare values of the same type, or check for a misspelled Enum value."
+  },
   "bare-cell-boolean": {
     severity: "warning",
     message: "Bare cell is evaluated as a boolean; an unset value poisons the traversal. Use an explicit comparison for value tests, or cell.isUnset() when testing whether the cell has a value."
@@ -10195,6 +9858,9 @@ function lintNodeBareCellBooleans(node2, lintIssues) {
       emitLintIssue(lintIssues, "bare-cell-boolean", cell.loc);
     }
   }
+}
+function lintNeverEqualComparison(lintIssues, loc) {
+  emitLintIssue(lintIssues, "comparison-never-equal", loc);
 }
 function lintRootArc(root, lintIssues) {
   const writes = /* @__PURE__ */ new Map();
@@ -11148,6 +10814,11 @@ var activeReadSet;
 var activeInvokeBuilders = [];
 var mapContextStack = [];
 var activeSegReadSets;
+var activeLintSite;
+function noteLintLoc(loc) {
+  if (activeLintSite)
+    activeLintSite.loc = loc;
+}
 function recordCellRead(name2) {
   activeReadSet?.cells.add(name2);
   for (const builder of activeInvokeBuilders)
@@ -13708,10 +13379,12 @@ function validateNode(node2, context) {
   const segReadSets = /* @__PURE__ */ new Map();
   activeReadSet = builder;
   activeSegReadSets = segReadSets;
+  activeLintSite = { issues: context.lintIssues, loc: node2.loc };
   try {
     if (node2.guidance !== void 0)
       validateSemanticString(node2.guidance, cells, nodeNames, context.issues, baseOptions);
     for (const cell of node2.cells) {
+      noteLintLoc(cell.loc);
       const questions = isObservableCell(cell) ? observingQuestions(cell) : [];
       for (const question of questions) {
         validateSemanticString(question, cells, nodeNames, context.issues, baseOptions);
@@ -13762,6 +13435,7 @@ function validateNode(node2, context) {
   } finally {
     activeReadSet = previousReadSet;
     activeSegReadSets = previousSegReadSets;
+    activeLintSite = void 0;
   }
   segReadSets.set(nodeSegKey("body"), finalizeReadSet(builder));
   context.bySeg.set(node2, segReadSets);
@@ -13783,6 +13457,7 @@ function validateNode(node2, context) {
   }
 }
 function validateStatement(statement2, cells, nodes, issues, labels = [], options = {}) {
+  noteLintLoc(statement2.loc);
   if (statement2.kind === "if") {
     validateExpression(statement2.test, cells, nodes, issues, options);
     checkBooleanValue(statement2.test, cells, options.references?.currentNode.signature, issues, options);
@@ -14149,6 +13824,7 @@ function checkMapCallbackBody(body2, receiver, hasResults, issues) {
   visit(body2);
 }
 function validateTriggerStatement(statement2, cells, nodes, issues, labels = [], options = {}) {
+  noteLintLoc(statement2.loc);
   if (statement2.kind === "if") {
     validateExpression(statement2.test, cells, nodes, issues, options);
     checkBooleanValue(statement2.test, cells, options.references?.currentNode.signature, issues, options);
@@ -14209,6 +13885,7 @@ function validateTriggerStatement(statement2, cells, nodes, issues, labels = [],
   throw new Error(`Unexpected hook statement: ${JSON.stringify(unreachable)}`);
 }
 function validateGuardStatement(statement2, cells, nodes, issues, labels = [], options = {}) {
+  noteLintLoc(statement2.loc);
   if (statement2.kind === "if") {
     validateExpression(statement2.test, cells, nodes, issues, options);
     checkBooleanValue(statement2.test, cells, options.references?.currentNode.signature, issues, options);
@@ -14313,6 +13990,7 @@ function validateInterruptionCompletion(statements, issues) {
   }
 }
 function validateCatchDeflectionStatement(statement2, cells, nodes, issues, labels = [], options = {}) {
+  noteLintLoc(statement2.loc);
   if (statement2.kind === "if") {
     validateExpression(statement2.test, cells, nodes, issues, options);
     checkBooleanValue(statement2.test, cells, options.references?.currentNode.signature, issues, options);
@@ -14373,6 +14051,7 @@ function validateCatchDeflectionStatement(statement2, cells, nodes, issues, labe
   throw new Error(`Unexpected hook statement: ${JSON.stringify(unreachable)}`);
 }
 function validateEffectStatement(statement2, cells, nodes, issues, labels = [], options = {}) {
+  noteLintLoc(statement2.loc);
   if (statement2.kind === "if") {
     validateExpression(statement2.test, cells, nodes, issues, options);
     checkBooleanValue(statement2.test, cells, options.references?.currentNode.signature, issues, options);
@@ -14875,6 +14554,8 @@ function validateExpression(expression, cells, nodes, issues, options = {}) {
           code: isOrdering && artifact ? "INVALID_ARTIFACT_OPERATION" : isOrdering && array2 ? "ARRAY_ORDERING" : "COMPARISON_VALUE_TYPE",
           message: isOrdering && artifact ? "Artifacts cannot be ordered" : isOrdering && array2 ? "A whole array cannot be used in an ordering comparison" : "Comparison operands do not have a coherent shared domain"
         });
+      } else if (!isOrdering && activeLintSite && !comparisonRule.mayBeEqual(decision2)) {
+        lintNeverEqualComparison(activeLintSite.issues, activeLintSite.loc);
       }
       return;
     }
@@ -15157,7 +14838,7 @@ function structToken(fields) {
   const entries = [];
   for (const name2 of Reflect.ownKeys(object)) {
     if (typeof name2 !== "string" || !isHostStructFieldName(name2)) {
-      declarationError(path, "Struct field names must be nonempty strings and cannot be __proto__, prototype, or constructor");
+      declarationError(path, "Struct field names must be nonempty strings, cannot begin with $, and cannot be __proto__, prototype, or constructor");
     }
     const fieldPath2 = propertyPath(path, name2);
     const descriptor = Object.getOwnPropertyDescriptor(object, name2);

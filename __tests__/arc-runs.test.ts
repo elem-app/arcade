@@ -1,8 +1,13 @@
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createTestArcHost, workEventsFor } from "./work-event-fixtures.js";
+import {
+  createTestArcHost,
+  moduleHubFor,
+  workEventsFor,
+} from "./work-event-fixtures.js";
 
+import { hmd } from "@elem-app/arc/host-utils";
 import { parse } from "@elem-app/arc/parser";
 import { Runtime, toArcRef } from "@elem-app/arc/runtime";
 import { describe, expect, it, vi } from "vitest";
@@ -39,6 +44,7 @@ import {
   GREET_SOURCE,
   createCapturingLogger,
   deferred,
+  hostModule,
   makeArcHost,
   makeArcHostWithSource,
   makeWorkerHub,
@@ -1331,6 +1337,59 @@ function Main() {
         ],
       }),
     ]);
+  });
+
+  it("counts Artifact host arguments without mistaking path records for Artifacts", async () => {
+    const arcHost = await createTestArcHost({
+      store: new InMemoryArcHostStore(),
+    });
+    await arcHost.registerHostModule(
+      "files",
+      hostModule(
+        moduleHubFor(arcHost),
+        hmd.define({
+          save: (
+            file = hmd.Artifact(),
+            related = hmd.Array(hmd.Artifact()),
+            record = hmd.Struct({ path: hmd.Str() }),
+          ) => {},
+        }),
+        async () => undefined,
+      ),
+    );
+    await arcHost.registerArc(
+      "artifact-host-arguments",
+      parse(`
+"arc";
+
+import Files from "host:files";
+
+function Main() {
+  this.trigger = () => {
+    return true;
+  };
+  this.hostParams = {
+    workerRole: "writer",
+  };
+
+  Files.$save(
+    Artifact("reports/direct.md"),
+    [Artifact("reports/nested.md")],
+    { path: "reports/plain.md" },
+  );
+  $instruct(\`Done.\`);
+}
+`),
+    );
+
+    const driver = await beginActivatedDriver(arcHost, {
+      cursor: { user: 0, self: 0 },
+      lastTurns: [],
+    });
+
+    await expect(arcHost.getRunView(driver.arcRunId)).resolves.toEqual(
+      expect.objectContaining({ artifactCount: 2 }),
+    );
   });
 
   it("counts unique artifact paths as action briefs emit them", async () => {
