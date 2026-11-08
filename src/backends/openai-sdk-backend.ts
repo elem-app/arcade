@@ -1300,7 +1300,7 @@ export class OpenAiSdkWorker implements Worker {
       });
       return withBackendDetails(report, backendDetails);
     } catch (error) {
-      if ((await effects.checkSignal())?.kind === "cancel") {
+      if (this.#stopped || (await effects.checkSignal())?.kind === "cancel") {
         await this.disposeRoutine({
           arcRunId: routine.arcRunId,
           routineId: routine.id,
@@ -1582,14 +1582,16 @@ async function defaultOpenAiSdkRun({
     }
     await stream.completed.catch(() => undefined);
     if (stream.rawResponses) rawResponses.push(...stream.rawResponses);
-    if (signal) break;
+    if (signal || stream.cancelled || abortController.signal.aborted) break;
 
     const pending = stream.state.getInterruptions();
     if (pending.length === 0) break;
     for (const item of pending) {
       const verdict = await resolveApproval(approvalRequest(item));
+      if (abortController.signal.aborted) break;
       applyApprovalVerdict(stream.state, item, verdict);
     }
+    if (abortController.signal.aborted) break;
     // Resume from the RunState, which carries its own response chain.
     runInput = stream.state as OpenAiRunState;
     prevId = undefined;
@@ -1602,6 +1604,13 @@ async function defaultOpenAiSdkRun({
       }
       throw error;
     }
+  }
+
+  // Stream completion also resolves on abort. Let the routine owner classify
+  // shutdown and timeout before accessing output or attempting report recovery.
+  if (!signal) {
+    abortController.signal.throwIfAborted();
+    if (stream.cancelled) throw new Error("OpenAI SDK run was cancelled.");
   }
 
   return {

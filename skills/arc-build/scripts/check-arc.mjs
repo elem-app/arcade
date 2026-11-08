@@ -9809,7 +9809,7 @@ var LINT_RULES = {
   },
   "comparison-never-equal": {
     severity: "warning",
-    message: "Comparison operands share no possible value, so == is always false and != is always true; Arc does not coerce between types. Compare values of the same type, or check for a misspelled Enum value."
+    message: "Comparison operands cannot match, so == is false and != is true (two empty arrays are the one exception); Arc compares structurally and never coerces. Compare values of the same type, or check for a misspelled Enum value."
   },
   "bare-cell-boolean": {
     severity: "warning",
