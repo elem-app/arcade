@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { moduleHubFor } from "./work-event-fixtures.js";
 
 import { parse } from "@elem-app/arc/parser";
-import { Runtime } from "@elem-app/arc/runtime";
+import { Runtime, toArcRef } from "@elem-app/arc/runtime";
 import type {
   ArcTraversal,
   ArcTraversalSet,
@@ -126,6 +126,70 @@ async function recordedGreetRun(): Promise<{
 }
 
 describe("exact self-replay (determinism anchor)", () => {
+  it("replays recorded root selection without widening to sibling roots", async () => {
+    const env = await makeReplayHost();
+    const ref = toArcRef("targeted", "One");
+    try {
+      await env.host.registerArc(
+        "targeted",
+        parse(
+          '"arc"; function One(){this.trigger=()=>true;} function Two(){this.trigger=()=>judge("excluded?");}',
+        ),
+      );
+      const steps = await env.host.begin({
+        principal: REPLAY_OWNER,
+        arcRefs: [ref],
+        projectDialog: async () => userDialog("start"),
+      });
+      const step = steps[0];
+      if (step?.kind !== "action") throw new Error("Expected selected action.");
+      expect(await env.host.verifyReplay(step.arcRunId, ref)).toMatchObject({
+        status: "compatible",
+        handoff: "reproduced",
+      });
+      const recorded = await env.replay.listSteps(step.arcRunId);
+      expect(recorded[0]).toEqual({
+        kind: "trigger-start",
+        position: { stage: "trigger", index: 0, reactivationCount: 0 },
+        dialog: userDialog("start"),
+        arcRefs: [ref],
+      });
+      await env.host.registerArc(
+        "renamed",
+        parse(
+          '"arc"; function Renamed(){this.trigger=()=>true;} function Two(){this.trigger=()=>judge("excluded?");}',
+        ),
+      );
+      const candidate = toArcRef("renamed", "Renamed");
+      const jumped = await env.host.jump(step.arcRunId, candidate);
+      expect(jumped.status).toBe("compatible");
+      if (jumped.status !== "compatible") throw new Error(jumped.reason);
+      expect(jumped.regenerated.triggerSteps[0]).toEqual({
+        ...recorded[0],
+        arcRefs: [candidate],
+      });
+      expect(
+        await env.host.verifyReplay(jumped.arcRunId, candidate),
+      ).toMatchObject({
+        status: "compatible",
+        handoff: "reproduced",
+      });
+      const rewound = await env.host.rewind(step.arcRunId, {
+        stage: "action",
+        index: 0,
+        reactivationCount: 0,
+      });
+      expect((await env.replay.listSteps(rewound.arcRunId))[0]).toEqual(
+        recorded[0],
+      );
+      expect(await env.host.verifyReplay(rewound.arcRunId, ref)).toMatchObject({
+        status: "compatible",
+        handoff: "reproduced",
+      });
+    } finally {
+      await env.host.stop();
+    }
+  });
   it("reproduces the recorded run byte-for-byte under identity iso", async () => {
     const { env, runId } = await recordedGreetRun();
     const alignment = await env.host.verifyReplay(runId, GREET_ARC);
@@ -717,11 +781,14 @@ describe("a semantic fan-out replicates its trigger stream and survives a rename
     const triggerPrefix = async (runId: ArcRunId): Promise<ReplayStep[]> =>
       (await env.replay.listSteps(runId)).filter(
         (step) =>
-          step.kind === "trigger-brief" || step.kind === "trigger-report",
+          step.kind === "trigger-start" ||
+          step.kind === "trigger-brief" ||
+          step.kind === "trigger-report",
       );
     const firstPrefix = await triggerPrefix(runIds[0]!);
     const secondPrefix = await triggerPrefix(runIds[1]!);
     expect(firstPrefix.length).toBeGreaterThan(0);
+    expect(firstPrefix[0]?.kind).toBe("trigger-start");
     expect(firstPrefix).toEqual(secondPrefix);
 
     // Contract 2: replay Alpha against a renamed, coexisting Alpha — a broken

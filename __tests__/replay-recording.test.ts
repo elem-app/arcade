@@ -10,7 +10,11 @@ import {
 } from "../src/testing.js";
 import { beginActivatedDriver } from "./arc-host-helpers.js";
 import { GREET_SOURCE } from "./helpers.js";
-import { makeReplayHost, runToCompletion } from "./replay-helpers.js";
+import {
+  makeReplayHost,
+  runToCompletion,
+  userDialog,
+} from "./replay-helpers.js";
 
 function summarize(steps: readonly ReplayStep[]): string[] {
   return steps.map((step) => {
@@ -28,6 +32,7 @@ describe("replay recording", () => {
     const runId = await runToCompletion(host, "hi");
 
     expect(summarize(await replay.listSteps(runId))).toEqual([
+      "trigger-start@0:trigger:0",
       "trigger-brief@0:trigger:1",
       "action-brief@0:action:1",
       "action-report@0:action:1(worker)",
@@ -94,8 +99,16 @@ describe("replay recording", () => {
     const triggerSteps = (await replay.listSteps(runId)).filter((step) =>
       step.kind.startsWith("trigger"),
     );
-    expect(triggerSteps).toHaveLength(1);
-    expect(triggerSteps[0]!.kind).toBe("trigger-brief");
+    expect(triggerSteps).toHaveLength(2);
+    expect(triggerSteps[0]).toEqual({
+      kind: "trigger-start",
+      position: { stage: "trigger", index: 0, reactivationCount: 0 },
+      dialog: userDialog("hi"),
+    });
+    expect(triggerSteps[1]).toMatchObject({
+      kind: "trigger-brief",
+      position: { stage: "trigger", index: 1, reactivationCount: 0 },
+    });
   });
 
   it("records and verifies terminal root identity, outcome, and returns", async () => {

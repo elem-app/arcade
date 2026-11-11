@@ -187,6 +187,7 @@ type SubmissionState = {
   pending: number;
   triggerProbeIds: Set<ArcRunId>;
   inbound: InboundMessage;
+  arcRefs?: readonly ArcRef[];
   controller: AbortController;
   removeAbortListener?: () => void;
   operations: number;
@@ -1203,7 +1204,10 @@ export class WorkerHubService {
    */
   submitInbound(
     message: InboundMessage,
-    options: { signal?: AbortSignal } = {},
+    options: {
+      signal?: AbortSignal;
+      arcRefs?: readonly ArcRef[];
+    } = {},
   ): AsyncIterable<InboundLifecycleEvent> {
     this.#assertStarted();
     this.#logger.info("worker_hub.inbound.received", {
@@ -1228,6 +1232,7 @@ export class WorkerHubService {
       pending: 0,
       triggerProbeIds: new Set(),
       inbound: message,
+      arcRefs: options.arcRefs === undefined ? undefined : [...options.arcRefs],
       controller: new AbortController(),
       operations: 0,
       finalizations: 0,
@@ -2159,6 +2164,7 @@ export class WorkerHubService {
       clientId,
       principal,
       activationPolicy,
+      arcRefs: submission?.arcRefs,
       // Activation settles before the inbound is committed to the history
       // store, so the projector closes over the held inbound rather than
       // reading the (still-empty) run history.

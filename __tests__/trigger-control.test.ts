@@ -1,6 +1,7 @@
 import { getEventListeners } from "node:events";
 
 import { parse } from "@elem-app/arc/parser";
+import { toArcRef } from "@elem-app/arc/runtime";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { ModuleExecution } from "../src/service/module-execution.js";
 
@@ -32,6 +33,58 @@ const request = {
 };
 
 describe("Explicit trigger control", () => {
+  it.each([true, false])(
+    "preserves targeted semantic trigger scope with admission cancellation %s",
+    async (cancelled) => {
+      const store = new InMemoryArcHostStore();
+      const host = await createTestArcHost({ store });
+      const controller = new AbortController();
+      try {
+        await host.registerArc(
+          "semantic-selection",
+          parse(
+            '"arc"; function One(){this.trigger=()=>judge("one?");$instruct("one");} function Two(){this.trigger=()=>judge("two?");$instruct("two");}',
+          ),
+        );
+        const probe = expectSoleTrigger(
+          await host.begin({
+            ...request,
+            activationPolicy: "all",
+            arcRefs: [toArcRef("semantic-selection", "One")],
+            signal: controller.signal,
+          }),
+        );
+        expect(probe.frontier.briefs.judgments).toHaveLength(1);
+        if (cancelled) controller.abort();
+        const steps = await host.advanceTrigger(probe.arcRunId, {
+          projectDialog: request.projectDialog,
+          reports: [
+            {
+              outcome: "completed",
+              semantic: {
+                judgments: Object.fromEntries(
+                  probe.frontier.briefs.judgments.map(({ id }) => [id, true]),
+                ),
+              },
+            },
+          ],
+        });
+        if (!cancelled) {
+          const action = expectSoleDriver(steps);
+          expect(await host.getRunView(action.arcRunId)).toMatchObject({
+            arcRef: toArcRef("semantic-selection", "One"),
+          });
+        } else {
+          expect(steps).toEqual([]);
+          const states = [];
+          for await (const entry of store.listStates()) states.push(entry);
+          expect(states).toEqual([]);
+        }
+      } finally {
+        await host.stop();
+      }
+    },
+  );
   it.each([
     ["snapshot read", "matched"],
     ["snapshot read", "ready"],

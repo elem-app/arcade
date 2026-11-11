@@ -19,9 +19,9 @@ import type { ArcDocumentSnapshotId, ArcRunId } from "./core.js";
  * done before activation) and an action stream (work done after activation).
  * Positions are stage-tagged so a failure in either stage is locatable.
  *
- * A trigger position numbers from 1. An action position numbers from 0, where
+ * Each stage numbers from 0. Trigger index 0 records the start inputs. Action
  * index 0 is the activation seed checkpoint (the traversals handed to the first
- * action `start`) and the first emitted action output is index 1.
+ * action `start`). The first emitted output in each stage is index 1.
  */
 export type TriggerReplayPosition = {
   stage: "trigger";
@@ -42,18 +42,18 @@ export function positionKey(position: ReplayPosition): string {
   return `${position.reactivationCount}:${position.stage}:${position.index}`;
 }
 
-/** A trigger brief with its `traversals` stripped (recorded in checkpoint 0). */
-export type BareTriggerBrief = Omit<TriggerBrief, "traversals">;
-
-/** An action brief with its `traversals` stripped (stored in its checkpoint). */
-export type BareActionBrief = Omit<ActionBrief, "traversals">;
-
-/** A terminal brief with its `traversals` stripped (stored in its checkpoint). */
-export type BareTerminalBrief = BareBrief<TerminalBrief>;
-
 type BareBrief<TBrief> = TBrief extends unknown
   ? Omit<TBrief, "traversals">
   : never;
+
+/** A trigger brief with its `traversals` stripped (recorded in checkpoint 0). */
+export type BareTriggerBrief = BareBrief<TriggerBrief>;
+
+/** An action brief with its `traversals` stripped (stored in its checkpoint). */
+export type BareActionBrief = BareBrief<ActionBrief>;
+
+/** A terminal brief with its `traversals` stripped (stored in its checkpoint). */
+export type BareTerminalBrief = BareBrief<TerminalBrief>;
 
 /** Project a brief to its bare recorded form, dropping `traversals`. */
 export function stripBrief<
@@ -62,6 +62,15 @@ export function stripBrief<
   const { traversals: _traversals, ...rest } = brief;
   return rest as BareBrief<TBrief>;
 }
+
+/** Inputs that begin a trigger episode, recorded at trigger index 0. */
+export type TriggerStartStep = {
+  kind: "trigger-start";
+  position: TriggerReplayPosition;
+  dialog: Dialog;
+  /** Explicit root selection; omission considers all registered roots. */
+  arcRefs?: readonly ArcRef[];
+};
 
 /**
  * Recorded trigger brief step. Stores the bare payload; the trigger stage's
@@ -118,7 +127,10 @@ export type ActionReportStep = {
   moduleEffect?: HostModuleEffect;
 };
 
-export type TriggerReplayStep = TriggerBriefStep | TriggerReportStep;
+export type TriggerReplayStep =
+  | TriggerStartStep
+  | TriggerBriefStep
+  | TriggerReportStep;
 export type ActionReplayStep =
   | ActionBriefStep
   | ActionReportStep

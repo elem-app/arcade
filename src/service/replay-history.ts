@@ -33,7 +33,10 @@ export function replayPrefixAt(
   );
   return structuredClone({
     triggerSteps: retained.filter(
-      (step) => step.kind === "trigger-brief" || step.kind === "trigger-report",
+      (step) =>
+        step.kind === "trigger-start" ||
+        step.kind === "trigger-brief" ||
+        step.kind === "trigger-report",
     ),
     actionSteps: retained.filter(
       (step) =>
@@ -130,6 +133,13 @@ export function validateReplayPrefix(prefix: RegeneratedReplay): void {
     const triggers = prefix.triggerSteps.filter(
       (step) => step.position.reactivationCount === count,
     );
+    const start = triggers[0];
+    if (
+      start?.kind !== "trigger-start" ||
+      start.position.index !== 0 ||
+      start.position.stage !== "trigger"
+    )
+      throw new Error("Missing or invalid replay trigger start.");
     const briefs = triggers.filter((step) => step.kind === "trigger-brief");
     if (!briefs.length) throw new Error("Missing replay trigger episode.");
     for (let index = 1; index <= briefs.length; index++) {
@@ -153,7 +163,7 @@ export function validateReplayPrefix(prefix: RegeneratedReplay): void {
           admit(report.moduleEffect);
         }
     }
-    if (triggers.length !== briefs.length * 2 - 1)
+    if (triggers.length !== briefs.length * 2)
       throw new Error("Unexpected replay trigger position.");
     triggerCount += triggers.length;
     const checkpoints = prefix.checkpoints.filter(

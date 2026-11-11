@@ -69,22 +69,27 @@ Reloads one discovered Arc source and replaces its registered document.
 
 ### Host Registration
 
-#### `registerArcs(registrations)` and `registerArc(source, document, manifest?, opts?)`
+#### `registerArcs(registrations, opts?)` and `registerArc(source, document, manifest?, opts?)`
 
 ```ts
-registerArcs(registrations: readonly ArcRegistrationInput[]): Promise<void>
+registerArcs(
+  registrations: readonly ArcRegistrationInput[],
+  opts?: { dryRun?: boolean },
+): Promise<void>
 
 registerArc(
   source: string,
   document: Document,
   manifest?: ArcManifest,
-  opts?: { workspacePath?: string; replace?: boolean },
+  opts?: { workspacePath?: string; replace?: boolean; dryRun?: boolean },
 ): Promise<void>
 ```
 
 Registers every root Arc in a parsed document under its source name. `registerArc` handles one document; `registerArcs` applies a batch of source changes.
 
 A batch can add sources, replace existing sources with `replace: true`, and remove sources with `{ source, delete: true }`. Each source appears at most once. Related documents are validated together, regardless of entry order; a rejected batch leaves the live registry unchanged.
+
+Pass `{ dryRun: true }` to validate the prospective registry without installing it. Dry runs share normal registration's input, manifest, worker-role, import, and host-module checks, using the currently registered host modules, and throw the same validation errors. They construct and discard the prospective runtime without writing registration records, changing the live registry, executing Arc work, or logging registration. Dry runs share the registration queue and validate against the registry committed by preceding calls. Omitting `dryRun` or setting it to `false` performs normal registration. A later installation is a separate normal call that validates again against the registry current at that time.
 
 Each registration names:
 
@@ -132,7 +137,7 @@ Connectors call `WorkerHubService` for every operation that affects a run: submi
 ```ts
 submitInbound(
   message: InboundMessage,
-  options?: { signal?: AbortSignal },
+  options?: { signal?: AbortSignal; arcRefs?: readonly ArcRef[] },
 ): AsyncIterable<InboundLifecycleEvent>
 ```
 
@@ -142,6 +147,8 @@ Submits one inbound message and returns its lifecycle event stream. An inbound m
 - An **ask answer** has a run ID and a hub-generated `metadata.askId`. It settles only the live ask identified by that exact pair. The ask, rather than the connector, supplies the logical audience and asking role recorded in history.
 
 Any other message is rejected without changing history or dispatching work. This covers an activation request carrying `metadata.askId`, a missing or malformed `askId`, an unknown or already settled ask, and an ask belonging to another run.
+
+Activation options may supply `arcRefs` to select trigger roots from the registered documents. Omission considers all roots; an empty array admits none. The hub captures the array before asynchronous routing. Imports remain available from the complete registered document set. The same selection applies to fresh activation, active-run choices, and pinned deflected-run probes. Selection is captured for the admission. Applications can abort its signal to retire remaining probes and choices when their admission policy changes. Already-bound action execution and ask answers remain independent of admission selection. Recorded trigger episodes preserve the selected roots for replay.
 
 Processing starts immediately and proceeds independently of event consumption. Consume the returned stream for activation decisions and trigger failures, or one `continued` or `rejected` answer outcome. A request with no match produces no events. The stream ends, or throws an infrastructure error, after admission or answer delivery and owned cleanup finish. Activated runs continue independently.
 

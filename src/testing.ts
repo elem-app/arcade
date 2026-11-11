@@ -71,6 +71,7 @@ export {
   type TriggerReplayPosition,
   type TriggerReplayStep,
   type TriggerReportStep,
+  type TriggerStartStep,
 } from "./types/replay.js";
 export type {
   PermissionVerdict,

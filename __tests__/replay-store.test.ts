@@ -80,14 +80,26 @@ function checkpoint(index: number, reactivationCount = 0): ReplayCheckpoint {
 }
 
 async function exercise(store: ReplayStore): Promise<void> {
+  const start: ReplayStep = {
+    kind: "trigger-start",
+    position: { stage: "trigger", index: 0, reactivationCount: 0 },
+    dialog: {
+      cursor: { user: 1, self: 0 },
+      lastTurns: [{ role: "user", message: "start" }],
+    },
+    arcRefs: ["arc:s:A"],
+  };
+  await store.appendStep(RUN, start);
   await store.appendStep(RUN, triggerBriefStep(1));
   await store.appendStep(RUN, actionBriefStep(1));
   await store.appendStep(RUN, actionBriefStep(2));
 
   const steps = await store.listSteps(RUN);
+  expect(steps[0]).toEqual(start);
   expect(
     steps.map((step) => `${step.kind}:${positionKey(step.position)}`),
   ).toEqual([
+    "trigger-start:0:trigger:0",
     "trigger-brief:0:trigger:1",
     "action-brief:0:action:1",
     "action-brief:0:action:2",

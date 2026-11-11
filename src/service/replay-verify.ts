@@ -176,7 +176,6 @@ export function alignTriggerReplay(args: {
   reactivationCount: number;
   seedTraversals?: ArcTraversalSet;
   hostModules?: HostModuleState;
-  arcRefs?: readonly ArcRef[];
 }): TriggerReplayResult {
   const { triggerRuntime, candidateArcRef } = args;
   const staged = stageReplayIso(args.iso);
@@ -194,18 +193,26 @@ export function alignTriggerReplay(args: {
     index,
     reactivationCount: args.reactivationCount,
   });
-  const first = briefSteps[0];
-  if (!first) throw new Error("Missing recorded trigger episode.");
+  const start = triggerSteps.find((step) => step.kind === "trigger-start");
+  if (!start) throw new Error("Missing recorded trigger start.");
+  if (!briefSteps.length) throw new Error("Missing recorded trigger episode.");
+  const arcRefs = start.arcRefs?.map((ref) => iso.arcs.get(ref) ?? ref);
   const regenerated: TriggerReplayStep[] = [];
-  let position = positionAt(1);
+  let position = positionAt(0);
   let hostModules = structuredClone(args.hostModules ?? { calls: [] });
   try {
-    let dialog = first.dialog;
+    let dialog = start.dialog;
     let generated = triggerRuntime.startTrigger(
       args.seedTraversals ?? [],
       dialog,
-      { arcRefs: args.arcRefs },
+      { arcRefs },
     );
+    regenerated.push({
+      kind: "trigger-start",
+      position,
+      dialog,
+      ...(arcRefs === undefined ? {} : { arcRefs }),
+    });
     hostModules = advanceHostModuleState(
       hostModules,
       generated,
@@ -1077,7 +1084,11 @@ function mapBriefId(id: BriefId, iso: ReplayIso): BriefId {
 // Step filters --------------------------------------------------------------
 
 function isTriggerStep(step: ReplayStep): step is TriggerReplayStep {
-  return step.kind === "trigger-brief" || step.kind === "trigger-report";
+  return (
+    step.kind === "trigger-start" ||
+    step.kind === "trigger-brief" ||
+    step.kind === "trigger-report"
+  );
 }
 
 function isActionStep(step: ReplayStep): step is ActionReplayStep {

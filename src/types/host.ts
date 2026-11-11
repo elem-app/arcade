@@ -189,6 +189,8 @@ export type BeginInput =
       clientId?: string;
       /** How many matchable arcs to activate; defaults to `first`. */
       activationPolicy?: ActivationPolicy;
+      /** Selected trigger roots; omitted selects all registered roots, empty selects none. */
+      arcRefs?: readonly ArcRef[];
       /** Fences unclaimed admission; already claimed activations complete independently. */
       signal?: AbortSignal;
     };

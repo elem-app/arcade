@@ -1,18 +1,9 @@
 import { spawn } from "node:child_process";
-import { chmod, copyFile, readdir, rm } from "node:fs/promises";
+import { chmod, copyFile, rm } from "node:fs/promises";
 
 import { build } from "esbuild";
 
-// Skills are assembled independently and may be shipped prebuilt.
-const outputs = await readdir("dist").catch((error) => {
-  if (error.code === "ENOENT") return [];
-  throw error;
-});
-for (const output of outputs) {
-  if (output !== "skills") {
-    await rm(`dist/${output}`, { recursive: true, force: true });
-  }
-}
+await rm("dist", { recursive: true, force: true });
 
 await run(process.execPath, [
   "node_modules/typescript/bin/tsc",

@@ -40,6 +40,63 @@ import {
 } from "./helpers.js";
 
 describe("Activation handshakes", () => {
+  it.each(["workspace", "active", "deflected"] as const)(
+    "uses captured %s selection when a later admission selects no roots",
+    async (kind) => {
+      const store = new InMemoryArcHostStore();
+      const host = await createTestArcHost({ store });
+      const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+      const projectDialog = projectorFor(dialog);
+      const ref = toArcRef("selected", "Main");
+      try {
+        await host.registerArc(
+          "selected",
+          parse(
+            `"arc"; function Main(){this.trigger=()=>true; ${kind === "deflected" ? "$enter(Wait); function Wait(){this.guard=()=>State.DEFLECTED;}" : '$instruct("work");'} }`,
+          ),
+          {
+            workspaceScope: kind === "workspace" ? "arc" : "run",
+            bundle: {},
+            contextIsolation: "role",
+          },
+        );
+        const input = {
+          principal: ALICE_OWNER,
+          projectDialog,
+          arcRefs: [ref],
+        };
+        const existing =
+          kind === "workspace"
+            ? undefined
+            : expectSoleDriver(await host.begin(input));
+        const before = await collectAsync(store.listStates());
+        const handshake = expectSoleHandshake(await host.begin(input));
+        input.arcRefs.splice(0);
+        expect(await host.begin(input)).toEqual([]);
+        expect(
+          await host.resolveHandshake(
+            handshake.handshakeId,
+            existing
+              ? { runChoice: { action: "join", arcRunId: existing.arcRunId } }
+              : { workspace: "/tmp/selected" },
+            { projectDialog },
+          ),
+        ).toMatchObject({ status: kind === "active" ? "joined" : "ok" });
+        if (kind === "active")
+          expect(await collectAsync(store.listStates())).toEqual(before);
+        if (kind === "deflected" && existing)
+          expect(await host.getRunView(existing.arcRunId)).toMatchObject({
+            reactivationCount: 1,
+          });
+        if (kind === "active" && existing)
+          expect(
+            await host.begin({ arcRunId: existing.arcRunId, projectDialog }),
+          ).toHaveLength(1);
+      } finally {
+        await host.stop();
+      }
+    },
+  );
   it("owns handshake storage through invalid answers consumption release and host stop", async () => {
     const handshakes = new HandshakeStore();
     const host = await createTestArcHost({
@@ -1247,7 +1304,7 @@ function Main() {
     expect(resolved.reason).toContain("is not a candidate");
   });
 
-  it("includes active and deflected candidates after accepting an arc choice", async () => {
+  it("keeps targeted arc-choice rounds scoped through active and deflected run choices", async () => {
     const store = new InMemoryArcHostStore();
     const arcHost = await createTestArcHost({ store });
     await arcHost.registerArc(
@@ -1301,11 +1358,35 @@ function ChoiceB() {
   $instruct("Also matches.");
 }`),
     );
+    await arcHost.registerArc(
+      "unselected",
+      parse(
+        '"arc";function Excluded(){this.trigger=()=>true;$instruct("Excluded");}',
+      ),
+    );
+    const arcRefs = [
+      toArcRef("choice-a", "ChoiceA"),
+      toArcRef("choice-b", "ChoiceB"),
+    ];
     const choiceSteps = await arcHost.begin({
       principal: ALICE_OWNER,
       activationPolicy: "choose",
+      arcRefs,
       projectDialog: projectorFor(activeDialog),
     });
+    expect(
+      choiceSteps.map((step) =>
+        step.kind === "handshake" ? step.arcRef : undefined,
+      ),
+    ).toEqual(arcRefs);
+    arcRefs.splice(0);
+    expect(
+      await arcHost.begin({
+        principal: ALICE_OWNER,
+        arcRefs,
+        projectDialog: projectorFor(activeDialog),
+      }),
+    ).toEqual([]);
     const choiceA = choiceSteps.find(
       (step): step is HandshakeStep =>
         step.kind === "handshake" &&
@@ -1334,6 +1415,13 @@ function ChoiceB() {
         ),
       ),
     ).toEqual(new Set([deflected.arcRunId, activeRunId]));
+    expect(
+      await arcHost.resolveHandshake(
+        accepted.step.handshakeId,
+        { runChoice: { action: "join", arcRunId: activeRunId } },
+        { projectDialog: projectorFor(activeDialog) },
+      ),
+    ).toMatchObject({ status: "joined", arcRunId: activeRunId });
   });
 
   it("declines an arc choice without disturbing its siblings", async () => {

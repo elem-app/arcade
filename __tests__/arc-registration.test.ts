@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { createTestArcHost, moduleHubFor } from "./work-event-fixtures.js";
 
 import { parse } from "@elem-app/arc/parser";
-import { RuntimeRegistrationError, toNodeRef } from "@elem-app/arc/runtime";
+import { RuntimeRegistrationError, toArcRef, toNodeRef } from "@elem-app/arc/runtime";
 import type { Document } from "@elem-app/arc/types";
 import { describe, expect, it, vi } from "vitest";
 import type { ArcRegistrationInput } from "../src/service/arc-host.js";
@@ -45,6 +45,86 @@ import {
 } from "./helpers.js";
 
 describe("Arc registration and discovery", () => {
+  it("targets selected roots while retaining imported documents and empty admission", async () => {
+    const store = new InMemoryArcHostStore();
+    const host = await createTestArcHost({ store });
+    const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+    const ref = toArcRef("@alice/main", "Main");
+    try {
+      await host.registerArcs([
+        {
+          source: "@alice/main",
+          document: parse(
+            '"arc"; import {Helper} from "@bob/helper"; function Main(){ this.trigger = () => true; $enter(Helper); }',
+          ),
+        },
+        {
+          source: "@bob/helper",
+          document: parse(
+            '"arc"; function Helper(){ this.trigger = () => judge("independent helper trigger?"); $instruct("Imported work"); }',
+          ),
+        },
+      ]);
+      const input = {
+        principal: ALICE_OWNER,
+        projectDialog: async () => dialog,
+        activationPolicy: "all" as const,
+      };
+      expect(await host.begin({ ...input, arcRefs: [] })).toEqual([]);
+      const action = expectSoleDriver(
+        await host.begin({ ...input, arcRefs: [ref] }),
+      );
+      expect(await store.getState(arcRunKey(action.arcRunId))).toMatchObject({
+        arcRef: ref,
+        deps: expect.arrayContaining([toArcRef("@bob/helper", "Helper")]),
+      });
+      expect(action.frontier.status).toBe("ready");
+      expect(await host.begin({ ...input, arcRefs: [] })).toEqual([]);
+      expect(
+        await host.begin({
+          arcRunId: action.arcRunId,
+          projectDialog: input.projectDialog,
+        }),
+      ).toHaveLength(1);
+    } finally {
+      await host.stop();
+    }
+  });
+
+  it("captures trigger root selection before awaiting the initial dialog", async () => {
+    const host = await createTestArcHost({ store: new InMemoryArcHostStore() });
+    const entered = deferred();
+    const unblock = deferred();
+    try {
+      await host.registerArc(
+        "selection",
+        parse(
+          '"arc"; function One(){this.trigger=()=>true;$instruct("one");} function Two(){this.trigger=()=>true;$instruct("two");}',
+        ),
+      );
+      const refs = [toArcRef("selection", "One")];
+      const pending = host.begin({
+        principal: ALICE_OWNER,
+        arcRefs: refs,
+        activationPolicy: "all",
+        projectDialog: async () => {
+          entered.resolve();
+          await unblock.promise;
+          return { cursor: { user: 0, self: 0 }, lastTurns: [] };
+        },
+      });
+      await entered.promise;
+      refs.splice(0, 1, toArcRef("selection", "Two"));
+      unblock.resolve();
+      const action = expectSoleDriver(await pending);
+      expect(await host.getRunView(action.arcRunId)).toMatchObject({
+        arcRef: toArcRef("selection", "One"),
+      });
+    } finally {
+      unblock.resolve();
+      await host.stop();
+    }
+  });
   it("owns cached documents manifests and declarations returned by a custom store", async () => {
     const store = new InMemoryArcHostStore();
     const host = await createTestArcHost({ store });
@@ -898,6 +978,364 @@ describe("source registry transactions", () => {
     parse(
       `"arc"; function ${name}() { this.trigger = () => true; $instruct("Work"); }`,
     );
+
+  it.each([undefined, false])(
+    "reg.dry-run previews single-document additions and replacements before committing with dryRun=%s",
+    async (dryRun) => {
+      const store = new InMemoryArcHostStore();
+      const host = await createTestArcHost({ store });
+      const original = document("Original");
+      const replacement = document("Replacement");
+      const documentWrites = vi.spyOn(store, "putArcDocumentRecord");
+      const sourceWrites = vi.spyOn(store, "putArcSource");
+      try {
+        await host.registerArc("single", original, undefined, { dryRun: true });
+        expect(documentWrites).not.toHaveBeenCalled();
+        expect(sourceWrites).not.toHaveBeenCalled();
+        expect(await store.getArcSource("single")).toBeUndefined();
+        await expect(
+          host.nodeInfoForRef(toNodeRef("single", ["Original"])),
+        ).rejects.toThrow();
+
+        await host.registerArc("single", original, undefined, { dryRun });
+        documentWrites.mockClear();
+        sourceWrites.mockClear();
+        await expect(
+          host.registerArc("single", replacement, undefined, { dryRun: true }),
+        ).rejects.toThrow("Arc source already registered");
+        await host.registerArc("single", replacement, undefined, {
+          replace: true,
+          dryRun: true,
+        });
+        const invalid = parse(
+          '"arc"; import { Missing } from "missing"; function Invalid() { $enter(Missing); }',
+        );
+        await expect(
+          host.registerArc("single", invalid, undefined, {
+            replace: true,
+            dryRun: true,
+          }),
+        ).rejects.toBeInstanceOf(RuntimeRegistrationError);
+        expect(documentWrites).not.toHaveBeenCalled();
+        expect(sourceWrites).not.toHaveBeenCalled();
+        expect(await store.getArcSource("single")).toEqual(original);
+        expect(
+          await host.nodeInfoForRef(toNodeRef("single", ["Original"])),
+        ).toMatchObject({ name: "Original" });
+        await expect(
+          host.nodeInfoForRef(toNodeRef("single", ["Replacement"])),
+        ).rejects.toThrow();
+
+        await host.registerArc("single", replacement, undefined, {
+          replace: true,
+          dryRun,
+        });
+        expect(documentWrites).toHaveBeenCalledTimes(1);
+        expect(sourceWrites).toHaveBeenCalledTimes(1);
+        expect(await store.getArcSource("single")).toEqual(replacement);
+        expect(
+          await host.nodeInfoForRef(toNodeRef("single", ["Replacement"])),
+        ).toMatchObject({ name: "Replacement" });
+        await expect(
+          host.nodeInfoForRef(toNodeRef("single", ["Original"])),
+        ).rejects.toThrow();
+      } finally {
+        await host.stop();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "reg.dry-run validates mixed changes without effects before installation with reverse=%s",
+    async (reverse) => {
+      const store = new InMemoryArcHostStore();
+      const { logger, records } = createCapturingLogger();
+      const nowMillis = vi.fn(() => 42);
+      const host = await createTestArcHost({ store, logger, nowMillis });
+      const caller = (dependency: string, description: string) =>
+        parse(`"arc";
+import Time from "host:time";
+import { Op } from "${dependency}";
+function Main() {
+  this.description = "${description}";
+  this.trigger = () => Time.nowMillis() > 0;
+  $enter(Op);
+}`);
+      const operation = parse('"arc"; function Op() {}');
+      const original = caller("b", "Original");
+      const replacement = caller("c", "Replacement");
+      try {
+        await host.registerArcs([
+          { source: "a", document: original },
+          { source: "b", document: operation },
+        ]);
+        const documentWrites = vi.spyOn(store, "putArcDocumentRecord");
+        const sourceWrites = vi.spyOn(store, "putArcSource");
+        const logCount = records.length;
+        const changes: ArcRegistrationInput[] = [
+          { source: "a", document: replacement, replace: true },
+          { source: "b", delete: true },
+          { source: "c", document: operation },
+        ];
+        if (reverse) changes.reverse();
+
+        await host.registerArcs(changes, { dryRun: true });
+        await host.registerArcs([], { dryRun: true });
+        await host.registerArcs(
+          [
+            { source: "a", delete: true },
+            { source: "b", delete: true },
+          ],
+          { dryRun: true },
+        );
+
+        expect(documentWrites).not.toHaveBeenCalled();
+        expect(sourceWrites).not.toHaveBeenCalled();
+        expect(records).toHaveLength(logCount);
+        expect(nowMillis).not.toHaveBeenCalled();
+        expect(await store.getArcSource("a")).toEqual(original);
+        expect(await store.getArcSource("c")).toBeUndefined();
+        expect(
+          await host.nodeInfoForRef(toNodeRef("a", ["Main"])),
+        ).toMatchObject({
+          description: "Original",
+        });
+        expect(await host.nodeInfoForRef(toNodeRef("b", ["Op"]))).toMatchObject(
+          {
+            name: "Op",
+          },
+        );
+        await expect(
+          host.nodeInfoForRef(toNodeRef("c", ["Op"])),
+        ).rejects.toThrow();
+
+        await host.registerArcs(changes, { dryRun: false });
+        expect(documentWrites).toHaveBeenCalledTimes(2);
+        expect(sourceWrites).toHaveBeenCalledTimes(2);
+        expect(await store.getArcSource("a")).toEqual(replacement);
+        expect(
+          await host.nodeInfoForRef(toNodeRef("a", ["Main"])),
+        ).toMatchObject({
+          description: "Replacement",
+        });
+        expect(await host.nodeInfoForRef(toNodeRef("c", ["Op"]))).toMatchObject(
+          {
+            name: "Op",
+          },
+        );
+        await expect(
+          host.nodeInfoForRef(toNodeRef("b", ["Op"])),
+        ).rejects.toThrow();
+      } finally {
+        await host.stop();
+      }
+    },
+  );
+
+  const invalidDryRuns: {
+    name: string;
+    registrations: ArcRegistrationInput[];
+  }[] = [
+    {
+      name: "empty document",
+      registrations: [
+        { source: "candidate", document: { ...document("Empty"), roots: [] } },
+      ],
+    },
+    {
+      name: "duplicate source",
+      registrations: [
+        { source: "a", delete: true },
+        { source: "a", document: document("New"), replace: true },
+      ],
+    },
+    {
+      name: "existing source without replace",
+      registrations: [{ source: "b", document: document("New") }],
+    },
+    {
+      name: "malformed deletion",
+      registrations: [
+        { source: "b", delete: false } as unknown as ArcRegistrationInput,
+      ],
+    },
+    {
+      name: "invalid manifest",
+      registrations: [
+        {
+          source: "candidate",
+          document: document("New"),
+          manifest: {
+            workspaceScope: "invalid",
+            bundle: {},
+            contextIsolation: "role",
+          },
+        } as unknown as ArcRegistrationInput,
+      ],
+    },
+    ...[
+      ["worker role", "{ workerRole: 42 }"],
+      ["tools", "{ tools: [42] }"],
+      ["context isolation", '{ contextIsolation: "invalid" }'],
+    ].map(([name, metadata]) => ({
+      name: `invalid ${name}`,
+      registrations: [
+        {
+          source: "candidate",
+          document: parse(
+            `"arc"; function New() { this.hostParams = ${metadata}; }`,
+          ),
+        },
+      ],
+    })),
+    {
+      name: "missing import",
+      registrations: [
+        {
+          source: "candidate",
+          document: parse(
+            '"arc"; import { Op } from "missing"; function New() { $enter(Op); }',
+          ),
+        },
+      ],
+    },
+    {
+      name: "incompatible imported channel",
+      registrations: [
+        {
+          source: "candidate",
+          document: parse(
+            '"arc"; import { Op } from "b"; function New() { let value = Bool(); $enter(Op, { args: { value } }); }',
+          ),
+        },
+      ],
+    },
+    {
+      name: "deletion of an imported source",
+      registrations: [{ source: "b", delete: true }],
+    },
+    {
+      name: "undeclared host module",
+      registrations: [
+        {
+          source: "candidate",
+          document: parse(
+            '"arc"; import Missing from "host:missing"; function New() { this.trigger = () => Missing.value(); }',
+          ),
+        },
+      ],
+    },
+    {
+      name: "missing host dispatcher",
+      registrations: [
+        {
+          source: "candidate",
+          document: parse(
+            '"arc"; import Fixture from "host:fixture"; function New() { this.effects = () => Fixture.$record(true); }',
+          ),
+        },
+      ],
+    },
+  ];
+
+  it.each(invalidDryRuns)(
+    "reg.dry-run preserves normal validation errors and state for $name",
+    async ({ registrations }) => {
+      const store = new InMemoryArcHostStore();
+      const host = await createTestArcHost({ store });
+      try {
+        await host.registerHostModule("fixture", {
+          declaration: HOST_MODULE_DECLARATIONS.booleanValueAndRecordEffect,
+        });
+        await host.registerArcs([
+          {
+            source: "a",
+            document: parse(
+              '"arc"; import { Op } from "b"; function Main() { let value = Str(); $enter(Op, { args: { value } }); }',
+            ),
+          },
+          {
+            source: "b",
+            document: parse('"arc"; function Op(args = { value: Str() }) {}'),
+          },
+        ]);
+        const documentWrites = vi.spyOn(store, "putArcDocumentRecord");
+        const sourceWrites = vi.spyOn(store, "putArcSource");
+        const dryError = await host
+          .registerArcs(registrations, { dryRun: true })
+          .catch((error: unknown) => error);
+        const normalError = await host
+          .registerArcs(registrations)
+          .catch((error: unknown) => error);
+        expect(dryError).toBeInstanceOf(Error);
+        expect(normalError).toBeInstanceOf(Error);
+        if (!(dryError instanceof Error) || !(normalError instanceof Error)) {
+          throw new Error(
+            "Both registration modes must reject the invalid batch.",
+          );
+        }
+        expect(dryError.constructor).toBe(normalError.constructor);
+        expect(dryError.message).toBe(normalError.message);
+        if (dryError instanceof RuntimeRegistrationError) {
+          expect(normalError).toMatchObject({ issues: dryError.issues });
+        }
+        expect(documentWrites).not.toHaveBeenCalled();
+        expect(sourceWrites).not.toHaveBeenCalled();
+        expect(
+          await host.nodeInfoForRef(toNodeRef("a", ["Main"])),
+        ).toMatchObject({ name: "Main" });
+        expect(await host.nodeInfoForRef(toNodeRef("b", ["Op"]))).toMatchObject(
+          { name: "Op" },
+        );
+        expect(await store.getArcSource("candidate")).toBeUndefined();
+        await host.registerArc("after", document("After"));
+      } finally {
+        await host.stop();
+      }
+    },
+  );
+
+  it("reg.dry-run validates the registry committed by preceding queued registrations", async () => {
+    const store = new InMemoryArcHostStore();
+    const host = await createTestArcHost({ store });
+    const entered = deferred();
+    const release = deferred();
+    const put = store.putArcDocumentRecord.bind(store);
+    vi.spyOn(store, "putArcDocumentRecord").mockImplementation(
+      async (record) => {
+        entered.resolve();
+        await release.promise;
+        await put(record);
+      },
+    );
+    try {
+      const registration = host.registerArc("base", document("Base"));
+      await entered.promise;
+      const changes: ArcRegistrationInput[] = [
+        {
+          source: "dependent",
+          document: parse(
+            '"arc"; import { Base } from "base"; function Main() { $enter(Base); }',
+          ),
+        },
+      ];
+      const preview = host.registerArcs(changes, { dryRun: true });
+      release.resolve();
+      await Promise.all([registration, preview]);
+      expect(store.putArcDocumentRecord).toHaveBeenCalledTimes(1);
+      expect(await store.getArcSource("dependent")).toBeUndefined();
+      await expect(
+        host.nodeInfoForRef(toNodeRef("dependent", ["Main"])),
+      ).rejects.toThrow();
+      await host.registerArcs(changes);
+      expect(
+        await host.nodeInfoForRef(toNodeRef("dependent", ["Main"])),
+      ).toMatchObject({ name: "Main" });
+    } finally {
+      release.resolve();
+      await host.stop();
+    }
+  });
 
   it("deletes every source root and permits a fresh registration", async () => {
     const store = new InMemoryArcHostStore();

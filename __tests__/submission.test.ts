@@ -1,4 +1,5 @@
 import { parse } from "@elem-app/arc/parser";
+import { toArcRef } from "@elem-app/arc/runtime";
 import { describe, expect, it, vi } from "vitest";
 import { createTestArcHost, workEventsFor } from "./work-event-fixtures.js";
 
@@ -71,6 +72,38 @@ async function stageActiveRunChoice(workerHub: WorkerHubService): Promise<{
 }
 
 describe("Inbound submission and messaging", () => {
+  it("captures submission trigger roots before routing and preserves an empty selection", async () => {
+    const host = await makeArcHost();
+    await host.registerArc(
+      "selection",
+      parse(
+        '"arc";function One(){this.trigger=()=>true;}function Two(){this.trigger=()=>true;}',
+      ),
+    );
+    const { workerHub } = makeWorkerHub({ arcHost: host });
+    try {
+      const refs = [toArcRef("selection", "One")];
+      const message = {
+        content: "start",
+        metadata: { principal: ALICE_OWNER, activationPolicy: "all" },
+      };
+      const submitted = workerHub.submitInbound(message, { arcRefs: refs });
+      refs.splice(0, 1, toArcRef("selection", "Two"));
+      const events = await collectAsync(submitted);
+      expect(events).toEqual([expect.objectContaining({ kind: "activated" })]);
+      const activated = events[0];
+      if (activated?.kind !== "activated")
+        throw new Error("Expected selected activation.");
+      expect(await host.getRunView(activated.arcRunId)).toMatchObject({
+        arcRef: toArcRef("selection", "One"),
+      });
+      expect(
+        await collectAsync(workerHub.submitInbound(message, { arcRefs: [] })),
+      ).toEqual([]);
+    } finally {
+      await workerHub.stop();
+    }
+  });
   it("gives a successor handshake a fresh deadline while its sibling expires independently", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const arcHost = await createTestArcHost({

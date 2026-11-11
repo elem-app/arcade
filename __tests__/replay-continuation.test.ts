@@ -343,6 +343,26 @@ it("replay.verify rejects malformed selected history before candidate divergence
     await expect(
       host.verifyReplay(pending.arcRunId, "arc:candidate:Main"),
     ).rejects.toThrow("Missing replay output or checkpoint");
+    vi.restoreAllMocks();
+    const steps = await replay.listSteps(pending.arcRunId);
+    const start = steps[0];
+    if (start?.kind !== "trigger-start")
+      throw new Error("Expected trigger start.");
+    const readSteps = vi.spyOn(replay, "listSteps");
+    for (const malformed of [
+      steps.slice(1),
+      [
+        { ...start, position: { ...start.position, index: 1 } },
+        ...steps.slice(1),
+      ],
+      [start, ...steps],
+      [...steps.slice(1), start],
+    ]) {
+      readSteps.mockResolvedValue(malformed);
+      await expect(
+        host.verifyReplay(pending.arcRunId, "arc:candidate:Main"),
+      ).rejects.toThrow(/replay trigger/);
+    }
   } finally {
     await host.stop();
     vi.restoreAllMocks();
@@ -447,6 +467,22 @@ it.each([
         { projectDialog: projectorFor(secondDialog) },
       );
       expect(reentry.status).toBe("ok");
+      const starts = (await replay.listSteps(first.arcRunId)).filter(
+        (step) => step.kind === "trigger-start",
+      );
+      expect(starts).toEqual([
+        {
+          kind: "trigger-start",
+          position: { stage: "trigger", index: 0, reactivationCount: 0 },
+          dialog,
+        },
+        {
+          kind: "trigger-start",
+          position: { stage: "trigger", index: 0, reactivationCount: 1 },
+          dialog: secondDialog,
+          arcRefs: ["arc:source:Main"],
+        },
+      ]);
       await host.registerArc(
         "source",
         arc(
@@ -474,6 +510,11 @@ it.each([
           (step) => step.position.reactivationCount <= count,
         ),
       ).toBe(true);
+      expect(
+        result.regenerated.triggerSteps.filter(
+          (step) => step.kind === "trigger-start",
+        ),
+      ).toEqual(starts.slice(0, count + 1));
       if (edit === "later-trigger") {
         expect(handoffCheckpoint(result.regenerated).traversals).toEqual(
           firstBoundary.traversals,

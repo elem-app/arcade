@@ -82,4 +82,3 @@ Custom backend implementations import their contracts from `arcade`. Application
 - [Host module implementation](./docs/host-modules/README.md)
 - [Audience host module](./docs/host-modules/audience.md)
 - [Time host module](./docs/host-modules/time.md)
-- [Skills](./docs/skills.md)

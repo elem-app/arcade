@@ -88,29 +88,37 @@ export class RecordingRuntime {
     this.#reactivationCount = opts.reactivationCount;
   }
 
-  /** Begin a trigger probe; records (buffers) the first trigger brief. */
+  /** Begin a trigger probe; buffers its start inputs and first brief. */
   async startTrigger(
     traversals: ArcTraversalSet,
     dialog: Dialog,
     opts: { arcRefs?: readonly ArcRef[] } = {},
   ): Promise<TriggerBrief> {
     const brief = this.#runtime.startTrigger(traversals, dialog, opts);
-    {
-      this.#triggerIndex += 1;
-      const position: TriggerReplayPosition = {
+    this.#triggerBuffer.push({
+      kind: "trigger-start",
+      position: {
         stage: "trigger",
-        index: this.#triggerIndex,
+        index: 0,
         reactivationCount: this.#reactivationCount,
-      };
-      this.#triggerBriefPosition.set(brief, position);
-      this.#triggerBuffer.push({
-        kind: "trigger-brief",
-        position,
-        dialog,
-        brief: stripBrief(brief),
-        hostModules: structuredClone(this.#hostModules),
-      });
-    }
+      },
+      dialog,
+      ...(opts.arcRefs === undefined ? {} : { arcRefs: [...opts.arcRefs] }),
+    });
+    this.#triggerIndex += 1;
+    const position: TriggerReplayPosition = {
+      stage: "trigger",
+      index: this.#triggerIndex,
+      reactivationCount: this.#reactivationCount,
+    };
+    this.#triggerBriefPosition.set(brief, position);
+    this.#triggerBuffer.push({
+      kind: "trigger-brief",
+      position,
+      dialog,
+      brief: stripBrief(brief),
+      hostModules: structuredClone(this.#hostModules),
+    });
     return brief;
   }
 

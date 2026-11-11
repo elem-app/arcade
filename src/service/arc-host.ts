@@ -405,6 +405,7 @@ export type ArcHostServiceOptions = {
 
 type ActivationRequest = {
   signal?: AbortSignal;
+  arcRefs?: readonly ArcRef[];
   /** Connector-tagged client id recorded on staged handshakes. */
   clientId?: string;
   /** Opaque connector-supplied principal for this activation request. */
@@ -1077,28 +1078,38 @@ export class ArcHostService {
    * `source` must match the source name used by imports and persisted Arc
    * refs. Registration adds the document to the latest in-process runtime,
    * stores the latest source for diagnostics, and stores an immutable document
-   * record that future activation snapshots can reference.
+   * record that future activation snapshots can reference. A dry run validates
+   * the change without persisting or changing the live registry.
    */
   async registerArc(
     source: string,
     document: Document,
     manifest: ArcManifest = DEFAULT_ARC_MANIFEST,
-    opts: { workspacePath?: string; replace?: boolean } = {},
+    opts: { workspacePath?: string; replace?: boolean; dryRun?: boolean } = {},
   ): Promise<void> {
-    return this.registerArcs([{ source, document, manifest, ...opts }]);
+    const { dryRun, ...registrationOptions } = opts;
+    return this.registerArcs(
+      [{ source, document, manifest, ...registrationOptions }],
+      { dryRun },
+    );
   }
 
-  /** Validate and commit a complete Arc document update as one registry batch. */
+  /**
+   * Validate and commit a complete Arc document update as one registry batch.
+   * A dry run validates without persisting or changing the live registry.
+   */
   async registerArcs(
     registrations: readonly ArcRegistrationInput[],
+    { dryRun = false }: { dryRun?: boolean } = {},
   ): Promise<void> {
     return this.#registryMutations.run("registry", () =>
-      this.#registerArcs(registrations),
+      this.#registerArcs(registrations, dryRun),
     );
   }
 
   async #registerArcs(
     registrations: readonly ArcRegistrationInput[],
+    dryRun: boolean,
   ): Promise<void> {
     if (registrations.length === 0) return;
     const batchSources = new Set<string>();
@@ -1162,6 +1173,7 @@ export class ArcHostService {
     }
     const nextRuntime = this.#buildRuntime(latestDocuments);
     assertHostDispatcherContracts(latestDocuments, this.#hostModules);
+    if (dryRun) return;
 
     const at = new Date().toISOString();
     const commits = prepared.map((registration) => ({
@@ -1632,10 +1644,16 @@ export class ArcHostService {
     input: Extract<BeginInput, { arcRunId?: undefined }>,
   ): Promise<ArcHostStep[]> {
     if (input.signal?.aborted || this.#stopped) return [];
+    const request = activationRequestFrom(input);
+    const runtime = this.#latestRuntime;
+    const origin: Extract<TriggerProbeOrigin, { kind: "fresh" }> = {
+      kind: "fresh",
+      recordIds: new Map(this.#latestDocumentRecordIds),
+      arcs: new Map(this.#arcs),
+    };
+    runtime.init();
     const dialog = await input.projectDialog({ roleId: DEFAULT_WORKER_ROLE });
     if (input.signal?.aborted || this.#stopped) return [];
-    this.#latestRuntime.init();
-    const request = activationRequestFrom(input);
     const batchId = `activation-batch:${randomUUID()}`;
     const batch: ActivationBatch = {
       id: batchId,
@@ -1650,16 +1668,7 @@ export class ArcHostService {
     try {
       const steps: ArcHostStep[] = [];
       steps.push(
-        ...(await this.#startActivationProbe(
-          batch,
-          {
-            kind: "fresh",
-            recordIds: new Map(this.#latestDocumentRecordIds),
-            arcs: new Map(this.#arcs),
-          },
-          this.#latestRuntime,
-          [],
-        )),
+        ...(await this.#startActivationProbe(batch, origin, runtime, [])),
       );
       const deflectedStates: ArcRunState[] = [];
       if (request.signal?.aborted) throw new AdmissionCancelled();
@@ -1667,7 +1676,9 @@ export class ArcHostService {
         if (request.signal?.aborted) throw new AdmissionCancelled();
         if (
           state.ownerPrincipal !== request.principal ||
-          state.lifecycle !== "deflected"
+          state.lifecycle !== "deflected" ||
+          (request.arcRefs !== undefined &&
+            !request.arcRefs.includes(state.arcRef))
         ) {
           continue;
         }
@@ -1750,7 +1761,9 @@ export class ArcHostService {
           {
             traversals,
             arcRefs:
-              origin.kind === "deflected" ? [origin.state.arcRef] : undefined,
+              origin.kind === "deflected"
+                ? [origin.state.arcRef]
+                : batch.request.arcRefs,
             snapshotId:
               origin.kind === "deflected" ? origin.state.snapshotId : undefined,
             recordIds: origin.kind === "fresh" ? origin.recordIds : undefined,
@@ -3728,7 +3741,6 @@ export class ArcHostService {
         reactivationCount,
         seedTraversals,
         hostModules,
-        arcRefs: reactivationCount === 0 ? undefined : [candidateArcRef],
       });
       if (trigger.status === "incompatible") {
         if (!regenerated) return trigger;
@@ -5100,6 +5112,7 @@ function activationRequestFrom(
 ): ActivationRequest {
   return {
     signal: input.signal,
+    arcRefs: input.arcRefs === undefined ? undefined : [...input.arcRefs],
     clientId: input.clientId,
     principal: input.principal,
     activationPolicy: input.activationPolicy ?? "first",
