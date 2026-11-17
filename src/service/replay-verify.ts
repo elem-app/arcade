@@ -174,6 +174,8 @@ export function alignTriggerReplay(args: {
   candidateArcRef: ArcRef;
   iso: ReplayIso;
   reactivationCount: number;
+  /** Recorded participants when the first trigger start has no explicit selection. */
+  participatingRoots?: readonly ArcRef[];
   seedTraversals?: ArcTraversalSet;
   hostModules?: HostModuleState;
 }): TriggerReplayResult {
@@ -196,7 +198,12 @@ export function alignTriggerReplay(args: {
   const start = triggerSteps.find((step) => step.kind === "trigger-start");
   if (!start) throw new Error("Missing recorded trigger start.");
   if (!briefSteps.length) throw new Error("Missing recorded trigger episode.");
-  const arcRefs = start.arcRefs?.map((ref) => iso.arcs.get(ref) ?? ref);
+  const candidateRef = (ref: ArcRef) => iso.arcs.get(ref) ?? ref;
+  const arcRefs = start.arcRefs
+    ? start.arcRefs.map(candidateRef)
+    : args.participatingRoots
+        ?.map(candidateRef)
+        .filter((ref) => triggerRuntime.has(ref));
   const regenerated: TriggerReplayStep[] = [];
   let position = positionAt(0);
   let hostModules = structuredClone(args.hostModules ?? { calls: [] });
@@ -211,7 +218,7 @@ export function alignTriggerReplay(args: {
       kind: "trigger-start",
       position,
       dialog,
-      ...(arcRefs === undefined ? {} : { arcRefs }),
+      ...(start.arcRefs === undefined ? {} : { arcRefs }),
     });
     hostModules = advanceHostModuleState(
       hostModules,

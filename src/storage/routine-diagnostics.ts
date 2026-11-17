@@ -1,4 +1,4 @@
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import type { RoutineDiagnostics } from "../types/routine.js";
@@ -11,6 +11,13 @@ export class FileRoutineDiagnosticsStore implements RoutineDiagnosticsStore {
   constructor(root: string) {
     this.id = `file:${root}`;
     this.#root = root;
+  }
+
+  async deleteRunData(arcRunId: string): Promise<void> {
+    const segment = routinePathSegment(arcRunId);
+    if (segment === "." || segment === "..")
+      throw new Error("Invalid diagnostic directory for run.");
+    await rm(join(this.#root, segment), { recursive: true, force: true });
   }
 
   forRoutine(

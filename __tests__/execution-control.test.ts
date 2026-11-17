@@ -1846,6 +1846,10 @@ describe("Host and hub parks and rebuilds", () => {
         status: "hub-restarted",
         updatedAt: expect.any(String),
       });
+      await expect(workerHub.removeRun(arcRunId)).resolves.toEqual({
+        outcome: "removed",
+        arcRunId,
+      });
     } finally {
       release();
     }
@@ -1890,6 +1894,10 @@ describe("Host and hub parks and rebuilds", () => {
     await expect(
       restarted.workerHub.getExecutionControlView(arcRunId),
     ).resolves.toMatchObject({ status: "hub-restarted" });
+    await expect(workerHub.removeRun(arcRunId)).resolves.toEqual({
+      outcome: "removed",
+      arcRunId,
+    });
   });
 
   it("exec.resume rebuilds a run left running at a restart and skips its stale routine", async () => {

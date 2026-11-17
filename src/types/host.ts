@@ -53,8 +53,16 @@ export type ArcDocumentSnapshot = {
   createdAt: string;
 };
 
+/** Parsed source definitions and host declarations captured together for runtime construction. */
+export type ResolvedDocumentSnapshot = {
+  documents: readonly Pick<ArcDocumentRecord, "source" | "document">[];
+  hostModules: ReadonlyMap<string, HostModuleSpec>;
+};
+
 /** Durable Arc run state owned by `ArcHostService`. */
 export type ArcRunState = {
+  /** Freezing commits this run to removal. Its durable data remains until cleanup finishes. */
+  frozen?: true;
   /** Canonical submissions and admitted outcomes retained with traversal state. */
   hostModules: HostModuleState;
   /** Arc run this traversal state belongs to. */
@@ -99,6 +107,9 @@ export type ArcRunView = { arcRunId: ArcRunId; ownerPrincipal: string } & (
   | { stage: "preparing"; arcRef: ArcRef; workspacePath?: string }
   | {
       stage: "actioning";
+      /** Process-local identity of the live action session, when present. */
+      generation?: string;
+      frozen?: true;
       arcRef: ArcRef;
       workspacePath: string;
       lifecycle: ArcRunLifecycle;
@@ -108,6 +119,24 @@ export type ArcRunView = { arcRunId: ArcRunId; ownerPrincipal: string } & (
       artifactCount: number;
     }
 );
+
+/** Omit frozen runs by default, select only frozen runs with true, or include both with "all". */
+export type RunViewFilter = {
+  ownerPrincipal?: string;
+  frozen?: boolean | "all";
+};
+
+/** A conditional freeze can observe host progress since the driver's eligibility check. */
+export type FreezeRunResult = {
+  outcome: "frozen" | "missing" | "changed";
+  arcRunId: ArcRunId;
+};
+
+/** A completed removal attempt identifies the requested run. */
+export type RemoveRunResult = {
+  outcome: "removed" | "missing" | "in-use";
+  arcRunId: ArcRunId;
+};
 
 /** Structured outcome from Arc host begin/advance methods. */
 export type RunFrontier = {
@@ -273,6 +302,8 @@ export type ArcHostStep =
     }
   | {
       kind: "action";
+      /** Aborted when the execution that produced this step is released. */
+      signal: AbortSignal;
       arcRunId: ArcRunId;
       frontier: RunFrontier;
       reactivationCount: number;

@@ -390,6 +390,11 @@ function Ready() {
         workerHub.getExecutionControlView(arcRunId),
       ).resolves.toMatchObject({ arcRunId, status: park });
 
+      await expect(workerHub.removeRun(arcRunId)).resolves.toEqual({
+        outcome: "missing",
+        arcRunId,
+      });
+
       // Fire the backoff: the trigger re-runs, settles, and fans out to the worker.
       scheduled[0]!.callback();
       await waitFor(() => worker.mock.calls.length === 1);

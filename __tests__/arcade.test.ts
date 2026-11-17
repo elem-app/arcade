@@ -29,7 +29,7 @@ import { submitActivation } from "./worker-hub-helpers.js";
 
 describe("Arcade and internal App lifecycle", () => {
   it.each([
-    "run-list",
+    "run-view",
     "control-read",
     "append-held",
     "append-rejected",
@@ -68,19 +68,15 @@ describe("Arcade and internal App lifecycle", () => {
       });
       if (step?.kind !== "action") throw new Error("Expected active seed");
       await seed.stop();
-      if (boundary === "run-list") {
-        const list = ArcHostService.prototype.listRunViews;
-        vi.spyOn(
-          ArcHostService.prototype,
-          "listRunViews",
-        ).mockImplementationOnce(async function (
-          this: ArcHostService,
-          ...args
-        ) {
-          entered.resolve();
-          await release.promise;
-          return list.apply(this, args);
-        });
+      if (boundary === "run-view") {
+        const get = ArcHostService.prototype.getRunView;
+        vi.spyOn(ArcHostService.prototype, "getRunView").mockImplementationOnce(
+          async function (this: ArcHostService, ...args) {
+            entered.resolve();
+            await release.promise;
+            return get.apply(this, args);
+          },
+        );
       } else if (boundary === "control-read") {
         const get = startup.workerHubStore.getExecutionControl.bind(
           startup.workerHubStore,

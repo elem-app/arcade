@@ -1,3 +1,6 @@
+import { mkdtemp, open, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { DEFAULT_WORKER_ROLE } from "../src/constants.js";
@@ -6,7 +9,9 @@ import {
   projectDialog,
   projectInboundDialog,
 } from "../src/service/dialog-projection.js";
+import type { HistoryCursor } from "../src/storage/base.js";
 import { InMemoryHistoryStore } from "../src/storage/in-memory.js";
+import { JsonFileHistoryStore } from "../src/storage/json-file.js";
 import type { HistoryEntry } from "../src/types/messaging.js";
 
 const NOW = "2026-05-21T00:00:00.000Z";
@@ -229,6 +234,20 @@ describe("projectDialog", () => {
 });
 
 describe("InMemoryHistoryStore", () => {
+  it("resumes in-memory history through its captured end after later appends", async () => {
+    const store = new InMemoryHistoryStore();
+    const run = "arc-run:memory";
+    expect(await store.endCursor(run)).toEqual({ turn: 0 });
+    await store.appendEntry(run, entry({ content: "one" }));
+    const start = await store.endCursor(run);
+    await store.appendEntry(run, entry({ content: "two" }));
+    const end = await store.endCursor(run);
+    await store.appendEntry(run, entry({ content: "later" }));
+    const rows = [];
+    for await (const row of store.readEntries(run, start, end)) rows.push(row);
+    expect(rows).toEqual([{ entry: entry({ content: "two" }) }]);
+  });
+
   it("returns entries in append order per Arc run", async () => {
     const store = new InMemoryHistoryStore();
     await store.appendEntry("arc-run:r1", entry({ content: "one" }));
@@ -242,6 +261,54 @@ describe("InMemoryHistoryStore", () => {
       (await store.listEntries("arc-run:r2")).map((e) => e.content),
     ).toEqual(["other"]);
   });
+});
+
+it("seeks directly to saved file history cursors across formats after reopening", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "arcade-history-"));
+  try {
+    const run = "arc-run:file";
+    const store = new JsonFileHistoryStore({ dir });
+    expect(await store.endCursor(run)).toEqual({ byteOffset: 0 });
+    const prefix = entry({ content: "prefix" });
+    await store.appendEntry(run, prefix);
+    const start = await store.endCursor(run);
+    const middle = entry({ content: '🙂"\n'.repeat(6000) });
+    const prefixBytes = Buffer.byteLength(JSON.stringify(prefix) + "\n");
+    const endBytes =
+      prefixBytes + Buffer.byteLength(JSON.stringify(middle) + "\n");
+    const append = store.appendEntry(run, middle);
+    const end = await store.endCursor(run);
+    await append;
+    await store.appendEntry(run, entry({ content: "tail" }));
+    // Unreadable records outside the captured range must not be parsed.
+    const [name] = await readdir(dir);
+    const file = await open(join(dir, name!), "r+");
+    try {
+      await file.write(Buffer.from("!"), 0, 1, 0);
+      await file.write(Buffer.from("!"), 0, 1, endBytes);
+    } finally {
+      await file.close();
+    }
+    const reopened = new JsonFileHistoryStore({ dir });
+    const read = async (from: HistoryCursor | null, until: HistoryCursor) => {
+      const rows = [];
+      for await (const row of reopened.readEntries(run, from, until))
+        rows.push(row);
+      return rows;
+    };
+    expect(await read(start, end)).toEqual([{ entry: middle }]);
+    expect(await read(prefixBytes, end)).toEqual([{ entry: middle }]);
+    expect(await read(start, endBytes)).toEqual([{ entry: middle }]);
+    expect(await read(end, end)).toEqual([]);
+    await expect(read({ byteOffset: prefixBytes + 1 }, end)).rejects.toThrow(
+      RangeError,
+    );
+    await expect(read(start, { byteOffset: endBytes - 1 })).rejects.toThrow(
+      RangeError,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 describe("view stamping", () => {

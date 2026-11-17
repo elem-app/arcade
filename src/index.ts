@@ -22,6 +22,8 @@ export type {
   ArtifactPathRenderTarget,
   PromptAudienceReference,
 } from "./service/semantic-text-renderer.js";
+export { formatSimulationReport } from "./service/simulation-comparisons.js";
+export { SimulatorService } from "./service/simulator.js";
 export {
   buildInstructionPrompt,
   buildInstructionSystemPrompt,
@@ -40,6 +42,7 @@ export type {
 } from "./service/task-renderer.js";
 export type {
   ArcHostStore,
+  HistoryCursor,
   HistoryStore,
   ReplayStore,
   RoutineDiagnosticsStore,
@@ -91,7 +94,11 @@ export type {
   ArcRunView,
   BeginInput,
   DialogProjector,
+  FreezeRunResult,
+  RemoveRunResult,
+  ResolvedDocumentSnapshot,
   RunFrontier,
+  RunViewFilter,
 } from "./types/host.js";
 export type {
   RequestPauseResult,
@@ -117,6 +124,7 @@ export type {
   RegeneratedReplay,
   ReplayCheckpoint,
   ReplayHandoffReason,
+  ReplayRecording,
 } from "./types/replay.js";
 export {
   AgentRoutineReportSchema,
@@ -134,6 +142,7 @@ export type {
   RoutineReport,
   RoutineSignal,
 } from "./types/routine.js";
+export type * from "./types/simulation.js";
 export type {
   InstructionTask,
   SemanticTask,

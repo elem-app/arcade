@@ -20,9 +20,9 @@ startArcade(options: StartArcadeOptions): Promise<Arcade>
 
 Starts Arcade with the supplied stores, backends, in-process role workers, and worker slots. The built-in `host:time` module is available automatically. A configured slot naming a backend the caller did not supply fails startup. Startup also prunes orphaned run workspaces.
 
-Returns `ArcHostService`, `DiscoveryService`, and `WorkerHubService`, plus the logger, `stop()`, and `done`. The caller registers Arcs and constructs connectors.
+Returns an `Arcade` instance with `arcade.arcHost` (`ArcHostService`), `arcade.discovery` (`DiscoveryService`), `arcade.workerHub` (`WorkerHubService`), and `arcade.simulator` (`SimulatorService`). It also provides `arcade.logger`, `arcade.stop()`, and `arcade.done`. The caller registers Arcs and constructs connectors.
 
-A startup failure cleans up services already started and rejects with the startup error. Call `stop()` to stop accepting work, cancel ongoing execution, and await worker and host module cleanup. It attempts all cleanup and rejects with one aggregate error if any part failed. `done` resolves once cleanup settles, including when `stop()` rejects.
+A startup failure cleans up services already started and rejects with the startup error. Call `arcade.stop()` to stop accepting work, cancel ongoing execution, and await worker and host module cleanup. It attempts all cleanup and rejects with one aggregate error if any part failed. `arcade.done` resolves once cleanup settles, including when `arcade.stop()` rejects.
 
 ## Arc Registration
 
@@ -32,7 +32,7 @@ Registration makes Arcs available for activation without starting a run.
 
 ### Discovery
 
-#### `discoverArcadeWorkspaces(workingRoots, arcsDir)`
+#### `discovery.discoverArcadeWorkspaces(workingRoots, arcsDir)`
 
 ```ts
 discoverArcadeWorkspaces(
@@ -43,7 +43,7 @@ discoverArcadeWorkspaces(
 
 Returns the supplied absolute working roots that are Arcade workspaces, deduplicated. A working root is a workspace when its relative `arcsDir` exists as a directory. Only the supplied roots are checked; include each nested workspace as a separate working root.
 
-#### `registerArcsFromWorkspace(workspacePath, arcsDir)`
+#### `discovery.registerArcsFromWorkspace(workspacePath, arcsDir)`
 
 ```ts
 registerArcsFromWorkspace(workspacePath: string, arcsDir: string): Promise<number>
@@ -51,7 +51,7 @@ registerArcsFromWorkspace(workspacePath: string, arcsDir: string): Promise<numbe
 
 Registers every Arc bundle under the workspace's `arcsDir` as one batch and returns the bundle count. The workspace path becomes available to arc-scoped workspace policy.
 
-#### `registerArcsFromDirectory(arcsDir)`
+#### `discovery.registerArcsFromDirectory(arcsDir)`
 
 ```ts
 registerArcsFromDirectory(arcsDir: string): Promise<number>
@@ -59,7 +59,7 @@ registerArcsFromDirectory(arcsDir: string): Promise<number>
 
 Registers every Arc bundle in one directory as one batch and returns the bundle count. These Arcs carry no workspace.
 
-#### `upsertArcFromDirectory(arcsDir, source)`
+#### `discovery.upsertArcFromDirectory(arcsDir, source)`
 
 ```ts
 upsertArcFromDirectory(arcsDir: string, source: string): Promise<void>
@@ -69,7 +69,7 @@ Reloads one discovered Arc source and replaces its registered document.
 
 ### Host Registration
 
-#### `registerArcs(registrations, opts?)` and `registerArc(source, document, manifest?, opts?)`
+#### `arcHost.registerArcs(registrations, opts?)` and `arcHost.registerArc(source, document, manifest?, opts?)`
 
 ```ts
 registerArcs(
@@ -102,7 +102,7 @@ The activating root's manifest governs workspace policy, bundle mappings, and co
 
 Registration also validates the document's worker roles, tool selections, and context-isolation declarations, which control how its work is dispatched.
 
-#### `registerHostModule(module, impl)`
+#### `arcHost.registerHostModule(module, impl)`
 
 ```ts
 registerHostModule(module: string, impl: HostModule): Promise<() => Promise<void>>
@@ -110,7 +110,7 @@ registerHostModule(module: string, impl: HostModule): Promise<() => Promise<void
 
 Registers the Arc-visible declaration and host implementation of one `host:*` module and returns an asynchronous unregister function. Await registration before using the module and await the unregister call when removing it. See [host module implementation](./host-modules/README.md) for the module contract.
 
-#### `knownWorkerRoles()`
+#### `arcHost.knownWorkerRoles()`
 
 ```ts
 knownWorkerRoles(): Set<string>
@@ -118,7 +118,7 @@ knownWorkerRoles(): Set<string>
 
 Returns the worker roles referenced by registered Arc documents, including the default worker role.
 
-#### `nodeInfoForRef(ref, arcRunId?)`
+#### `arcHost.nodeInfoForRef(ref, arcRunId?)`
 
 ```ts
 nodeInfoForRef(ref: NodeRef, arcRunId?: ArcRunId): Promise<NodeInfo>
@@ -128,11 +128,11 @@ Returns a node's name and description. Supply a run or probe ID to read its capt
 
 ## Connector Interface
 
-Connectors call `WorkerHubService` for every operation that affects a run: submitting inbound messages, answering asks, resolving handshakes, and pausing or resuming execution. The worker hub delivers outbound messages and work events to handlers the connector registers. Connectors read run state through run views.
+`WorkerHubService` is the main connector entry point for submitting inbound messages, answering asks, resolving handshakes, pausing or resuming execution, and removing runs. It delivers outbound messages and WorkEvents to registered handlers. Connectors can also read run views from the arc host and use the discovery service.
 
 ### Messaging API
 
-#### `submitInbound(message, options?)`
+#### `workerHub.submitInbound(message, options?)`
 
 ```ts
 submitInbound(
@@ -168,7 +168,7 @@ To abandon a submission, abort the supplied signal and consume through stream te
 
 `WorkerHubServiceOptions.submissionQueue` sets the buffer limits, defaulting to 256 events and 1 MiB of UTF-8 JSON. Overflow cancels uncommitted admission and fails the stream. Stream failure discards buffered events; connectors also discard their pending handshake entries.
 
-To follow an admitted activation, retain `(arcRunId, reactivationCount)` from `activated` or `joined` and compare with the same run's actioning view from [`getRunView`](#getrunviewarcrunid). An equal count means its current lifecycle describes that activation. A greater count proves the followed activation deflected, because only deflection permits same-ID reactivation. A missing or preparation view, or a smaller count, is unavailable or inconsistent with the receipt and establishes no activation outcome. This comparison applies to a receipt-established activation, not an arbitrary lower number: successors can start at nonzero counts.
+To follow an admitted activation, retain `(arcRunId, reactivationCount)` from `activated` or `joined` and compare with the same run's actioning view from [`arcHost.getRunView`](#archostgetrunviewarcrunid). An equal count means its current lifecycle describes that activation. A greater count proves the followed activation deflected, because only deflection permits same-ID reactivation. A missing or preparation view, or a smaller count, is unavailable or inconsistent with the receipt and establishes no activation outcome. This comparison applies to a receipt-established activation, not an arbitrary lower number: successors can start at nonzero counts.
 
 Pause, parks, interruption, resume, and reconstruction preserve the count. Completed and poisoned runs cannot reactivate under the same ID. These service results and views let a caller follow an activation without reading or subscribing to WorkEvents. The identity confers no reservation or precondition for a later control action.
 
@@ -176,12 +176,12 @@ Pause, parks, interruption, resume, and reconstruction preserve the count. Compl
 
 A worker asks by emitting an outbound message with cause `question` or by calling the permission effect. The outbound message carries an Arcade-generated `metadata.askId`, which is the answer-routing identity, and is ready to accept an answer when it reaches the registered handlers. A provider-local tool-call ID may appear as `metadata.toolCallId` as correlation evidence.
 
-The connector answers through `submitInbound` with the ask's `askId` and run ID. The first valid answer claims the ask; cancellation before that claim leaves it available. A connector that may hold stale asks, for example after joining a run or after Arcade restarts, reads the asks still live through [`listAsks`](#listasksarcrunid-situation).
+The connector answers through `workerHub.submitInbound` with the ask's `askId` and run ID. The first valid answer claims the ask; cancellation before that claim leaves it available. A connector that may hold stale asks, for example after joining a run or after Arcade restarts, reads the asks still live through [`workerHub.listAsks`](#workerhublistasksarcrunid-situation).
 
 - A question answer appends one role-private history entry under the ask's audience and role before the worker receives it. If that append fails, the submission fails and the connector can retry while the routine remains live.
 - A permission answer carries its verdict in `metadata.decision` as `allow`, `deny`, or `allow_this_run`, optionally with `metadata.updatedInput`, and uses `content` as an optional human-readable message. A missing or unknown decision is rejected and leaves the ask live. Permission answers write no dialog history.
 
-#### `registerOutboundHandler(situation, handler)`
+#### `workerHub.registerOutboundHandler(situation, handler)`
 
 ```ts
 registerOutboundHandler(
@@ -194,7 +194,7 @@ Registers delivery for outbound messages matching one [outbound situation](./arc
 
 A handler's promise settles once the connector has accepted delivery and never waits for an answer. A rejection means delivery failed, and the hub rejects the ask the message carries.
 
-#### `listAsks(arcRunId, situation)`
+#### `workerHub.listAsks(arcRunId, situation)`
 
 ```ts
 listAsks(arcRunId: ArcRunId, situation: OutboundSituation): OutboundMessage[]
@@ -204,7 +204,7 @@ Returns the run's live question and permission asks whose situation matches, und
 
 An ask is registered before its outbound dispatch completes, so a listed ask may still be on its way to the connector's handler. The shared `askId` identifies the repeat.
 
-#### `handshake(id, values, clientId?)`
+#### `workerHub.handshake(id, values, clientId?)`
 
 ```ts
 handshake(
@@ -249,7 +249,7 @@ Execution control pauses, parks, and resumes a run. A run's execution-control st
 
 See [execution control](./arcade.md#execution-control---pause-park-and-resume) for pause boundaries and park retry policy.
 
-#### `getExecutionControlView(arcRunId)`
+#### `workerHub.getExecutionControlView(arcRunId)`
 
 ```ts
 getExecutionControlView(arcRunId: ArcRunId): Promise<ExecutionControlView>
@@ -257,7 +257,7 @@ getExecutionControlView(arcRunId: ArcRunId): Promise<ExecutionControlView>
 
 Returns the run's execution-control status.
 
-#### `requestPause(arcRunId)`
+#### `workerHub.requestPause(arcRunId)`
 
 ```ts
 requestPause(arcRunId: ArcRunId): Promise<RequestPauseResult>
@@ -271,7 +271,7 @@ Requests a cooperative pause. Outcomes:
 - `inactive`: the run is completed, deflected, or poisoned.
 - `missing`: no eligible run is known.
 
-#### `resume(arcRunId)`
+#### `workerHub.resume(arcRunId)`
 
 ```ts
 resume(arcRunId: ArcRunId): Promise<ResumeResult>
@@ -285,11 +285,41 @@ Resumes a paused or parked run. Resume uses the exact continuation when this pro
 - `inactive`: the run is completed, deflected, or poisoned.
 - `missing`: no eligible run is known.
 
+### Run Removal
+
+#### `workerHub.removeRun(arcRunId)`
+
+```ts
+removeRun(arcRunId: ArcRunId): Promise<RemoveRunResult>
+```
+
+Reclaims a paused, parked, or inactive run and its associated data. The connector verifies the caller owns the run using `workerHub.getRunOwnerPrincipal(arcRunId)` before calling. Each result includes the requested `arcRunId`.
+
+- `removed` means Arcade finished reclaiming a paused, parked, or inactive run. Inactive runs include completed, deflected, and poisoned runs.
+- `in-use` means the run is running or still approaching a requested pause boundary. Its work continues. If the owner wants to pause it, use `requestPause` separately and wait for `paused` before retrying.
+- `missing` means the ID is unknown, provisional, or fully reclaimed. This includes a trigger that parked before activation.
+
+The worker hub calls `arcHost.freezeRun`. Once frozen, ordinary run and owner lookup return `undefined`. The hub discards the saved continuation, waits for admitted writes to settle, and reclaims dialog history, routine records, execution control, backend worker state, and routine diagnostics. It then calls `arcHost.removeRun` to delete the replay steps, checkpoints, and frozen run state. WorkEvents remain readable through `workerHub.listWorkEvents`. Workspace files, sibling runs, and existing replay forks are preserved.
+
+Concurrent calls share an attempt. A busy run returns `in-use` to each caller. A failure throws the same error to each caller. After cleanup, one receives `removed` and the others receive `missing`.
+
+##### Retrying failed cleanup
+
+A storage failure throws the original error. The authorized caller can retry `workerHub.removeRun(arcRunId)`. Once the run is frozen, the worker hub also retries cleanup with backoff and recovers pending removals at startup.
+
+After repairing storage, a deployer can list frozen runs through the arc host and ask the worker hub to finish cleanup for each one.
+
+```ts
+for (const run of await arcade.arcHost.listRunViews({ frozen: true })) {
+  await arcade.workerHub.removeRun(run.arcRunId);
+}
+```
+
 ### Work Events API
 
 Work events are durable records of run activity. Connectors use them to render activity without exposing backend transcripts or operator diagnostics, and each connector authorizes access for its own audience. The kinds cover run and routine lifecycle, uncaught interruptions, parks, host-module calls and admitted outcomes, tool activity, question and permission waits, token usage, execution-control transitions, and node entry and exit. See [WorkEvent semantics](./observability.md#workevent).
 
-#### `registerWorkEventHandler(handler)`
+#### `workerHub.registerWorkEventHandler(handler)`
 
 ```ts
 registerWorkEventHandler(handler: WorkEventHandler): () => void
@@ -297,7 +327,7 @@ registerWorkEventHandler(handler: WorkEventHandler): () => void
 
 Notifies the handler after a retained work event is recorded and readable from history, and returns its unregister function. Each handler receives an isolated copy. Its retained deliveries follow append order within each run, independently of storage and other subscribers. Pending or failed callbacks cannot hold operational work; bounded queues may drop observations. Unregistering discards queued deliveries, while an already running callback may finish.
 
-#### `listWorkEvents(arcRunId)`
+#### `workerHub.listWorkEvents(arcRunId)`
 
 ```ts
 listWorkEvents(arcRunId: ArcRunId): Promise<WorkEvent[]>
@@ -309,36 +339,36 @@ Returns one run's work events in append order. Timestamps and generated IDs do n
 
 A run view reports a run's stage and identity. `ArcHostService` serves run views; the worker hub exposes the owner lookup connectors use for authorization.
 
-#### `getRunOwnerPrincipal(arcRunId)`
+#### `workerHub.getRunOwnerPrincipal(arcRunId)`
 
 ```ts
 getRunOwnerPrincipal(arcRunId: ArcRunId): Promise<string | undefined>
 ```
 
-`WorkerHubService` method. Returns the connector-supplied principal that owns the run, or `undefined` if the run is unknown.
+Returns the connector-supplied principal from the live run view. An unknown ID or a run whose removal has committed returns `undefined`.
 
-#### `getRunView(arcRunId)`
+#### `arcHost.getRunView(arcRunId)`
 
 ```ts
 getRunView(arcRunId: ArcRunId): Promise<ArcRunView | undefined>
 ```
 
-`ArcHostService` method. Returns the run's current view, or `undefined` if the run ID is unknown. Every view carries the run ID and owner principal. The stages are:
+Returns the run's current view, or `undefined` if the run ID is unknown. Every view carries the run ID and owner principal. The stages are:
 
 - `triggering`: trigger evaluation is in progress. Includes any known Arc ref and workspace.
 - `handshaking`: activation awaits a handshake answer. Includes the Arc ref and handshake ID.
 - `preparing`: activation is being prepared. Includes the Arc ref and any resolved workspace.
-- `actioning`: execution has started, including completed, deflected, and poisoned runs. Includes the Arc ref, lifecycle, `reactivationCount`, timestamps, workspace, and artifact count. Lifecycle and count come from the same persisted state snapshot.
+- `actioning`: execution has started, including completed, deflected, and poisoned runs. Includes the Arc ref, lifecycle, `reactivationCount`, timestamps, workspace, and artifact count. Lifecycle and count come from the same persisted state snapshot. When the arc host holds a live action session, `generation` identifies it across its frontiers. Reopening the session assigns a new generation to the same run. Frozen runs and runs read from storage with no live session omit this field.
 
 A preparation ID becomes unknown if preparation ends without starting execution under that ID. A failed authoritative read rejects; it does not become a missing view.
 
-#### `listRunViews(ownerPrincipal?)`
+#### `arcHost.listRunViews(filter?)`
 
 ```ts
-listRunViews(ownerPrincipal?: string): Promise<ArcRunView[]>
+listRunViews(filter?: { ownerPrincipal?: string; frozen?: boolean | "all" } | string): Promise<ArcRunView[]>
 ```
 
-`ArcHostService` method. Lists current run views, optionally for one owner. Views in `triggering`, `handshaking`, or `preparing` come first, ordered by run ID. `actioning` views follow, ordered by `updatedAt` descending, then run ID.
+Lists current run views, optionally for one owner. Passing an owner string is equivalent to `{ ownerPrincipal }`. By default, the list includes only unfrozen runs. Use `{ frozen: true }` for frozen durable views, or `{ frozen: "all" }` to include both. A frozen view retains its owner, lifecycle, and timestamps and carries `frozen: true`. The listing captures live session generations when the call begins. Views in `triggering`, `handshaking`, or `preparing` come first, ordered by run ID. `actioning` views follow, ordered by `updatedAt` descending, then run ID.
 
 ## Host Interface
 
@@ -350,7 +380,7 @@ To drive a run:
 2. Handle each step by kind:
    - `trigger`: dispatch the trigger tasks and pass their reports to `advanceTrigger`.
    - `handshake`: present the handshake and pass the answer to `resolveHandshake`.
-   - `action`: dispatch the tasks listed in the run's frontier and pass each result to `advanceAction`.
+   - `action`: check `step.signal.aborted` before dispatching queued work. The signal belongs to the action session that produced the step. Dispatch its frontier tasks while the signal is live and pass each result to `advanceAction`.
    - `rejected`: the match was refused.
 3. Deliver host module outcomes through advancement as they arrive. Host operations can leave a frontier `blocked` with no worker tasks; this frontier remains live while waiting for an outcome. Frontiers expose worker tasks, but no host-call briefs.
 4. Stop the current lap when the frontier reports `canProgress: false`. Read `frontier.status` for its outcome.
@@ -364,7 +394,7 @@ Supply a dialog projector with every `begin` and advancement call. The arc host 
 
 ### Arc Run API
 
-#### `begin(input)`
+#### `arcHost.begin(input)`
 
 ```ts
 begin(input: BeginInput): Promise<ArcHostStep[]>
@@ -380,7 +410,7 @@ Activation input accepts a cancellation `signal` that aborts unclaimed admission
 
 An empty result means the call handed off no execution. If the call returns no step for an execution, or rejects, that execution is closed and its resources released. Previously saved run progress is preserved.
 
-#### `advanceTrigger(arcRunId, input)`
+#### `arcHost.advanceTrigger(arcRunId, input)`
 
 ```ts
 advanceTrigger(
@@ -395,7 +425,7 @@ The call returns another `trigger` step, resulting handshake/action steps, or `[
 
 A failed or deflected report ends only that trigger evaluation; successful siblings can still activate when the last evaluation settles. Keep the submitted report if you need its failure details. Existing deflected runs change only after successful re-entry.
 
-#### `releaseTrigger(arcRunId)`
+#### `arcHost.releaseTrigger(arcRunId)`
 
 ```ts
 releaseTrigger(arcRunId: ArcRunId): Promise<void>
@@ -403,7 +433,7 @@ releaseTrigger(arcRunId: ArcRunId): Promise<void>
 
 Abandons the named run's pending trigger, handshake, or unclaimed activation preparation. Already claimed actions continue independently. Other pending evaluations can still advance their established matches; releasing the last pending evaluation discards unused collected matches. Use a step skip for best-effort continuation.
 
-#### `advanceAction(arcRunId, frontierId, input)`
+#### `arcHost.advanceAction(arcRunId, frontierId, input)`
 
 ```ts
 advanceAction(
@@ -420,7 +450,7 @@ Applies worker feedback or one host module outcome, serialized per run. A skip i
 
 Returns one `action` step for the same run. Its `frontier.transitions` lists the position changes acknowledged during the call, which the worker hub records as node entered and exited work events under the Arc version the run executed. An uncaught interruption can end the lap with `canProgress: false` while the run lifecycle remains `active`; the frontier then carries the interruption's `id` and `reason` in `interruption`.
 
-#### `releaseAction(arcRunId, frontierId)`
+#### `arcHost.releaseAction(arcRunId, frontierId)`
 
 ```ts
 releaseAction(arcRunId: ArcRunId, frontierId: string): Promise<void>
@@ -430,7 +460,7 @@ Releases an action execution after its final result or when a failure prevents c
 
 Use any frontier returned by the execution you want to release; an older execution's frontier cannot release a replacement. Call `begin` before further advancement. It waits for cleanup before opening the new execution.
 
-#### `resolveHandshake(id, values, opts)`
+#### `arcHost.resolveHandshake(id, values, opts)`
 
 ```ts
 resolveHandshake(
@@ -447,7 +477,7 @@ Validates the answer to a staged activation handshake and returns:
 - `missing` when the handshake is unavailable.
 - `invalid` when the answer can be corrected while the handshake remains pending.
 
-#### `getRunWorkspaceContext(arcRunId)`
+#### `arcHost.getRunWorkspaceContext(arcRunId)`
 
 ```ts
 getRunWorkspaceContext(arcRunId: ArcRunId): Promise<{
@@ -461,6 +491,20 @@ Returns the workspace path, resolved workspace bundle, and reactivation count us
 
 The activating root's manifest in the captured snapshot supplies the bundle, including for imported tasks; an ambiguous trigger probe returns an empty bundle. Each result owns its bundle map.
 
+#### `arcHost.freezeRun(arcRunId, expected?)`
+
+Freezes a durable run for removal and retires its host execution. Drivers cannot begin or advance work on a frozen run, the worker hub cannot pause or resume it, and callers cannot join it, reactivate it through deflected re-entry, or use it as a replay source. Freeze persists across restart and hides the run from ordinary lookup.
+
+A driver coordinates eligibility with its own execution control. Pass the observed actioning view to check that its lifecycle, reactivation count, update time, and live session generation still match. Passing `null` retries an ID absent from ordinary lookup while protecting any newly visible run. Omitting the precondition freezes the current durable run.
+
+The result contains `arcRunId` and an `outcome` of `frozen`, `changed`, or `missing`. Repeated calls on a frozen run return `frozen`. A `changed` result leaves the current action live and tells the driver to read the run again and reassess eligibility.
+
+Freeze waits for an in-flight progress write. During host-module submission, a successful freeze commits before aborting the submission. A failed freeze write leaves its acknowledgment eligible to advance the run.
+
+#### `arcHost.removeRun(arcRunId)`
+
+Deletes a frozen run's replay steps and checkpoints, then its durable state. A custom driver finishes its own cleanup before calling this method. Returns `{ outcome, arcRunId }` with `removed` on success, `missing` for an absent run, or `in-use` for an unfrozen run. A storage failure throws and leaves the frozen state available for retry.
+
 ### Replay API
 
 Use replay to inspect where a run would continue under an updated Arc, create a continuation on that Arc, or return to an earlier point under the original Arc. These operations leave the source run unchanged. See [replay, jump, and rewind](./arcade.md#replay-jump-and-rewind) for the model.
@@ -469,7 +513,7 @@ Configure `ArcHostService` with a replay store before recording runs you intend 
 
 An `ActionReplayPosition` identifies an action point by `reactivationCount` and `index`, with `stage: "action"`. Reactivation count zero is the initial activation; each re-entry starts another count. Index zero is the start of that activation or re-entry, before any action work. Later indexes identify recorded action outputs, before any associated report is applied. Use positions from the run's recorded history; an invalid or unavailable position rejects the operation.
 
-#### `verifyReplay(sourceArcRunId, candidateArcRef, opts?)`
+#### `arcHost.verifyReplay(sourceArcRunId, candidateArcRef, opts?)`
 
 ```ts
 verifyReplay(
@@ -488,7 +532,7 @@ Checks the source run's recorded progress against the registered candidate Arc a
 
 Verification creates no run and starts no pending work. Unusable replay history and execution failures reject the promise rather than returning a compatibility result.
 
-#### `jump(sourceArcRunId, candidateArcRef, opts?)`
+#### `arcHost.jump(sourceArcRunId, candidateArcRef, opts?)`
 
 ```ts
 jump(
@@ -504,7 +548,7 @@ The new run continues from the candidate handoff with reused work already comple
 
 The last entry of the successful result's `regenerated.checkpoints` is the installed handoff; its position supplies the successor's initial `reactivationCount`. The new run uses the candidate Arc version checked by this call and has its own replay history. It can be verified, jumped, or rewound again.
 
-#### `rewind(sourceArcRunId, atPosition)`
+#### `arcHost.rewind(sourceArcRunId, atPosition)`
 
 ```ts
 rewind(
@@ -521,7 +565,7 @@ The worker hub turns registered backends into live workers at startup and dispat
 
 ### Backend Registration And Startup
 
-#### `addBackend(name, backend)`
+#### `workerHub.addBackend(name, backend)`
 
 ```ts
 addBackend(name: string, backend: Backend): void
@@ -531,7 +575,7 @@ Registers one trusted backend under a name accepted by `BackendNameSchema`. Regi
 
 Declare the supported slot kinds: default, role, and fast-trigger. An optional synchronous worker-slot schema validates and normalizes backend-specific configuration. Its output must be canonical JSON and preserve the reserved `backend`, `kind`, and `role` fields. Use `createWorkerSlotSchema(...)` to define the schema and `defineBackend(...)` to apply validation to direct factory calls as well as worker startup through the hub. Implement `createWorker(host, slot)` to return a distinct worker for each slot.
 
-#### `start(options?)`
+#### `workerHub.start(options?)`
 
 ```ts
 start(options?: {
@@ -539,7 +583,7 @@ start(options?: {
 }): Promise<void>
 ```
 
-Starts the configured workers. All slots must validate and all workers must start successfully before work can be dispatched. A startup failure cleans up workers already created and rejects with the startup error. Each worker receives a canonical JSON state store scoped to its backend and slot.
+Starts the configured workers and captures existing action generations through `arcHost.listRunViews({ frozen: "all" })` before admitting new work. The worker hub finishes removal of frozen runs and announces eligible restart parks for active runs. A failed cleanup is scheduled for retry while startup continues with the remaining runs. All slots must validate and all workers must start successfully before work can be dispatched. A startup failure cleans up workers already created and rejects with the startup error. Each worker receives a canonical JSON state store scoped to its backend and slot.
 
 Routing sends trigger-stage semantic work to the fast-trigger slot, and other work to the explicit role slot, then an in-process role worker, then the default slot. Work with no available worker is reported as unavailable.
 
@@ -576,3 +620,48 @@ Any report may carry `backendDetails`, a patch over the routine's durable backen
 Agent-authored reports use `AgentRoutineReportSchema`, which admits only completed and failed reports and excludes dispositions, control outcomes, and `backendDetails`.
 
 The package also exports task renderers, stock instruction and semantic prompt builders, structural report validators, and `parseAgentJsonOutput(...)`. Use these helpers to prepare tasks and validate report structure. Completed semantic reports must also supply results for every requested item; unrequested results are ignored.
+
+## Branch Simulation
+
+Use `arcade.simulator` to explore a registered Arc from its trigger. The simulator models external answers, assumes instructions are applied, and supplies host return values without dispatching workers or executing host operations. For an unregistered draft, construct `new SimulatorService({ captureSnapshot })`. The callback returns the parsed documents for the requested roots and their imports in `documents`, with the host module declarations in `hostModules`.
+
+### `simulator.simulate(options)`
+
+```ts
+simulate(options: SimulationOptions): Promise<SimulationResult>
+```
+
+Simulates the Arc identified by `arcRef`, starting at its trigger. Pass a fixed `Dialog` in `dialog` to use the same conversation at every step. To choose the conversation based on earlier answers, pass a callback `(context: SimulationContext) => Dialog`. Its `context.choices` contains the answers already submitted on the current path.
+
+By default, the simulator tries different judgment answers, observation values, and host call results. Each entry in `result.comparisons` describes two paths from the same point in the Arc.
+
+- `decisions` shows which inputs received different answers and the answer on each path.
+- `left.work` and `right.work` list the instructions and host calls that followed on each path, in order. Each instruction has an `instruction` object with its `text`, `mode`, optional `guidance`, and effective `hostParams`.
+- `left.outcome` and `right.outcome` show how each path ended, for example `{ kind: "covered" }` or `{ kind: "deflected" }`.
+
+```ts
+import { formatSimulationReport } from "arcade";
+
+const result = await simulator.simulate({ arcRef, dialog });
+try {
+  console.log(formatSimulationReport(result, "Draft review", 4096));
+} finally {
+  await simulator.release(result.id);
+}
+```
+
+### `simulator.getPath(id)`
+
+```ts
+getPath(id: SimulationPathId): Promise<SimulationPath>
+```
+
+Pass an ID from `result.paths` or either side of a comparison. The path contains the replay recording (`arcRef`, recorded `steps`, and action `checkpoints`), the modeled choices, the stopping outcome, and an ordered JSONL trace in `traceJsonl`. Use `result.unexplored[].prefixId` to inspect where exploration stopped early.
+
+### `simulator.release(id)`
+
+```ts
+release(id: SimulationId): Promise<void>
+```
+
+Pass `result.id` after inspecting its paths. Releasing the simulation frees its retention slot and invalidates all its path IDs.

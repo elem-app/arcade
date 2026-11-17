@@ -10,9 +10,9 @@ import type {
   TriggerBrief,
   TriggerReport,
 } from "@elem-app/arc/runtime";
-import type { HostModuleEffect, HostModuleState } from "./host-module.js";
 
 import type { ArcDocumentSnapshotId, ArcRunId } from "./core.js";
+import type { HostModuleEffect, HostModuleState } from "./host-module.js";
 
 /**
  * Replay records two ordered streams under one Arc run: a trigger stream (work
@@ -29,12 +29,14 @@ export type TriggerReplayPosition = {
   /** Reactivation count assigned to this replay position. */
   reactivationCount: number;
 };
+/** A checkpoint or report position within one action episode. */
 export type ActionReplayPosition = {
   stage: "action";
   index: number;
   /** Reactivation count assigned to this replay position. */
   reactivationCount: number;
 };
+/** A trigger or action position within its reactivation episode. */
 export type ReplayPosition = TriggerReplayPosition | ActionReplayPosition;
 
 /** Stable string key for a replay position, used by stores keyed on position. */
@@ -127,14 +129,17 @@ export type ActionReportStep = {
   moduleEffect?: HostModuleEffect;
 };
 
+/** One recorded trigger start, brief or submitted report. */
 export type TriggerReplayStep =
   | TriggerStartStep
   | TriggerBriefStep
   | TriggerReportStep;
+/** One recorded action brief, terminal brief or submitted report. */
 export type ActionReplayStep =
   | ActionBriefStep
   | ActionReportStep
   | TerminalBriefStep;
+/** A record in execution order from either stage. */
 export type ReplayStep = TriggerReplayStep | ActionReplayStep;
 
 /**
@@ -223,25 +228,25 @@ export type FailedReplay = {
   reason: string;
 };
 
-/**
- * A successful jump: a new run (`arcRunId`) installed at the handoff point.
- * `arcRef`/`deps`/`snapshotId` are the candidate binding it installed, `handoff`
- * is the verdict, `iso` is the source→candidate rename, and `regenerated` is the
- * replay prefix the new run carries forward.
- */
-export type JumpedReplay = {
+/** Source root, ordered trigger and action steps, and their action checkpoints. */
+export type ReplayRecording = {
+  arcRef: ArcRef;
+  steps: readonly ReplayStep[];
+  checkpoints: readonly ReplayCheckpoint[];
+};
+
+/** Candidate binding, pinned snapshot and regenerated history through the action handoff. */
+export type CompatibleReplay = {
   status: "compatible";
-  arcRunId: ArcRunId;
+  handoff: ReplayHandoffReason;
   iso: ReplayIso;
   arcRef: ArcRef;
   deps: readonly ArcRef[];
-  snapshotId: ArcDocumentSnapshotId;
-  handoff: ReplayHandoffReason;
   regenerated: RegeneratedReplay;
+  snapshotId: ArcDocumentSnapshotId;
 };
 
-/**
- * A compatible alignment that has not been jumped: the verify result, holding
- * the candidate binding, handoff verdict, and regenerated prefix a jump installs.
- */
-export type CompatibleReplay = Omit<JumpedReplay, "arcRunId">;
+/** Verified action replay installed as a new Arc run. */
+export type JumpedReplay = CompatibleReplay & {
+  arcRunId: ArcRunId;
+};

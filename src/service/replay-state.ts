@@ -63,7 +63,7 @@ function reconcilePendingCalls(
     if (record.runtimeCallId === undefined) continue;
     const source = hostCallTraversal(traversals, record.call.sourceRef);
     if (
-      record.context.arcRunId !== undefined &&
+      record.enterCount !== undefined &&
       source?.enterCount !== record.enterCount
     ) {
       record.runtimeCallId = undefined;

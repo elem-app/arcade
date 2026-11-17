@@ -1,8 +1,3 @@
-import { mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { moduleHubFor } from "./work-event-fixtures.js";
-
 import { parse } from "@elem-app/arc/parser";
 import { Runtime, toArcRef } from "@elem-app/arc/runtime";
 import type {
@@ -15,6 +10,9 @@ import type {
   SegKey,
 } from "@elem-app/arc/types";
 import { catchSegKey } from "@elem-app/arc/types";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -23,8 +21,6 @@ import {
   createReplayIso,
   traversalsEqualModuloIso,
 } from "../src/service/replay-verify.js";
-import { stripBrief } from "../src/types/replay.js";
-
 import {
   arcRunKey,
   handoffCheckpoint,
@@ -34,6 +30,7 @@ import {
   type ArcRunId,
   type ReplayStep,
 } from "../src/testing.js";
+import { stripBrief } from "../src/types/replay.js";
 import {
   DEFLECTABLE_SOURCE,
   GREET_SOURCE,
@@ -48,6 +45,7 @@ import {
   userDialog,
   type ReplayHost,
 } from "./replay-helpers.js";
+import { moduleHubFor } from "./work-event-fixtures.js";
 
 const GREET_ARC = "arc:greet:Greet" as ArcRef;
 
@@ -126,6 +124,168 @@ async function recordedGreetRun(): Promise<{
 }
 
 describe("exact self-replay (determinism anchor)", () => {
+  it("replays untargeted judgments in evaluation order across an imported participant", async () => {
+    const env = await makeReplayHost();
+    const a = toArcRef("entry", "A");
+    const b = toArcRef("entry", "B");
+    const c = toArcRef("lib", "C");
+    const entry = parse(
+      '"arc"; import { C } from "lib"; function A(){this.trigger=()=>judge("A?");$instruct("A");} function B(){this.trigger=()=>judge("B?");}',
+    );
+    try {
+      await env.host.registerArcs([
+        { source: "entry", document: entry },
+        {
+          source: "lib",
+          document: parse('"arc"; function C(){this.trigger=()=>judge("C?");}'),
+        },
+      ]);
+      const projectDialog = async () => userDialog("start");
+      const [trigger] = await env.host.begin({
+        principal: REPLAY_OWNER,
+        projectDialog,
+      });
+      if (trigger?.kind !== "trigger")
+        throw new Error("Expected trigger judgments.");
+      const judgments = trigger.frontier.briefs.judgments;
+      expect(judgments.map((item) => item.question)).toEqual([
+        "A?",
+        "B?",
+        "C?",
+      ]);
+      const [run] = await env.host.advanceTrigger(trigger.arcRunId, {
+        projectDialog,
+        reports: [
+          {
+            outcome: "completed",
+            semantic: {
+              judgments: Object.fromEntries(
+                judgments.map((j) => [j.id, j.question === "A?"]),
+              ),
+            },
+          },
+        ],
+      });
+      if (run?.kind !== "action") throw new Error("Expected A to activate.");
+      const recorded = (await env.replay.listSteps(run.arcRunId)).find(
+        (s) => s.kind === "trigger-brief",
+      );
+      expect(recorded?.brief.deps).toEqual([a, c, b]);
+      expect(await env.host.verifyReplay(run.arcRunId, a)).toMatchObject({
+        status: "compatible",
+        handoff: "reproduced",
+      });
+      // Republishing the same source puts it after lib in the live registry.
+      await env.host.registerArc("entry", entry, undefined, { replace: true });
+      expect(await env.host.verifyReplay(run.arcRunId, a)).toMatchObject({
+        status: "compatible",
+        handoff: "reproduced",
+      });
+      // B's recorded judgment is required to reproduce this trigger.
+      await env.host.registerArc(
+        "entry",
+        {
+          ...entry,
+          roots: entry.roots.filter((root) => root.identifier !== "B"),
+        },
+        undefined,
+        { replace: true },
+      );
+      expect(await env.host.verifyReplay(run.arcRunId, a)).toMatchObject({
+        status: "incompatible",
+        position: { stage: "trigger", index: 1 },
+      });
+    } finally {
+      await env.host.stop();
+    }
+  });
+  it("reproduces the surviving match after an inferred sibling root is removed", async () => {
+    const env = await makeReplayHost();
+    const a = toArcRef("entry", "A");
+    const b = toArcRef("entry", "B");
+    const rootA = 'function A(){this.trigger=()=>true;$instruct("A");}';
+    try {
+      await env.host.registerArc(
+        "entry",
+        parse(
+          '"arc";' +
+            rootA +
+            'function B(){this.trigger=()=>true;$instruct("B");}',
+        ),
+      );
+      const runs = await env.host.begin({
+        principal: REPLAY_OWNER,
+        activationPolicy: "all",
+        projectDialog: async () => userDialog("start"),
+      });
+      const actions = runs.filter((s) => s.kind === "action");
+      expect(actions.map((s) => s.frontier.arcRef)).toEqual([a, b]);
+      const run = actions.find((s) => s.frontier.arcRef === a)!;
+      await env.host.registerArc("entry", parse('"arc";' + rootA), undefined, {
+        replace: true,
+      });
+      expect(await env.host.verifyReplay(run.arcRunId, a)).toMatchObject({
+        status: "compatible",
+        handoff: "reproduced",
+      });
+    } finally {
+      await env.host.stop();
+    }
+  });
+  it("preserves untargeted root order when different kinds of trigger work converge on judgments", async () => {
+    const env = await makeReplayHost();
+    const projectDialog = async () => userDialog("start");
+    try {
+      await env.host.registerArc(
+        "entry",
+        parse(`"arc";
+        function A() { let ready = Bool(); this.trigger = () => { $observe(ready); return ready && judge("A ready?"); }; $instruct("A"); }
+        function B() { this.trigger = () => judge("B first?") && judge("B ready?"); }`),
+      );
+      const [first] = await env.host.begin({
+        principal: REPLAY_OWNER,
+        projectDialog,
+      });
+      if (first?.kind !== "trigger")
+        throw new Error("Expected an observation and a judgment.");
+      const { observations, judgments } = first.frontier.briefs;
+      const [second] = await env.host.advanceTrigger(first.arcRunId, {
+        projectDialog,
+        reports: [
+          {
+            outcome: "completed",
+            semantic: {
+              observations: {
+                [observations[0]!.id]: { status: "resolved", value: true },
+              },
+              judgments: { [judgments[0]!.id]: true },
+            },
+          },
+        ],
+      });
+      if (second?.kind !== "trigger")
+        throw new Error("Expected the second round of judgments.");
+      const ready = second.frontier.briefs.judgments;
+      expect(ready.map((j) => j.question)).toEqual(["A ready?", "B ready?"]);
+      const [action] = await env.host.advanceTrigger(second.arcRunId, {
+        projectDialog,
+        reports: [
+          {
+            outcome: "completed",
+            semantic: {
+              judgments: { [ready[0]!.id]: true, [ready[1]!.id]: false },
+            },
+          },
+        ],
+      });
+      if (action?.kind !== "action") throw new Error("Expected A to activate.");
+      expect(
+        await env.host.verifyReplay(action.arcRunId, toArcRef("entry", "A")),
+      ).toMatchObject({ status: "compatible", handoff: "reproduced" });
+    } finally {
+      await env.host.stop();
+    }
+  });
   it("replays recorded root selection without widening to sibling roots", async () => {
     const env = await makeReplayHost();
     const ref = toArcRef("targeted", "One");
@@ -190,6 +350,64 @@ describe("exact self-replay (determinism anchor)", () => {
       await env.host.stop();
     }
   });
+  it.each([
+    { scope: "selected", library: "lib" },
+    { scope: "all", library: "lib" },
+    { scope: "selected", library: "new-lib" },
+    { scope: "all", library: "new-lib" },
+  ])(
+    "resolves candidate imports for $scope trigger roots after an import rename to $library",
+    async ({ scope, library }) => {
+      const env = await makeReplayHost();
+      const main = toArcRef("entry", "Main");
+      const entry = (name: string, source: string) =>
+        parse(
+          `"arc"; import { ${name} } from "${source}"; function Main(){this.trigger=()=>true;$instruct("Continue");}`,
+        );
+      const dependency = (name: string) =>
+        parse(`"arc"; function ${name}(){this.trigger=()=>false;}`);
+      try {
+        await env.host.registerArcs([
+          { source: "entry", document: entry("Old", "lib") },
+          { source: "lib", document: dependency("Old") },
+        ]);
+        const [step] = await env.host.begin({
+          principal: REPLAY_OWNER,
+          arcRefs: scope === "selected" ? [main] : undefined,
+          projectDialog: async () => userDialog("start"),
+        });
+        if (step?.kind !== "action")
+          throw new Error("Expected an activated run.");
+        const first = (await env.replay.listSteps(step.arcRunId)).find(
+          (s) => s.kind === "trigger-brief",
+        );
+        expect(first?.brief.deps).toContain(toArcRef("lib", "Old"));
+
+        await env.host.registerArcs([
+          { source: "entry", document: entry("New", library), replace: true },
+          { source: library, document: dependency("New"), replace: true },
+          {
+            source: "later",
+            document: parse(
+              '"arc"; function Later(){this.trigger=()=>judge("Unrelated?");}',
+            ),
+          },
+          ...(library === "lib"
+            ? []
+            : [{ source: "lib", delete: true as const }]),
+        ]);
+        const verified = await env.host.verifyReplay(step.arcRunId, main);
+        expect(verified).toMatchObject({
+          status: "compatible",
+          handoff: "reproduced",
+        });
+        if (verified.status !== "compatible") throw new Error(verified.reason);
+        expect(verified.deps).toContain(toArcRef(library, "New"));
+      } finally {
+        await env.host.stop();
+      }
+    },
+  );
   it("reproduces the recorded run byte-for-byte under identity iso", async () => {
     const { env, runId } = await recordedGreetRun();
     const alignment = await env.host.verifyReplay(runId, GREET_ARC);

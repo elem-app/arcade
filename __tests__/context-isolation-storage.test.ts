@@ -33,6 +33,7 @@ describe("persisted context isolation", () => {
     const store = new JsonFileWorkerHubStore({ dir });
     const routine = {
       id: "routine:test",
+      arcRunId: "arc-run:test",
       task: {
         kind: "instruction",
       },

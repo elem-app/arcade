@@ -10,7 +10,6 @@ import type { ArcadeLogger } from "../logging.js";
 import type { ArcRunId } from "../types/core.js";
 import {
   assertCallPayload,
-  hostCallTraversal,
   type HostCall,
   type HostCallAck,
   type HostCallRecord,
@@ -18,12 +17,17 @@ import {
   type HostModuleContext,
   type HostModuleState,
 } from "../types/host-module.js";
+import { captureCalls } from "./host-call-recording.js";
 
 /** Public call facts staged with the acknowledgment commit. */
 export type HostCallPublication = Pick<
   HostCall,
   "hostCallId" | "module" | "target" | "operation"
 > & { publishedData: PayloadValue | null };
+
+export type WaitForModuleAcknowledgments = (
+  submission: Promise<readonly HostCallAck[]>,
+) => Promise<readonly HostCallAck[]>;
 
 /** Resources and submission identities owned by one concrete host execution. */
 export class ModuleExecution {
@@ -77,34 +81,20 @@ export class ModuleExecution {
     context: HostModuleContext,
     traversals: ArcTraversalSet,
     commit: (publications?: readonly HostCallPublication[]) => Promise<void>,
+    waitForModule?: WaitForModuleAcknowledgments,
   ): Promise<ActionPoisonReason | undefined> {
     this.assertOpen();
-    for (const brief of calls) {
-      const existing = [...state.calls]
-        .reverse()
-        .find((record) => record.runtimeCallId === brief.id);
-      if (
-        existing &&
-        !existing.effects.some(
-          (effect) =>
-            effect.hostCallOutcome.kind === "resolution" ||
-            effect.hostCallOutcome.kind === "failure",
-        )
-      )
-        continue;
-      const { id, ...call } = brief;
-      state.calls.push({
-        call: { ...structuredClone(call), hostCallId: randomUUID() },
-        context: structuredClone(context),
-        runtimeCallId: id,
-        enterCount:
-          context.arcRunId === undefined
-            ? undefined
-            : hostCallTraversal(traversals, call.sourceRef)?.enterCount,
-        acknowledged: false,
-        effects: [],
-      });
-    }
+    state.calls.push(
+      ...captureCalls(
+        this.action ? "action" : "trigger",
+        state,
+        calls,
+        traversals,
+        context,
+        randomUUID,
+        false,
+      ),
+    );
     const batches = new Map<HostModule, HostCallRecord[]>();
     for (const record of state.calls) {
       if (this.#submitted.has(record.call.hostCallId)) continue;
@@ -144,10 +134,13 @@ export class ModuleExecution {
       }));
       let acknowledgments: readonly HostCallAck[];
       try {
-        acknowledgments = await module.submit!(submissions, {
+        const pending = module.submit!(submissions, {
           arcRunId: this.arcRunId,
           signal: this.controller.signal,
         });
+        acknowledgments = await (waitForModule
+          ? waitForModule(pending)
+          : pending);
       } catch (error) {
         this.assertOpen();
         return {

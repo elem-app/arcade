@@ -23,6 +23,7 @@ import {
 } from "../src/testing.js";
 import {
   createCapturingLogger,
+  deferred,
   makeArcHost,
   makeArcHostWithSource,
   WATCH_SOURCE,
@@ -283,6 +284,46 @@ describe("backend registry", () => {
     ).toThrow("while worker hub is starting");
     resolveWorker(completedWorker());
     await startup;
+  });
+
+  it("finishes worker construction and rollback before rejecting a failed startup scan", async () => {
+    const host = await makeArcHost();
+    const hub = await createWorkerHub(host);
+    const factory = deferred<Worker>();
+    const stopping = deferred();
+    const finishStop = deferred();
+    const scanError = new Error("run listing failed");
+    vi.spyOn(host, "listRunViews").mockRejectedValueOnce(scanError);
+    const stop = vi.fn(async () => {
+      stopping.resolve();
+      await finishStop.promise;
+      throw new Error("worker cleanup failed");
+    });
+    hub.addBackend(
+      "slow-agent",
+      backend(["default"], () => factory.promise),
+    );
+    const startup = hub.start({
+      workers: { default: { backend: "slow-agent" } },
+    });
+    const rejected = vi.fn();
+    const finished = startup.catch(rejected);
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(rejected).not.toHaveBeenCalled();
+      factory.resolve({ ...completedWorker(), stop });
+      await stopping.promise;
+      expect(rejected).not.toHaveBeenCalled();
+      finishStop.resolve();
+      await finished;
+      expect(rejected).toHaveBeenCalledWith(scanError);
+    } finally {
+      factory.resolve({ ...completedWorker(), stop });
+      finishStop.resolve();
+      await hub.stop();
+      await host.stop();
+    }
+    expect(stop).toHaveBeenCalledTimes(1);
   });
 
   it("rejects backend registration after worker hub startup", async () => {

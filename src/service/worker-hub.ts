@@ -43,6 +43,7 @@ import type {
   ArcHostStep,
   ArcRunView,
   InstructionCoverage,
+  RemoveRunResult,
   RunFrontier,
 } from "../types/host.js";
 import type {
@@ -170,10 +171,7 @@ type Lifecycle =
   | "failed";
 
 /** Default deferred scheduler: a `setTimeout` that does not keep the process alive. */
-function defaultCapacityRetrySchedule(
-  callback: () => void,
-  delayMs: number,
-): () => void {
+function scheduleRetryTimer(callback: () => void, delayMs: number): () => void {
   const handle = setTimeout(callback, delayMs);
   (handle as { unref?: () => void }).unref?.();
   return () => clearTimeout(handle);
@@ -436,6 +434,12 @@ export class WorkerHubService {
   >();
   readonly #laps = new Map<ArcRunId, LapState>();
   readonly #unusableWorkers = new Set<ResolvedWorker["worker"]>();
+  readonly #runWrites = new Map<ArcRunId, Set<Promise<void>>>();
+  readonly #runRemovals = new Map<ArcRunId, Promise<RemoveRunResult>>();
+  readonly #removalRetries = new Map<
+    ArcRunId,
+    { delayMs: number; cancel: () => void }
+  >();
   readonly #historyStore: HistoryStore;
   readonly #routineStore: WorkerHubStore;
   readonly #workEvents: WorkEventService;
@@ -498,6 +502,9 @@ export class WorkerHubService {
     ArcRunId,
     { id: string; reason: string }
   >();
+  /** Generations already open when this hub took its startup snapshot. */
+  readonly #inheritedGenerations = new Map<ArcRunId, string>();
+  #initialRunViews?: Promise<ArcRunView[]>;
   readonly #runsSinceStart = new Set<ArcRunId>();
 
   /** Create an unstarted worker hub bound only to hub-owned services. */
@@ -510,7 +517,20 @@ export class WorkerHubService {
     this.#logger = opts.logger ?? createArcadeLogger();
     this.#workerRegistry = new WorkerRegistry({
       logger: this.#logger,
-      stateStore: this.#routineStore,
+      stateStore: {
+        getWorkerState: (...args) => this.#routineStore.getWorkerState(...args),
+        putWorkerState: (backend, slot, role, id, key, value) =>
+          this.#writeRunData(id, () =>
+            this.#routineStore.putWorkerState(
+              backend,
+              slot,
+              role,
+              id,
+              key,
+              value,
+            ),
+          ),
+      },
     });
     const capacityRetry = opts.capacityRetry ?? {};
     this.#capacityRetry = {
@@ -518,7 +538,7 @@ export class WorkerHubService {
       maxAttempts: capacityRetry.maxAttempts ?? 6,
       baseDelayMs: capacityRetry.baseDelayMs ?? 1000,
       maxDelayMs: capacityRetry.maxDelayMs ?? 60000,
-      schedule: capacityRetry.schedule ?? defaultCapacityRetrySchedule,
+      schedule: capacityRetry.schedule ?? scheduleRetryTimer,
     };
     this.#submissionQueue = {
       maxEvents: opts.submissionQueue?.maxEvents ?? 256,
@@ -1054,7 +1074,7 @@ export class WorkerHubService {
     this.#workerRegistry.addBackend(name, backend);
   }
 
-  /** Create configured workers, then announce restored restart parks. */
+  /** Create workers, recover committed removals, and announce restored restart parks. */
   start(options: WorkerHubStartOptions = {}): Promise<void> {
     if (this.#lifecycle !== "registering") {
       throw new Error(`Worker hub cannot start while ${this.#lifecycle}.`);
@@ -1068,52 +1088,71 @@ export class WorkerHubService {
       this.#lifecycle = "failed";
       throw error;
     }
+    // The host captures its live generations synchronously, before this hub admits work.
+    const initialRunViews = this.#arcHost
+      .listRunViews({ frozen: "all" })
+      .then((runs) => {
+        if (this.#lifecycle !== "starting" && this.#lifecycle !== "started")
+          return runs;
+        for (const run of runs) {
+          if (
+            run.stage === "actioning" &&
+            run.lifecycle === "active" &&
+            run.generation
+          )
+            this.#inheritedGenerations.set(run.arcRunId, run.generation);
+        }
+        return runs;
+      })
+      .finally(() => {
+        this.#initialRunViews = undefined;
+      });
+    this.#initialRunViews = initialRunViews;
     if (this.#workerRegistry.started) this.#lifecycle = "started";
-    this.#startupPromise = startup.then(
-      () => {
+    this.#startupPromise = Promise.all([startup, initialRunViews])
+      .then(async ([, runs]) => {
         if (this.#lifecycle === "stopping" || this.#lifecycle === "stopped")
           return;
         this.#lifecycle = "started";
-        void this.#announceRestartParks().catch((error: unknown) => {
-          try {
-            this.#logger.info(
-              "worker_hub.work_event.restart_announcement_failed",
-              { message: String(error) },
+        for (const run of runs) {
+          if (this.#lifecycle !== "started") return;
+          if (run.stage !== "actioning") continue;
+          if (run.frozen) await this.#recoverRemoval(run.arcRunId);
+          else if (run.lifecycle === "active")
+            this.#emitParkedControl(
+              {
+                kind: "control:parked",
+                arcRunId: run.arcRunId,
+                status: "hub-restarted",
+              },
+              () => !this.#runsSinceStart.has(run.arcRunId),
             );
-          } catch {
-            /* Optional startup observations cannot affect readiness. */
-          }
-        });
-      },
-      (error: unknown) => {
+        }
+      })
+      .catch(async (error: unknown) => {
         if (this.#lifecycle !== "stopping" && this.#lifecycle !== "stopped")
           this.#lifecycle = "failed";
+        // A failed scan can race a worker factory. Let construction publish
+        // its workers or finish its own rollback before stopping the registry.
+        await Promise.allSettled([startup]);
+        if (this.#workerRegistry.started) {
+          try {
+            await this.#workerRegistry.stop();
+          } catch {
+            // The registry logs individual stop failures. Preserve the startup error.
+          }
+        }
         throw error;
-      },
-    );
+      });
     return this.#startupPromise;
-  }
-
-  /** Announce restored active runs once at startup; control reads stay pure. */
-  async #announceRestartParks(): Promise<void> {
-    for (const run of await this.#arcHost.listRunViews()) {
-      if (this.#lifecycle !== "started") return;
-      if (run.stage === "actioning" && run.lifecycle === "active")
-        this.#emitParkedControl(
-          {
-            kind: "control:parked",
-            arcRunId: run.arcRunId,
-            status: "hub-restarted",
-          },
-          () => !this.#runsSinceStart.has(run.arcRunId),
-        );
-    }
   }
 
   /** Stop every created worker in reverse order and aggregate cleanup failures. */
   stop(): Promise<void> {
     if (this.#stopPromise) return this.#stopPromise;
     this.#lifecycle = "stopping";
+    for (const retry of this.#removalRetries.values()) retry.cancel();
+    this.#removalRetries.clear();
     this.#stopPromise = this.#stopAllWorkers();
     return this.#stopPromise;
   }
@@ -1124,7 +1163,7 @@ export class WorkerHubService {
     try {
       await this.#startupPromise;
     } catch {
-      /* Registry startup owns rollback. */
+      /* Startup has already attempted worker rollback. */
     }
     const submissions = [...this.#submissions.entries()].map(([id, state]) => {
       this.#cancelSubmission(id);
@@ -1161,6 +1200,8 @@ export class WorkerHubService {
       for (const result of await Promise.allSettled([...disposals]))
         if (result.status === "rejected") errors.push(result.reason);
       await Promise.all(submissions);
+      for (const result of await Promise.allSettled(this.#runRemovals.values()))
+        if (result.status === "rejected") errors.push(result.reason);
     } finally {
       this.#workScopes.clear();
       this.#pausedContinuations.clear();
@@ -1168,6 +1209,7 @@ export class WorkerHubService {
       this.#laps.clear();
       this.#lapFailures.clear();
       this.#runsSinceStart.clear();
+      this.#inheritedGenerations.clear();
       this.#uncaughtInterruptions.clear();
       this.#workerContexts.clear();
       this.#outboundRoot.exact.clear();
@@ -1180,8 +1222,7 @@ export class WorkerHubService {
   }
 
   /**
-   * Opaque connector-supplied principal recorded as the owner of a run, when
-   * one exists. Returns `undefined` if the run is unknown.
+   * Read the connector-supplied owner of a visible run.
    */
   async getRunOwnerPrincipal(arcRunId: string): Promise<string | undefined> {
     this.#assertStarted();
@@ -1450,6 +1491,7 @@ export class WorkerHubService {
     // `trigger` step is not an activation yet → the fork it settles into does.
     if (step.kind === "action") {
       this.#runsSinceStart.add(step.arcRunId);
+      this.#inheritedGenerations.delete(step.arcRunId);
       channel?.push({
         kind: "activated",
         arcRunId: step.arcRunId,
@@ -1492,6 +1534,7 @@ export class WorkerHubService {
     if (submission) submission.pending += 1;
     try {
       for (const step of steps) {
+        if (step.kind === "action" && step.signal.aborted) continue;
         if (submission?.controller.signal.aborted && step.kind !== "action") {
           if (step.kind === "handshake" || step.kind === "trigger")
             await this.#arcHost.releaseTrigger(step.arcRunId);
@@ -1513,6 +1556,7 @@ export class WorkerHubService {
           step.kind === "action"
             ? await this.#recordInboundAndProject(step.arcRunId, inbound)
             : projectInboundDialog(inbound, { roleId: DEFAULT_WORKER_ROLE });
+        if (step.kind === "action" && step.signal.aborted) continue;
         commands.push(this.#dispatchStep(step, dialog, submissionId));
       }
     } catch (error) {
@@ -2320,6 +2364,8 @@ export class WorkerHubService {
       return { kind: "continue" };
     }
     const { arcRunId, frontier } = step;
+    if (step.kind === "action" && step.signal.aborted)
+      return { kind: "continue" };
     if (this.#lifecycle !== "started") {
       if (step.kind === "trigger") await this.#arcHost.releaseTrigger(arcRunId);
       else await this.#arcHost.releaseAction(arcRunId, frontier.frontierId);
@@ -2354,6 +2400,7 @@ export class WorkerHubService {
       // Every other handback leaves the active lifecycle, where no park applies.
       else {
         this.#runsSinceStart.delete(arcRunId);
+        this.#inheritedGenerations.delete(arcRunId);
         this.#lapFailures.delete(arcRunId);
         this.#uncaughtInterruptions.delete(arcRunId);
       }
@@ -2710,7 +2757,11 @@ export class WorkerHubService {
     message: InboundMessage,
   ): Promise<Dialog> {
     const inboundEntry = inboundHistoryEntry(message, new Date().toISOString());
-    await this.#historyStore.appendEntry(arcRunId, inboundEntry);
+    // The fork admitted this write against the action step's live signal.
+    await this.#trackRunWrite(
+      arcRunId,
+      this.#historyStore.appendEntry(arcRunId, inboundEntry),
+    );
     if (message.arcRunId === undefined) {
       this.#logInboundAccepted(arcRunId, message);
     }
@@ -2770,7 +2821,7 @@ export class WorkerHubService {
       : undefined;
     if (owned) workScope!.routines.set(routine.id, owned);
     try {
-      await this.#routineStore.putRoutine(routine);
+      await this.#saveRoutine(routine);
       this.#routineWorkers.set(routine.id, selected);
       return await this.#runRoutine(
         routine,
@@ -2890,11 +2941,27 @@ export class WorkerHubService {
     const task = routine.task;
     const workScope = owned?.scope;
     if (owned) owned.active = true;
-    const diagnostics = this.#routineDiagnosticsStore.forRoutine(
+    const writer = this.#routineDiagnosticsStore.forRoutine(
       routine.arcRunId,
       routine.role,
       routine.id,
     );
+    const write = (operation: () => Promise<void>) =>
+      this.#writeRunData(
+        routine.arcRunId,
+        operation,
+        workScope?.stage === "trigger",
+      );
+    const diagnostics: RoutineDiagnostics = {
+      writeText: (handle, value) =>
+        write(() => writer.writeText(handle, value)),
+      writeJson: (handle, value) =>
+        write(() => writer.writeJson(handle, value)),
+      appendText: (handle, value) =>
+        write(() => writer.appendText(handle, value)),
+      appendJsonl: (handle, value) =>
+        write(() => writer.appendJsonl(handle, value)),
+    };
     const backend = selected.backend;
     if (routine.backend !== backend) {
       throw new Error(
@@ -3080,7 +3147,7 @@ export class WorkerHubService {
           ? { code: report.code, message: report.message }
           : undefined;
       routine.updatedAt = new Date().toISOString();
-      await this.#routineStore.putRoutine(routine);
+      await this.#saveRoutine(routine);
       this.#emitRoutineEvent(
         routine,
         backend,
@@ -3254,7 +3321,7 @@ export class WorkerHubService {
     routine.status = "skipped";
     routine.error = { code, message };
     routine.updatedAt = new Date().toISOString();
-    await this.#routineStore.putRoutine(routine);
+    await this.#saveRoutine(routine);
     this.#emitRoutineEvent(routine, backend, node, "routine:skipped", {
       error: routine.error,
     });
@@ -3579,7 +3646,7 @@ export class WorkerHubService {
       content: previewLogValue(message.content),
     });
     const audienceName = message.situation.audience;
-    await this.#historyStore.appendEntry(message.arcRunId, {
+    await this.#appendHistory(message.arcRunId, {
       from: { kind: "role", id: message.situation.role },
       to: {
         kind: "audience",
@@ -3663,7 +3730,7 @@ export class WorkerHubService {
     }
 
     try {
-      await this.#historyStore.appendEntry(
+      await this.#appendHistory(
         arcRunId,
         answerHistoryEntry(
           message.content,
@@ -3746,12 +3813,21 @@ export class WorkerHubService {
     arcRunId: ArcRunId,
   ): Promise<ExecutionControlView> {
     this.#assertStarted();
-    const run = await this.#arcHost.getRunView(arcRunId);
+    return this.#executionControlView(
+      arcRunId,
+      await this.#arcHost.getRunView(arcRunId),
+    );
+  }
+
+  async #executionControlView(
+    arcRunId: ArcRunId,
+    run: ArcRunView | undefined,
+  ): Promise<ExecutionControlView> {
     if (isInactiveRun(run)) {
       return { status: "inactive", arcRunId };
     }
     const control = await this.#executionControlFor(arcRunId);
-    const park = this.#hostOrHubPark(run, control);
+    const park = await this.#hostOrHubPark(run, control);
     if (park) return park;
     if (
       control.status !== "capacity-limited" &&
@@ -3775,18 +3851,20 @@ export class WorkerHubService {
    * failure, an uncaught interruption, then whether this hub has run the run
    * since it started.
    */
-  #hostOrHubPark(
+  async #hostOrHubPark(
     run: ArcRunView | undefined,
     control: ExecutionControlState,
-  ):
+  ): Promise<
     | Extract<
         ExecutionControlView,
         { status: "internal-error" | "uncaught-interruption" | "hub-restarted" }
       >
-    | undefined {
+    | undefined
+  > {
     if (run?.stage !== "actioning" || run.lifecycle !== "active") return;
     if (control.status !== "running" && control.status !== "pauseRequested")
       return;
+    if (this.#initialRunViews) await this.#initialRunViews;
     const { arcRunId } = control;
     if (this.#workScopes.has(arcRunId)) return;
     const failure = this.#lapFailures.get(arcRunId);
@@ -3806,7 +3884,11 @@ export class WorkerHubService {
         interruption: { ...interruption },
         updatedAt: control.updatedAt,
       };
-    if (!this.#runsSinceStart.has(arcRunId))
+    if (
+      !this.#runsSinceStart.has(arcRunId) &&
+      (run.generation === undefined ||
+        this.#inheritedGenerations.get(arcRunId) === run.generation)
+    )
       return {
         arcRunId,
         status: "hub-restarted",
@@ -3840,6 +3922,165 @@ export class WorkerHubService {
     };
   }
 
+  /** Reclaim an owned run once it is paused, parked or inactive. */
+  async removeRun(arcRunId: ArcRunId): Promise<RemoveRunResult> {
+    this.#assertStarted();
+    return this.#shareRemoval(arcRunId, this.#removalRetries.has(arcRunId));
+  }
+
+  async #shareRemoval(
+    arcRunId: ArcRunId,
+    frozen: boolean,
+  ): Promise<RemoveRunResult> {
+    const pending = this.#runRemovals.get(arcRunId);
+    if (pending) {
+      const result = await pending;
+      return result.outcome === "removed"
+        ? { outcome: "missing", arcRunId }
+        : result;
+    }
+    const attempt = this.#removeRun(arcRunId, frozen).finally(() => {
+      this.#runRemovals.delete(arcRunId);
+    });
+    this.#runRemovals.set(arcRunId, attempt);
+    return attempt;
+  }
+
+  async #freezeForRemoval(arcRunId: ArcRunId) {
+    return this.#controlMutations.run(arcRunId, async () => {
+      for (;;) {
+        const run = await this.#arcHost.getRunView(arcRunId);
+        if (run && run.stage !== "actioning") return "missing";
+        if (run) {
+          const { status } = await this.#executionControlView(arcRunId, run);
+          if (status === "running" || status === "pauseRequested")
+            return "in-use";
+        }
+        const { outcome } = await this.#arcHost.freezeRun(
+          arcRunId,
+          run ?? null,
+        );
+        if (outcome !== "changed") return outcome;
+      }
+    });
+  }
+
+  async #removeRun(
+    arcRunId: ArcRunId,
+    frozen: boolean,
+  ): Promise<RemoveRunResult> {
+    try {
+      if (!frozen) {
+        const outcome = await this.#freezeForRemoval(arcRunId);
+        if (outcome !== "frozen") return { outcome, arcRunId };
+        frozen = true;
+      }
+      await this.#reclaimHubData(arcRunId);
+      const result = await this.#arcHost.removeRun(arcRunId);
+      this.#removalRetries.get(arcRunId)?.cancel();
+      this.#removalRetries.delete(arcRunId);
+      return result;
+    } catch (error) {
+      if (frozen) this.#scheduleRemovalRetry(arcRunId);
+      throw error;
+    }
+  }
+
+  async #recoverRemoval(arcRunId: ArcRunId): Promise<void> {
+    if (this.#lifecycle !== "started") return;
+    try {
+      await this.#shareRemoval(arcRunId, true);
+    } catch (error) {
+      if (!this.#removalRetries.has(arcRunId))
+        this.#scheduleRemovalRetry(arcRunId);
+      this.#logger.info("worker_hub.run.cleanup_failed", {
+        arcRunId,
+        message: String(error),
+      });
+    }
+  }
+
+  #scheduleRemovalRetry(arcRunId: ArcRunId): void {
+    if (this.#lifecycle !== "started") return;
+    const previous = this.#removalRetries.get(arcRunId);
+    previous?.cancel();
+    const delayMs = previous ? Math.min(previous.delayMs * 2, 60_000) : 1000;
+    const cancel = scheduleRetryTimer(
+      () => void this.#recoverRemoval(arcRunId),
+      delayMs,
+    );
+    this.#removalRetries.set(arcRunId, { delayMs, cancel });
+  }
+
+  async #reclaimHubData(arcRunId: ArcRunId): Promise<void> {
+    const scope = this.#workScopes.get(arcRunId);
+    if (scope) await this.#releaseScope(scope);
+    this.#clearCapacityRetry(arcRunId);
+    this.#pausedContinuations.delete(arcRunId);
+    this.#moduleEffects.delete(arcRunId);
+    this.#laps.delete(arcRunId);
+    this.#lapFailures.delete(arcRunId);
+    this.#uncaughtInterruptions.delete(arcRunId);
+    this.#runsSinceStart.delete(arcRunId);
+    this.#inheritedGenerations.delete(arcRunId);
+
+    await Promise.allSettled(this.#runWrites.get(arcRunId) ?? []);
+    await this.#controlMutations.run(arcRunId, () =>
+      this.#routineStore.deleteRunData(arcRunId),
+    );
+    await this.#historyStore.deleteRunData(arcRunId);
+    await this.#routineDiagnosticsStore.deleteRunData(arcRunId);
+  }
+
+  /** Admit writes from a worker scope or a visible run. */
+  async #writeRunData(
+    arcRunId: ArcRunId,
+    write: () => Promise<void>,
+    triggerProbe = false,
+  ): Promise<void> {
+    // A trigger worker runs under a probe ID, distinct from every activation it admits.
+    if (triggerProbe) return write();
+    const scope = this.#workScopes.get(arcRunId);
+    const operation = (async () => {
+      if (
+        (scope && !scope.released) ||
+        (await this.#arcHost.getRunView(arcRunId))
+      )
+        await write();
+    })();
+    return this.#trackRunWrite(arcRunId, operation);
+  }
+
+  /** Let reclamation drain writes admitted before freeze. */
+  async #trackRunWrite(
+    arcRunId: ArcRunId,
+    operation: Promise<void>,
+  ): Promise<void> {
+    const writers = this.#runWrites.get(arcRunId) ?? new Set<Promise<void>>();
+    writers.add(operation);
+    this.#runWrites.set(arcRunId, writers);
+    try {
+      await operation;
+    } finally {
+      writers.delete(operation);
+      if (!writers.size) this.#runWrites.delete(arcRunId);
+    }
+  }
+
+  #saveRoutine(routine: RoutineState): Promise<void> {
+    return this.#writeRunData(
+      routine.arcRunId,
+      () => this.#routineStore.putRoutine(routine),
+      routine.task.kind === "semantic" && routine.task.stage === "trigger",
+    );
+  }
+
+  #appendHistory(arcRunId: ArcRunId, entry: HistoryEntry): Promise<void> {
+    return this.#writeRunData(arcRunId, () =>
+      this.#historyStore.appendEntry(arcRunId, entry),
+    );
+  }
+
   /** Request a cooperative pause for one Arc run. */
   async requestPause(arcRunId: ArcRunId): Promise<RequestPauseResult> {
     this.#assertStarted();
@@ -3852,7 +4093,7 @@ export class WorkerHubService {
         return { outcome: "missing" as const, arcRunId };
       }
       const existing = await this.#executionControlFor(arcRunId);
-      const park = this.#hostOrHubPark(run, existing);
+      const park = await this.#hostOrHubPark(run, existing);
       if (park) return { outcome: "not-running" as const, control: park };
       if (existing.status === "pauseRequested") {
         return {
@@ -3971,14 +4212,17 @@ export class WorkerHubService {
       const parked =
         existing.status === "capacity-limited" ||
         existing.status === "transport-lost";
-      if (run?.stage !== "actioning" && !(parked && continuation)) {
+      if (
+        run?.stage !== "actioning" &&
+        !(parked && continuation?.stage === "trigger")
+      ) {
         this.#clearCapacityRetry(arcRunId);
         return { outcome: "missing" as const, arcRunId };
       }
       // A host or hub park, or a pause or worker park whose continuation this
       // process no longer holds, resumes by rebuilding the run. With live work, the
       // continuation is still to be stored, so the resume is not ready yet.
-      let rebuild = this.#hostOrHubPark(run, existing) !== undefined;
+      let rebuild = (await this.#hostOrHubPark(run, existing)) !== undefined;
       if (!rebuild && existing.status === "running") {
         return {
           outcome: "not-paused" as const,
@@ -4027,6 +4271,7 @@ export class WorkerHubService {
       this.#lapFailures.delete(arcRunId);
       this.#uncaughtInterruptions.delete(arcRunId);
       this.#runsSinceStart.add(arcRunId);
+      this.#inheritedGenerations.delete(arcRunId);
       this.#emitControlEvent(
         arcRunId,
         "control:resumed",
@@ -4217,7 +4462,7 @@ export class WorkerHubService {
         }
         routine.status = "paused";
         routine.updatedAt = now;
-        await this.#routineStore.putRoutine(routine);
+        await this.#saveRoutine(routine);
         if (!scopeCancelled(owned?.scope))
           this.#emitControlEvent(
             routine.arcRunId,
@@ -4336,7 +4581,7 @@ export class WorkerHubService {
         }
         routine.status = control.status;
         routine.updatedAt = control.updatedAt;
-        await this.#routineStore.putRoutine(routine);
+        await this.#saveRoutine(routine);
         if (scopeCancelled(owned?.scope)) return undefined;
         emitEvent();
         this.#appendWorkEvent(() =>
@@ -4478,7 +4723,7 @@ export class WorkerHubService {
     routine.status = "running";
     routine.error = undefined;
     routine.updatedAt = new Date().toISOString();
-    await this.#routineStore.putRoutine(routine);
+    await this.#saveRoutine(routine);
     if (
       this.#lifecycle !== "started" ||
       scopeCancelled(continuation?.scope) ||

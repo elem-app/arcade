@@ -11,7 +11,7 @@ import type {
   ArcRunState,
 } from "../types/host.js";
 import type { RoutineState } from "../types/hub.js";
-import type { JsonValue } from "../types/json.js";
+import { asJsonObject, type JsonValue } from "../types/json.js";
 import type { HistoryEntry } from "../types/messaging.js";
 import type {
   ActionReplayPosition,
@@ -57,9 +57,14 @@ export interface ArcHostStore {
   putState(runKey: ArcRunKey, state: ArcRunState): Promise<void>;
   /** Load traversal state for one Arc run key. */
   getState(runKey: ArcRunKey): Promise<ArcRunState | undefined>;
+  /** Delete the state for a run key. An absent key is already deleted. */
+  deleteState(runKey: ArcRunKey): Promise<void>;
   /** Iterate all persisted traversal states. */
   listStates(): AsyncIterable<[ArcRunKey, ArcRunState]>;
 }
+
+/** A store-issued JSON value. Callers retain it verbatim for the same run. */
+export type HistoryCursor = Exclude<JsonValue, null>;
 
 /**
  * Flat per-run history log.
@@ -68,6 +73,8 @@ export interface ArcHostStore {
  * are produced by projecting these entries on read.
  */
 export interface HistoryStore {
+  /** Idempotently delete this store's records for the identified run. */
+  deleteRunData(arcRunId: ArcRunId): Promise<void>;
   /** Store identifier for diagnostics and configuration displays. */
   readonly id: string;
 
@@ -75,6 +82,44 @@ export interface HistoryStore {
   appendEntry(arcRunId: ArcRunId, entry: HistoryEntry): Promise<void>;
   /** Read all history entries for an Arc run in append order. */
   listEntries(arcRunId: ArcRunId): Promise<HistoryEntry[]>;
+  /** Capture the exclusive end of the run's committed history. */
+  endCursor(arcRunId: ArcRunId): Promise<HistoryCursor>;
+  /**
+   * Resume at start (null starts at the beginning) and stop at the captured end.
+   * A row supplies nextCursor only when another entry precedes end.
+   * The store interprets both cursors independently and honors issued cursors
+   * across appends and restart. An unavailable cursor raises RangeError.
+   */
+  readEntries(
+    arcRunId: ArcRunId,
+    start: HistoryCursor | null,
+    end: HistoryCursor,
+  ): AsyncIterable<{ entry: HistoryEntry; nextCursor?: HistoryCursor }>;
+}
+
+/** Decode a built-in store's cursor, including its previously issued numeric positions. */
+export function historyPosition(cursor: HistoryCursor, field: string): number {
+  const object = asJsonObject(cursor);
+  const value =
+    object && Object.keys(object).length === 1 ? object[field] : cursor;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+    throw new RangeError("History cursor is unavailable.");
+  return value;
+}
+
+export function assertHistoryRange(
+  start: number,
+  end: number,
+  available: number,
+): void {
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    start > end ||
+    end > available
+  )
+    throw new RangeError("History position is unavailable.");
 }
 
 /**
@@ -91,6 +136,8 @@ export interface HistoryStore {
  * rather than silently corrupting the stream.
  */
 export interface ReplayStore {
+  /** Idempotently delete this store's records for the identified run. */
+  deleteRunData(arcRunId: ArcRunId): Promise<void>;
   /** Store identifier for diagnostics and configuration displays. */
   readonly id: string;
 
@@ -151,10 +198,12 @@ export interface WorkerStatePersistence {
 
 /** Persistence for hub routines, execution control, and worker state. */
 export interface WorkerHubStore extends WorkerStatePersistence {
+  /** Idempotently delete this store's records for the identified run. */
+  deleteRunData(arcRunId: ArcRunId): Promise<void>;
   /** Store identifier for diagnostics and configuration displays. */
   readonly id: string;
 
-  /** Insert or replace one durable routine state. */
+  /** Insert or replace routine state using the ID the worker hub assigned to this run. */
   putRoutine(routine: RoutineState): Promise<void>;
   /** Load one durable routine by id. */
   getRoutine(routineId: string): Promise<RoutineState | undefined>;
@@ -170,6 +219,8 @@ export interface WorkerHubStore extends WorkerStatePersistence {
 
 /** Persistence for backend-aware routine diagnostic artifacts. */
 export interface RoutineDiagnosticsStore {
+  /** Idempotently delete this store's records for the identified run. */
+  deleteRunData(arcRunId: ArcRunId): Promise<void>;
   /** Store identifier for diagnostics and configuration displays. */
   readonly id: string;
 

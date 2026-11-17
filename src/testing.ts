@@ -29,6 +29,7 @@ export type {
   BeginInput,
   DialogProjector,
   InstructionCoverage,
+  ResolvedDocumentSnapshot,
   ResolveHandshakeResult,
   RunFrontier,
 } from "./types/host.js";
@@ -65,6 +66,7 @@ export {
   type ReplayCheckpoint,
   type ReplayHandoffReason,
   type ReplayPosition,
+  type ReplayRecording,
   type ReplayStep,
   type TerminalBriefStep,
   type TriggerBriefStep,
@@ -79,6 +81,7 @@ export type {
   RoutineEffects,
   RoutineReport,
 } from "./types/routine.js";
+export type * from "./types/simulation.js";
 export {
   taskId,
   type CellSnapshot,
@@ -148,6 +151,8 @@ export {
   JsonFileWorkEventStore,
 } from "./storage/json-file.js";
 
+export { formatSimulationReport } from "./service/simulation-comparisons.js";
+export { SimulatorService } from "./service/simulator.js";
 export { renderInstructionTaskText } from "./service/task-renderer.js";
 export {
   semanticTaskSourceRef,

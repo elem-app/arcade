@@ -21,6 +21,10 @@ Typical uses:
 
 The point of Arcade is not to hide the Arc script. The script is the workflow contract. Arcade supplies the runtime machinery around it.
 
+## Auditing an Arc
+
+Arc authors can run a draft from its trigger with `SimulatorService`. The service supplies external answers as Arc requests them. For example, if a failed review requests a rewrite and another review, the simulator can compare both answers to that second review and show whether they lead to different delivery instructions. The author decides which result satisfies the intended workflow. Each result carries the generated input coverage, exploration limits and a JSONL trace for each retained path. The [service API](./service-apis.md#branch-simulation) describes the registered and standalone entry points.
+
 ## Mental Model
 
 Arcade is a connector-driven hub-and-spoke system. Connectors initiate public inputs, and the worker hub is the hub: all cross-boundary traffic between connector channels, Arc traversal, and role backends passes through it. Connectors, the Arc host, and role backends each talk only to the worker hub, which keeps them decoupled from each other.
@@ -147,6 +151,8 @@ See [host module implementation](./host-modules/README.md) for wiring, submissio
 
 An Arc run is one durable execution of one Arc.
 
+Conversation history is an append-only log per run. A consumer can capture its end position and read entries up to that point in append order. Each entry supplies the position of the next one so a consumer can resume reading the same range after later appends.
+
 A run begins when trigger evaluation and any required handshake admit an Arc. From that point on, Arcade records its history, traversal state, artifacts, emitted outbound messages, and completed agent work.
 
 Arcade does not require every inbound message to create a run. If no Arc matches, the submission is idle. If an Arc needs more information before it can start, such as a workspace or a run-choice decision, Arcade returns a handshake instead of inventing a guess. Arcs discovered from connector working roots carry the discovered workspace path into fresh activation; packaged arcs remain workspace-less and still use a workspace handshake when their policy requires one.
@@ -156,6 +162,8 @@ The Arc host advances a run one step at a time: the caller reports where the run
 Every run is addressed by id, and its traversal progress lives in durable state. The host also retains process-local coordination state, including pending handshakes, live execution capabilities, and action frontier identities.
 
 Existing runs can be joined through two activation paths. Selecting an active run from a free inbound's run-choice handshake is an active-run join: Arcade immediately attaches the submitting client session to the selected run and emits `joined` on that submission's lifecycle channel. The connector presents the selected run's existing open outbound items to the joining client session and exposes execution control separately. Joining does not action the Arc, append or project the selecting inbound, create a routine, change execution control, or rotate worker context; previously joined client sessions remain joined. Selecting a deflected run causes deflected re-entry because trigger probing has already produced a traversal plan against that run's pinned Arc snapshot and persisted traversals. Arcade commits that plan, records the activating inbound, and increments `reactivationCount` after the initial action settlement completes. If re-entry is interrupted earlier, the previous persisted run state and count remain authoritative, and the next re-entry retries that count. Continuing an interrupted active run by run id preserves its entry and reactivation count. Existing runs continue on their pinned source revision while fresh runs use the latest revision.
+
+A connector can reclaim storage for a paused, parked, or inactive run through the worker hub. A running run continues and removal returns `in-use`, including while a cooperative pause is pending. The worker hub checks eligibility, asks the arc host to freeze the run, and reclaims its own data. While frozen, the run disappears from ordinary lookup and remains discoverable through the frozen filter. The arc host deletes replay and run state last so the hub can finish an interrupted removal. WorkEvents, workspace files, and independent replay forks survive reclamation. See [Run Removal](./service-apis.md#run-removal) for results and retry behavior.
 
 ### Interruptions and Deflections
 
@@ -188,6 +196,8 @@ Replay is Arcade's way to treat an Arc run as a durable path rather than only as
 Each durable run has a reactivation count. It starts at zero for the initial activation and increases by one after each deflected-run reactivation reaches its initial action settlement. Every trigger and action replay position carries this count. The count is also the managed worker-context epoch: deflected re-entry starts action work under the incremented count's fresh provider context, while ask answers and active-run attachment leave the current epoch unchanged. The run state's `reactivationCount` is authoritative: replay ignores records with a higher count, and the next re-entry removes those records before retrying that count. Replay, fork, and rewind therefore address every position by reactivation count, stage, and index.
 
 A replay does not ask workers to redo their work and does not mutate the source run. It is a host-side check over the recorded trigger and action path: activation, semantic answers, instruction reports, transition acknowledgments, and the checkpoints where the run can be picked up again. Transitions are ordinary recorded steps and give the alignment a natural anchor at every position change. The result is either incompatible, meaning the candidate path cannot reproduce the run's activation, or compatible, meaning the run can be handed off at a concrete action point.
+
+Replay uses the selected trigger roots when the recording names them. For an untargeted start it evaluates surviving participants in the order established by the recorded trigger briefs. The candidate definitions supply their imports. An unused import can be renamed or moved while the recorded action still reproduces.
 
 Jump creates a new run on updated Arc material at the candidate state reached by replay. Every successfully replayed report preserves its completed progress. If the source completed A and then reached B, while the candidate keeps A and replaces B with C, replay applies A’s report and hands off at C. The successor carries A’s completion and the candidate output for C in its own history; live continuation executes C. Output and traversal matching determine whether the next source report can be reused. Replay stops at the first divergence, including across reactivations. The source run remains unchanged.
 
@@ -368,7 +378,7 @@ An inbound message is channel-neutral content submitted by a connector in one of
 
 A free inbound carrying `metadata.askId`, or a targeted inbound without a matching live `askId`, is rejected before the arc host, history, or worker dispatch. Other inbound metadata remains connector context and grants no routing authority.
 
-`submitInbound` returns a lifecycle event stream whose termination marks completed admission or answer delivery, including cleanup. Activated runs continue independently. An optional `AbortSignal` cancels unfinished submission work; stopping iteration alone leaves it active. Processing and cleanup proceed without a reader. The [submission API](./service-apis.md#submitinboundmessage-options) defines cancellation, event ordering, and buffer limits.
+`workerHub.submitInbound` returns a lifecycle event stream whose termination marks completed admission or answer delivery, including cleanup. Activated runs continue independently. An optional `AbortSignal` cancels unfinished submission work; stopping iteration alone leaves it active. Processing and cleanup proceed without a reader. The [submission API](./service-apis.md#workerhubsubmitinboundmessage-options) defines cancellation, event ordering, and buffer limits.
 
 Pause and resume are explicit execution-control operations. Joining a run exposes its current execution-control state without resuming it.
 

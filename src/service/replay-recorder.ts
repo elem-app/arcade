@@ -24,7 +24,13 @@ import type {
   TriggerReplayStep,
   TriggerReportStep,
 } from "../types/replay.js";
-import { stripBrief } from "../types/replay.js";
+import {
+  recordActionOutput,
+  recordActionSeed,
+  recordReport,
+  recordTriggerOutput,
+  recordTriggerStart,
+} from "./replay-recording.js";
 import {
   advanceHostModuleState,
   matchingReplayCheckpoint,
@@ -95,16 +101,17 @@ export class RecordingRuntime {
     opts: { arcRefs?: readonly ArcRef[] } = {},
   ): Promise<TriggerBrief> {
     const brief = this.#runtime.startTrigger(traversals, dialog, opts);
-    this.#triggerBuffer.push({
-      kind: "trigger-start",
-      position: {
-        stage: "trigger",
-        index: 0,
-        reactivationCount: this.#reactivationCount,
-      },
-      dialog,
-      ...(opts.arcRefs === undefined ? {} : { arcRefs: [...opts.arcRefs] }),
-    });
+    this.#triggerBuffer.push(
+      recordTriggerStart(
+        {
+          stage: "trigger",
+          index: 0,
+          reactivationCount: this.#reactivationCount,
+        },
+        dialog,
+        opts.arcRefs,
+      ),
+    );
     this.#triggerIndex += 1;
     const position: TriggerReplayPosition = {
       stage: "trigger",
@@ -112,13 +119,9 @@ export class RecordingRuntime {
       reactivationCount: this.#reactivationCount,
     };
     this.#triggerBriefPosition.set(brief, position);
-    this.#triggerBuffer.push({
-      kind: "trigger-brief",
-      position,
-      dialog,
-      brief: stripBrief(brief),
-      hostModules: structuredClone(this.#hostModules),
-    });
+    this.#triggerBuffer.push(
+      recordTriggerOutput(position, brief, dialog, this.#hostModules),
+    );
     return brief;
   }
 
@@ -135,14 +138,16 @@ export class RecordingRuntime {
       throw new Error("Recording trigger progress for an unknown brief.");
     const next = this.#runtime.progressTrigger(brief, report, dialog);
     const admitted = this.#advanceHostModules(next, moduleEffect);
-    this.#triggerBuffer.push({
-      kind: "trigger-report",
-      position,
-      dialog,
-      report,
-      origin,
-      ...(admitted ? { moduleEffect } : {}),
-    });
+    this.#triggerBuffer.push(
+      recordReport({
+        kind: "trigger-report",
+        position,
+        dialog,
+        report,
+        origin,
+        ...(admitted ? { moduleEffect } : {}),
+      }),
+    );
     {
       this.#triggerIndex += 1;
       const nextPosition: TriggerReplayPosition = {
@@ -151,13 +156,9 @@ export class RecordingRuntime {
         reactivationCount: this.#reactivationCount,
       };
       this.#triggerBriefPosition.set(next, nextPosition);
-      this.#triggerBuffer.push({
-        kind: "trigger-brief",
-        position: nextPosition,
-        dialog,
-        brief: stripBrief(next),
-        hostModules: structuredClone(this.#hostModules),
-      });
+      this.#triggerBuffer.push(
+        recordTriggerOutput(nextPosition, next, dialog, this.#hostModules),
+      );
     }
     return next;
   }
@@ -377,21 +378,10 @@ export class RecordingRuntime {
   ): Promise<void> {
     if (!this.#replayStore) return;
     const position = this.#actionPosition(index);
-    if (brief.canProgress) {
-      await this.#replayStore.appendStep(this.#arcRunId, {
-        kind: "action-brief",
-        position,
-        dialog,
-        brief: stripBrief(brief),
-      });
-    } else {
-      await this.#replayStore.appendStep(this.#arcRunId, {
-        kind: "terminal-brief",
-        position,
-        dialog,
-        brief: stripBrief(brief),
-      });
-    }
+    await this.#replayStore.appendStep(
+      this.#arcRunId,
+      recordActionOutput(position, brief, dialog),
+    );
     // Terminal host module retirement belongs to the host; it captures that checkpoint
     // after applying its lifecycle policy and before committing run state.
     if (brief.canProgress) await this.#putCheckpoint(index, brief.traversals);
@@ -405,14 +395,17 @@ export class RecordingRuntime {
     moduleEffect?: HostModuleEffect,
   ): Promise<void> {
     if (!this.#replayStore) return;
-    await this.#replayStore.appendStep(this.#arcRunId, {
-      kind: "action-report",
-      position: this.#actionPosition(index),
-      dialog,
-      report,
-      origin,
-      ...(moduleEffect === undefined ? {} : { moduleEffect }),
-    });
+    await this.#replayStore.appendStep(
+      this.#arcRunId,
+      recordReport({
+        kind: "action-report",
+        position: this.#actionPosition(index),
+        dialog,
+        report,
+        origin,
+        ...(moduleEffect === undefined ? {} : { moduleEffect }),
+      }),
+    );
   }
 
   async #putCheckpoint(
@@ -420,11 +413,14 @@ export class RecordingRuntime {
     traversals: ArcTraversalSet,
   ): Promise<void> {
     if (!this.#replayStore) return;
-    await this.#replayStore.putCheckpoint(this.#arcRunId, {
-      position: this.#actionPosition(index),
-      traversals,
-      hostModules: structuredClone(this.#hostModules),
-    });
+    await this.#replayStore.putCheckpoint(
+      this.#arcRunId,
+      recordActionSeed(
+        this.#actionPosition(index),
+        traversals,
+        this.#hostModules,
+      ),
+    );
   }
 
   /** Find the latest equivalent checkpoint in the current reactivation. */

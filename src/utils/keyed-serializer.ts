@@ -2,41 +2,34 @@ import { registerRetentionProbe } from "./retention-registry.js";
 
 /** Serializes async tasks independently per key. */
 export class KeyedSerializer<Key> {
-  readonly #chains = new Map<Key, { tail: Promise<void>; refCount: number }>();
+  readonly #tails = new Map<Key, Promise<void>>();
 
   constructor() {
-    registerRetentionProbe(this, () => ({ keys: this.#chains.size }));
+    registerRetentionProbe(this, () => ({ keys: this.#tails.size }));
   }
 
   /** Run `task` after all earlier tasks for `key` have settled. */
   async run<T>(key: Key, task: () => Promise<T>): Promise<T> {
-    const slot = this.#chains.get(key);
-    const previous = slot?.tail ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = previous.then(
-      () => current,
-      () => current,
-    );
-    if (slot) {
-      slot.tail = tail;
-      slot.refCount += 1;
-    } else {
-      this.#chains.set(key, { tail, refCount: 1 });
-    }
-
-    await previous.catch(() => undefined);
+    const release = await this.acquire(key);
     try {
       return await task();
     } finally {
       release();
-      const entry = this.#chains.get(key);
-      if (entry) {
-        entry.refCount -= 1;
-        if (entry.refCount === 0) this.#chains.delete(key);
-      }
     }
+  }
+
+  /** Acquire the next turn for this key and return its release function. */
+  async acquire(key: Key): Promise<() => void> {
+    const previous = this.#tails.get(key);
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#tails.set(key, current);
+    await previous;
+    return () => {
+      if (this.#tails.get(key) === current) this.#tails.delete(key);
+      release();
+    };
   }
 }

@@ -6,6 +6,7 @@ import {
 } from "./logging.js";
 import { ArcHostService } from "./service/arc-host.js";
 import { DiscoveryService } from "./service/discovery.js";
+import { SimulatorService } from "./service/simulator.js";
 import { TimeModule, type ScheduleTimeout } from "./service/time.js";
 import { WorkEventService } from "./service/work-events.js";
 import { WorkerHubService } from "./service/worker-hub.js";
@@ -29,6 +30,8 @@ export type Arcade = {
   discovery: DiscoveryService;
   /** Shared Arc host service. */
   arcHost: ArcHostService;
+  /** In-process branch simulation over registered Arc definitions. */
+  simulator: SimulatorService;
   /** Logger shared with the owning composition. */
   logger: ArcadeLogger;
   /** Stop Arcade services and resolve `done`. */
@@ -91,6 +94,9 @@ export async function startArcade(
     replayStore: options.replayStore,
     logger,
   });
+  const simulator = new SimulatorService({
+    captureSnapshot: (roots) => arcHost.captureDocumentSnapshot(roots),
+  });
   const discovery = new DiscoveryService({ arcHost });
   const workerHub = new WorkerHubService({
     arcHost,
@@ -129,11 +135,12 @@ export async function startArcade(
   let cleanupPromise: Promise<unknown[]> | undefined;
   const cleanup = (): Promise<unknown[]> => {
     workEvents.close();
-    return (cleanupPromise ??= stopWorkerHub(
-      workerHub,
-      arcHost,
-      logger,
-    ).finally(resolveDone));
+    return (cleanupPromise ??= Promise.all([
+      stopWorkerHub(workerHub, arcHost, logger),
+      simulator.stop(),
+    ])
+      .then(([failures]) => failures)
+      .finally(resolveDone));
   };
 
   try {
@@ -156,7 +163,7 @@ export async function startArcade(
     }
   };
 
-  return { workerHub, discovery, arcHost, logger, stop, done };
+  return { workerHub, discovery, arcHost, simulator, logger, stop, done };
 }
 
 async function stopWorkerHub(

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { executionControlFor, workEventsFor } from "./work-event-fixtures.js";
 
 import { parse } from "@elem-app/arc/parser";
+import { toArcRef } from "@elem-app/arc/runtime";
 import { describe, expect, it, vi } from "vitest";
 
 import type { Backend, RoutineInput, RoutineReport } from "../src/index.js";
@@ -306,16 +307,19 @@ function Judged() {
 }`),
     );
     const fast = collectAsync(
-      workerHub.submitInbound({
-        content: "start",
-        metadata: { principal: ALICE_OWNER },
-      }),
+      workerHub.submitInbound(
+        { content: "start", metadata: { principal: ALICE_OWNER } },
+        { arcRefs: [toArcRef("judged", "Judged")] },
+      ),
     );
-    await vi.waitFor(() => expect(active).toBe(2));
-    release();
-    await Promise.allSettled([fast, ordinary]);
-
-    expect(maximum).toBe(2);
+    try {
+      await vi.waitFor(() => expect(active).toBe(2));
+      expect(maximum).toBe(2);
+    } finally {
+      release();
+      await Promise.allSettled([fast, ordinary]);
+      await workerHub.stop();
+    }
   });
 });
 

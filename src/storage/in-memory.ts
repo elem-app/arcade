@@ -26,11 +26,14 @@ import { positionKey } from "../types/replay.js";
 import type { WorkEvent } from "../types/work-event.js";
 import type { BackendName, WorkerSlotKind } from "../types/worker-slot.js";
 import {
+  assertHistoryRange,
+  historyPosition,
   replayStepKey,
   structurallyEqual,
   type ArcHostStore,
   type ArcRunKey,
   type CreateWorkEventInput,
+  type HistoryCursor,
   type HistoryStore,
   type ReplayStore,
   type WorkerHubStore,
@@ -122,6 +125,10 @@ export class InMemoryArcHostStore implements ArcHostStore {
     return state ? structuredClone(state) : undefined;
   }
 
+  async deleteState(runKey: ArcRunKey): Promise<void> {
+    this.#states.delete(runKey);
+  }
+
   /** Iterate every durable traversal state currently held in memory. */
   async *listStates(): AsyncIterable<[ArcRunKey, ArcRunState]> {
     for (const [key, state] of this.#states)
@@ -144,6 +151,10 @@ export class InMemoryHistoryStore implements HistoryStore {
     this.id = opts.id ?? "in-memory-history";
   }
 
+  async deleteRunData(arcRunId: ArcRunId): Promise<void> {
+    this.#entries.delete(arcRunId);
+  }
+
   /** Append one entry for an Arc run. */
   async appendEntry(arcRunId: ArcRunId, entry: HistoryEntry): Promise<void> {
     const entries = this.#entries.get(arcRunId) ?? [];
@@ -154,6 +165,26 @@ export class InMemoryHistoryStore implements HistoryStore {
   /** Read all entries for an Arc run in append order. */
   async listEntries(arcRunId: ArcRunId): Promise<HistoryEntry[]> {
     return structuredClone(this.#entries.get(arcRunId) ?? []);
+  }
+
+  async endCursor(arcRunId: ArcRunId): Promise<HistoryCursor> {
+    return { turn: this.#entries.get(arcRunId)?.length ?? 0 };
+  }
+
+  async *readEntries(
+    arcRunId: ArcRunId,
+    from: HistoryCursor | null,
+    until: HistoryCursor,
+  ): ReturnType<HistoryStore["readEntries"]> {
+    const entries = this.#entries.get(arcRunId) ?? [];
+    const start = from === null ? 0 : historyPosition(from, "turn");
+    const end = historyPosition(until, "turn");
+    assertHistoryRange(start, end, entries.length);
+    for (let i = start; i < end; i++)
+      yield {
+        entry: structuredClone(entries[i]!),
+        ...(i + 1 < end && { nextCursor: { turn: i + 1 } }),
+      };
   }
 }
 
@@ -172,6 +203,11 @@ export class InMemoryReplayStore implements ReplayStore {
   /** Create an in-memory replay store. */
   constructor(opts: { id?: string } = {}) {
     this.id = opts.id ?? "in-memory-replay";
+  }
+
+  async deleteRunData(arcRunId: ArcRunId): Promise<void> {
+    this.#steps.delete(arcRunId);
+    this.#checkpoints.delete(arcRunId);
   }
 
   /** Append one replay step, ignoring an equal duplicate and rejecting a differing one. */
@@ -331,11 +367,18 @@ export class InMemoryWorkerHubStore implements WorkerHubStore {
   readonly id: string;
   readonly #routines = new Map<string, RoutineState>();
   readonly #executionControls = new Map<ArcRunId, ExecutionControlState>();
-  readonly #workerState = new Map<string, JsonValue>();
+  readonly #workerState = new Map<ArcRunId, Map<string, JsonValue>>();
 
   /** Create an in-memory hub routine store. */
   constructor(opts: { id?: string } = {}) {
     this.id = opts.id ?? "in-memory-worker-hub";
+  }
+
+  async deleteRunData(arcRunId: ArcRunId): Promise<void> {
+    this.#executionControls.delete(arcRunId);
+    for (const [id, routine] of this.#routines)
+      if (routine.arcRunId === arcRunId) this.#routines.delete(id);
+    this.#workerState.delete(arcRunId);
   }
 
   /** Store or replace one durable routine state. */
@@ -352,7 +395,7 @@ export class InMemoryWorkerHubStore implements WorkerHubStore {
   /** Iterate routines, optionally filtered to one Arc run. */
   async *listRoutines(arcRunId?: ArcRunId): AsyncIterable<RoutineState> {
     for (const routine of this.#routines.values()) {
-      if (arcRunId && routine.arcRunId !== arcRunId) continue;
+      if (arcRunId !== undefined && routine.arcRunId !== arcRunId) continue;
       yield structuredClone(routine);
     }
   }
@@ -378,9 +421,9 @@ export class InMemoryWorkerHubStore implements WorkerHubStore {
     arcRunId: ArcRunId,
     key: string,
   ): Promise<JsonValue | undefined> {
-    const value = this.#workerState.get(
-      workerStateKey(backend, slotKind, role, arcRunId, key),
-    );
+    const value = this.#workerState
+      .get(arcRunId)
+      ?.get(workerStateKey(backend, slotKind, role, key));
     return value === undefined
       ? undefined
       : canonicalizeJsonValue(value, "stored worker state");
@@ -395,10 +438,13 @@ export class InMemoryWorkerHubStore implements WorkerHubStore {
     key: string,
     value: JsonValue,
   ): Promise<void> {
-    this.#workerState.set(
-      workerStateKey(backend, slotKind, role, arcRunId, key),
+    const values =
+      this.#workerState.get(arcRunId) ?? new Map<string, JsonValue>();
+    values.set(
+      workerStateKey(backend, slotKind, role, key),
       canonicalizeJsonValue(value, "worker state"),
     );
+    this.#workerState.set(arcRunId, values);
   }
 }
 
@@ -406,10 +452,9 @@ function workerStateKey(
   backend: BackendName,
   slotKind: WorkerSlotKind,
   role: string | undefined,
-  arcRunId: ArcRunId,
   key: string,
 ): string {
-  return JSON.stringify([backend, slotKind, role ?? null, arcRunId, key]);
+  return JSON.stringify([backend, slotKind, role ?? null, key]);
 }
 
 /**

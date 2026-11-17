@@ -117,6 +117,22 @@ describe("backend authoring public API", () => {
     expect(sourceModuleCycles()).toEqual([]);
   });
 
+  it("keeps replay independent of simulation including type-only dependencies", () => {
+    const graph = sourceModuleGraph();
+    const reachable = new Set(
+      [...graph.keys()].filter((file) =>
+        /^(types|service)\/replay(?:-|\.)/.test(sourceRelativePath(file)),
+      ),
+    );
+    for (const file of reachable)
+      for (const dependency of graph.get(file) ?? []) reachable.add(dependency);
+    expect(
+      [...reachable]
+        .map(sourceRelativePath)
+        .filter((path) => /^(types|service)\/simulat/.test(path)),
+    ).toEqual([]);
+  });
+
   it("exposes only hub-owned resume deliveries to custom backends", () => {
     const contexts: RoutineContext[] = [
       routineContext(),
@@ -718,7 +734,7 @@ function sourceRelativePath(path: string): string {
   return relative(SOURCE_ROOT, path);
 }
 
-function sourceModuleCycles(): string[][] {
+function sourceModuleGraph(): Map<string, string[]> {
   const files = sourceFiles();
   const fileSet = new Set(files);
   const graph = new Map<string, string[]>();
@@ -738,6 +754,11 @@ function sourceModuleCycles(): string[][] {
     graph.set(file, dependencies);
   }
 
+  return graph;
+}
+
+function sourceModuleCycles(): string[][] {
+  const graph = sourceModuleGraph();
   const active = new Set<string>();
   const complete = new Set<string>();
   const stack: string[] = [];
@@ -756,7 +777,7 @@ function sourceModuleCycles(): string[][] {
     active.delete(file);
     complete.add(file);
   };
-  for (const file of files) visit(file);
+  for (const file of graph.keys()) visit(file);
   return cycles;
 }
 

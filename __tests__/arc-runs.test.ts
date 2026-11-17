@@ -1433,9 +1433,10 @@ function Main() {
 
     const driver = await beginActivatedDriver(arcHost, dialog);
 
-    await expect(arcHost.getRunView(driver.arcRunId)).resolves.toEqual(
-      expect.objectContaining({ artifactCount: 2 }),
-    );
+    const first = await arcHost.getRunView(driver.arcRunId);
+    if (first?.stage !== "actioning" || !first.generation)
+      throw new Error("Expected a live generation");
+    expect(first.artifactCount).toBe(2);
 
     await advanceView(driver, dialog, {
       reports: [],
@@ -1444,12 +1445,12 @@ function Main() {
       },
     });
 
-    await expect(arcHost.getRunView(driver.arcRunId)).resolves.toEqual(
-      expect.objectContaining({ artifactCount: 3 }),
-    );
-    await expect(arcHost.listRunViews(ALICE_OWNER)).resolves.toEqual([
-      expect.objectContaining({ artifactCount: 3 }),
-    ]);
+    const second = await arcHost.getRunView(driver.arcRunId);
+    expect(second).toMatchObject({
+      artifactCount: 3,
+      generation: first.generation,
+    });
+    expect(await arcHost.listRunViews(ALICE_OWNER)).toEqual([second]);
   });
 
   it("keeps one artifact path reachable across writer and reader nodes", async () => {

@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
 import {
+  access,
   appendFile,
   mkdir,
+  open,
   readFile,
   readdir,
+  realpath,
   rename,
+  rm,
   unlink,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import type { ArcTraversalSet } from "@elem-app/arc/runtime";
 import type { Document } from "@elem-app/arc/types";
@@ -40,11 +45,14 @@ import type { BackendName, WorkerSlotKind } from "../types/worker-slot.js";
 import { KeyedSerializer } from "../utils/keyed-serializer.js";
 import {
   arcRunKey,
+  assertHistoryRange,
+  historyPosition,
   replayStepKey,
   structurallyEqual,
   type ArcHostStore,
   type ArcRunKey,
   type CreateWorkEventInput,
+  type HistoryCursor,
   type HistoryStore,
   type ReplayStore,
   type WorkEventStore,
@@ -155,7 +163,7 @@ export class JsonFileArcHostStore implements ArcHostStore {
 
   /** Load durable traversal state for one Arc run key. */
   async getState(runKey: ArcRunKey): Promise<ArcRunState | undefined> {
-    const state = await readJson<unknown>(this.#stateFile(runKey), () =>
+    const state = await readJson<ArcRunState>(this.#stateFile(runKey), () =>
       this.#ensureDir(),
     );
     if (state === undefined) return undefined;
@@ -163,12 +171,15 @@ export class JsonFileArcHostStore implements ArcHostStore {
       state,
       `Arc run state ${JSON.stringify(runKey)}`,
     );
-    assertHostModuleState((state as ArcRunState).hostModules);
-    return state as ArcRunState;
+    assertHostModuleState(state.hostModules);
+    return state;
   }
 
-  /** Iterate every durable traversal state persisted by this store. */
-  async *listStates(): AsyncIterable<[ArcRunKey, ArcRunState]> {
+  async deleteState(runKey: ArcRunKey): Promise<void> {
+    await rm(this.#stateFile(runKey), { force: true });
+  }
+
+  async #stateKeys(): Promise<ArcRunKey[]> {
     await this.#ensureDir();
     const entries = await readdir(join(this.#dir, "states")).catch(
       (error: unknown) => {
@@ -176,12 +187,17 @@ export class JsonFileArcHostStore implements ArcHostStore {
         throw error;
       },
     );
-    const keys = entries
+    return entries
       .filter((entry) => entry.endsWith(".json"))
       .map(
         (entry) =>
           decodeURIComponent(entry.slice(0, -".json".length)) as ArcRunKey,
       );
+  }
+
+  /** Iterate every durable traversal state persisted by this store. */
+  async *listStates(): AsyncIterable<[ArcRunKey, ArcRunState]> {
+    const keys = await this.#stateKeys();
     const loaded = await Promise.all(
       keys.map(async (key) => [key, await this.getState(key)] as const),
     );
@@ -234,6 +250,12 @@ export class JsonFileHistoryStore implements HistoryStore {
     this.#dir = opts.dir;
   }
 
+  async deleteRunData(arcRunId: ArcRunId): Promise<void> {
+    await this.#appendSerializer.run(arcRunKey(arcRunId), () =>
+      rm(this.#fileFor(arcRunId), { force: true }),
+    );
+  }
+
   /** Append one entry for an Arc run. */
   async appendEntry(arcRunId: ArcRunId, entry: HistoryEntry): Promise<void> {
     await this.#appendSerializer.run(arcRunKey(arcRunId), async () => {
@@ -250,6 +272,83 @@ export class JsonFileHistoryStore implements HistoryStore {
     );
   }
 
+  async endCursor(arcRunId: ArcRunId): Promise<HistoryCursor> {
+    return this.#appendSerializer.run(arcRunKey(arcRunId), async () => {
+      const file = await this.#openHistory(arcRunId);
+      if (!file) return { byteOffset: 0 };
+      try {
+        const { size } = await file.stat();
+        await assertLineBoundary(file, size);
+        return { byteOffset: size };
+      } finally {
+        await file.close();
+      }
+    });
+  }
+
+  async *readEntries(
+    arcRunId: ArcRunId,
+    fromCursor: HistoryCursor | null,
+    until: HistoryCursor,
+  ): ReturnType<HistoryStore["readEntries"]> {
+    const start =
+      fromCursor === null ? 0 : historyPosition(fromCursor, "byteOffset");
+    const end = historyPosition(until, "byteOffset");
+    const file = await this.#openHistory(arcRunId);
+    if (!file) {
+      assertHistoryRange(start, end, 0);
+      return;
+    }
+    try {
+      assertHistoryRange(start, end, (await file.stat()).size);
+      await assertLineBoundary(file, start);
+      await assertLineBoundary(file, end);
+      let parts: Buffer[] = [];
+      for (let position = start; position < end; ) {
+        const buffer = Buffer.allocUnsafe(Math.min(16 * 1024, end - position));
+        const { bytesRead } = await file.read(
+          buffer,
+          0,
+          buffer.length,
+          position,
+        );
+        if (!bytesRead)
+          throw new RangeError("History position is unavailable.");
+        const chunk = buffer.subarray(0, bytesRead);
+        let from = 0;
+        for (
+          let lf = chunk.indexOf(10);
+          lf !== -1;
+          lf = chunk.indexOf(10, from)
+        ) {
+          const tail = chunk.subarray(from, lf);
+          const line = parts.length ? Buffer.concat([...parts, tail]) : tail;
+          parts = [];
+          from = lf + 1;
+          const entry = JSON.parse(line.toString("utf8")) as HistoryEntry;
+          const byteOffset = position + from;
+          yield {
+            entry,
+            ...(byteOffset < end && { nextCursor: { byteOffset } }),
+          };
+        }
+        if (from < bytesRead) parts.push(chunk.subarray(from));
+        position += bytesRead;
+      }
+    } finally {
+      await file.close();
+    }
+  }
+
+  async #openHistory(arcRunId: ArcRunId) {
+    try {
+      return await open(this.#fileFor(arcRunId), "r");
+    } catch (error) {
+      if (isNotFound(error)) return undefined;
+      throw error;
+    }
+  }
+
   async #ensureDir(): Promise<void> {
     if (this.#initialized) return;
     await mkdir(this.#dir, { recursive: true });
@@ -259,6 +358,18 @@ export class JsonFileHistoryStore implements HistoryStore {
   #fileFor(arcRunId: ArcRunId): string {
     return join(this.#dir, `${encodeURIComponent(arcRunKey(arcRunId))}.ndjson`);
   }
+}
+
+/** A resumable NDJSON position immediately follows a complete record. */
+async function assertLineBoundary(
+  file: FileHandle,
+  position: number,
+): Promise<void> {
+  if (!position) return;
+  const byte = Buffer.alloc(1);
+  const { bytesRead } = await file.read(byte, 0, 1, position - 1);
+  if (bytesRead !== 1 || byte[0] !== 10)
+    throw new RangeError("History position is unavailable.");
 }
 
 /**
@@ -277,6 +388,13 @@ export class JsonFileReplayStore implements ReplayStore {
   constructor(opts: { id?: string; dir: string }) {
     this.id = opts.id ?? "json-file-replay";
     this.#dir = opts.dir;
+  }
+
+  async deleteRunData(arcRunId: ArcRunId): Promise<void> {
+    const dir = this.#runDir(arcRunId);
+    await this.#appendSerializer.run(arcRunKey(arcRunId), () =>
+      rm(dir, { recursive: true, force: true }),
+    );
   }
 
   /** Append one replay step, ignoring an equal duplicate and rejecting a differing one. */
@@ -419,7 +537,6 @@ export class JsonFileReplayStore implements ReplayStore {
   ): Promise<ArcTraversalSet | undefined> {
     const checkpoint = await readJson<ReplayCheckpoint>(
       this.#checkpointFile(arcRunId, position),
-      () => this.#ensureCheckpointDir(arcRunId),
     );
     if (checkpoint) assertHostModuleState(checkpoint.hostModules);
     return checkpoint?.traversals;
@@ -427,7 +544,6 @@ export class JsonFileReplayStore implements ReplayStore {
 
   /** List all action checkpoints for an Arc run, ordered by index. */
   async listCheckpoints(arcRunId: ArcRunId): Promise<ReplayCheckpoint[]> {
-    await this.#ensureCheckpointDir(arcRunId);
     const entries = await readdir(this.#checkpointDir(arcRunId)).catch(
       (error: unknown) => {
         if (isNotFound(error)) return [];
@@ -437,10 +553,7 @@ export class JsonFileReplayStore implements ReplayStore {
     const files = entries.filter((entry) => entry.endsWith(".json"));
     const loaded = await Promise.all(
       files.map((entry) =>
-        readJson<ReplayCheckpoint>(
-          join(this.#checkpointDir(arcRunId), entry),
-          () => this.#ensureCheckpointDir(arcRunId),
-        ),
+        readJson<ReplayCheckpoint>(join(this.#checkpointDir(arcRunId), entry)),
       ),
     );
     const checkpoints = loaded.filter(
@@ -457,9 +570,7 @@ export class JsonFileReplayStore implements ReplayStore {
   }
 
   async #readSteps(arcRunId: ArcRunId): Promise<ReplayStep[]> {
-    return readJsonLines<ReplayStep>(this.#stepsFile(arcRunId), () =>
-      this.#ensureRunDir(arcRunId),
-    );
+    return readJsonLines<ReplayStep>(this.#stepsFile(arcRunId));
   }
 
   async #ensureRunDir(arcRunId: ArcRunId): Promise<void> {
@@ -471,7 +582,10 @@ export class JsonFileReplayStore implements ReplayStore {
   }
 
   #runDir(arcRunId: ArcRunId): string {
-    return join(this.#dir, encodeURIComponent(arcRunKey(arcRunId)));
+    const segment = encodeURIComponent(arcRunKey(arcRunId));
+    if (!segment || segment === "." || segment === "..")
+      throw new Error("Invalid replay directory for run.");
+    return join(this.#dir, segment);
   }
 
   #stepsFile(arcRunId: ArcRunId): string {
@@ -487,16 +601,20 @@ export class JsonFileReplayStore implements ReplayStore {
   }
 }
 
+// All handles writing the same run serialize on its registry's canonical path.
+const routineRegistryWrites = new KeyedSerializer<string>();
+
 /**
  * JSON-file routine store for the worker hub.
  *
- * Each routine is stored as one JSON file named by its routine id.
+ * Routine files are keyed by ID. Each run's registry records the IDs it owns.
  */
 export class JsonFileWorkerHubStore implements WorkerHubStore {
   /** Store identifier for diagnostics. */
   readonly id: string;
   readonly #dir: string;
   readonly #workerStateSerializer = new KeyedSerializer<string>();
+  #registryDirectory?: string;
   #initialized = false;
 
   /** Create a JSON-file hub routine store rooted at `dir`. */
@@ -505,11 +623,57 @@ export class JsonFileWorkerHubStore implements WorkerHubStore {
     this.#dir = opts.dir;
   }
 
+  async deleteRunData(arcRunId: ArcRunId): Promise<void> {
+    const file = await this.#registryFileFor(arcRunId);
+    await routineRegistryWrites.run(file, async () => {
+      const registry = await this.#readRoutineRegistry(file, arcRunId);
+      await rm(`${file}.tmp`, { force: true });
+      if (!registry) return;
+      for (const id of registry.routineIds) {
+        const payload = this.#fileFor(id);
+        await rm(payload, { force: true });
+        await rm(`${payload}.tmp`, { force: true });
+      }
+      await rm(file, { force: true });
+    });
+    await rm(this.#executionControlFileFor(arcRunId), { force: true });
+
+    const root = join(this.#dir, "worker-state");
+    const run = digestWorkerStateSegment("run", arcRunId);
+    for (const backend of await childDirectories(root)) {
+      for (const slot of await childDirectories(backend)) {
+        const owners =
+          basename(slot) === "role" ? await childDirectories(slot) : [slot];
+        for (const owner of owners)
+          await rm(join(owner, run), { recursive: true, force: true });
+      }
+    }
+  }
+
   /** Store or replace one durable routine state. */
   async putRoutine(routine: RoutineState): Promise<void> {
-    await writeJson(this.#fileFor(routine.id), routine, () =>
-      this.#ensureDir(),
-    );
+    const state = structuredClone(routine);
+    const { id, arcRunId } = state;
+    const file = await this.#registryFileFor(arcRunId);
+    const payload = this.#fileFor(id);
+    await routineRegistryWrites.run(file, async () => {
+      // A published payload already has durable membership. Status updates
+      // can replace it without reading the registry.
+      try {
+        await access(payload);
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
+        const registry = (await this.#readRoutineRegistry(file, arcRunId)) ?? {
+          arcRunId,
+          routineIds: [],
+        };
+        if (!registry.routineIds.includes(id)) {
+          registry.routineIds.push(id);
+          await writeJson(file, registry, () => this.#ensureDir());
+        }
+      }
+      await writeJson(payload, state, () => this.#ensureDir());
+    });
   }
 
   /** Load one durable routine by id. */
@@ -532,6 +696,17 @@ export class JsonFileWorkerHubStore implements WorkerHubStore {
 
   /** Iterate routines, optionally filtered to one Arc run. */
   async *listRoutines(arcRunId?: ArcRunId): AsyncIterable<RoutineState> {
+    if (arcRunId !== undefined) {
+      const registry = await this.#readRoutineRegistry(
+        await this.#registryFileFor(arcRunId),
+        arcRunId,
+      );
+      for (const id of registry?.routineIds ?? []) {
+        const routine = await this.getRoutine(id);
+        if (routine?.arcRunId === arcRunId) yield routine;
+      }
+      return;
+    }
     await this.#ensureDir();
     const entries = await readdir(this.#routineDir());
     const ids = entries
@@ -539,9 +714,7 @@ export class JsonFileWorkerHubStore implements WorkerHubStore {
       .map((entry) => decodeURIComponent(entry.slice(0, -".json".length)));
     const loaded = await Promise.all(ids.map((id) => this.getRoutine(id)));
     for (const routine of loaded) {
-      if (!routine) continue;
-      if (arcRunId && routine.arcRunId !== arcRunId) continue;
-      yield routine;
+      if (routine) yield routine;
     }
   }
 
@@ -554,6 +727,35 @@ export class JsonFileWorkerHubStore implements WorkerHubStore {
 
   #fileFor(id: string): string {
     return join(this.#routineDir(), `${encodeURIComponent(id)}.json`);
+  }
+
+  async #registryFileFor(arcRunId: ArcRunId): Promise<string> {
+    if (!this.#registryDirectory) {
+      const dir = join(this.#dir, "routines-by-run");
+      await mkdir(dir, { recursive: true });
+      this.#registryDirectory = await realpath(dir);
+    }
+    return join(
+      this.#registryDirectory,
+      `${encodeURIComponent(arcRunKey(arcRunId))}.json`,
+    );
+  }
+
+  async #readRoutineRegistry(
+    file: string,
+    arcRunId: ArcRunId,
+  ): Promise<{ arcRunId: ArcRunId; routineIds: string[] } | undefined> {
+    const registry = await readJson<unknown>(file);
+    if (registry === undefined) return undefined;
+    if (
+      !isRecord(registry) ||
+      registry.arcRunId !== arcRunId ||
+      !Array.isArray(registry.routineIds) ||
+      !registry.routineIds.every((id: unknown) => typeof id === "string")
+    ) {
+      throw new Error(`Invalid routine registry at ${file}.`);
+    }
+    return { arcRunId, routineIds: registry.routineIds };
   }
 
   /** Store or replace durable execution-control state. */
@@ -585,9 +787,7 @@ export class JsonFileWorkerHubStore implements WorkerHubStore {
   ): Promise<JsonValue | undefined> {
     const scope = { backend, slotKind, role, arcRunId, key };
     const target = this.#workerStateFile(scope);
-    const stored = await readJson<unknown>(target, () =>
-      ensureParentDirectory(target),
-    );
+    const stored = await readJson<unknown>(target);
     if (stored === undefined) return undefined;
     assertStoredWorkerState(stored, scope, target);
     return canonicalizeJsonValue(stored.value, "stored worker state");
@@ -727,6 +927,18 @@ export function digestWorkerStateSegment(
   return `h1-${digest}`;
 }
 
+async function childDirectories(root: string): Promise<string[]> {
+  try {
+    const entries = await readdir(root, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(root, entry.name));
+  } catch (error) {
+    if (isNotFound(error)) return [];
+    throw error;
+  }
+}
+
 async function ensureParentDirectory(target: string): Promise<void> {
   await mkdir(dirname(target), { recursive: true });
 }
@@ -811,9 +1023,9 @@ async function writeJson<T>(
 
 async function readJson<T>(
   target: string,
-  ensureDir: () => Promise<void>,
+  ensureDir?: () => Promise<void>,
 ): Promise<T | undefined> {
-  await ensureDir();
+  await ensureDir?.();
   try {
     const raw = await readFile(target, "utf8");
     return JSON.parse(raw) as T;
@@ -864,9 +1076,9 @@ async function writeJsonLines<T>(
 
 async function readJsonLines<T>(
   target: string,
-  ensureDir: () => Promise<void>,
+  ensureDir?: () => Promise<void>,
 ): Promise<T[]> {
-  await ensureDir();
+  await ensureDir?.();
   try {
     const raw = await readFile(target, "utf8");
     if (raw.length === 0) return [];

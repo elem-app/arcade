@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-
 import { describe, expect, it } from "vitest";
 
 import * as applicationApi from "../src/index.js";
@@ -73,6 +72,8 @@ describe("package public API", () => {
         "renderSemanticRequestForPrompt",
         "renderTaskForPrompt",
         "startArcade",
+        "SimulatorService",
+        "formatSimulationReport",
         "validateAgentRoutineReport",
         "validateRoutineReport",
       ].sort(),

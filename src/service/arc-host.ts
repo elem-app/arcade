@@ -1,9 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
-import type { Dirent } from "node:fs";
-import { readdir, rmdir } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
-
 import type {
   ActionBrief,
   ActionMove,
@@ -42,6 +36,11 @@ import type {
   HostModuleSpec,
 } from "@elem-app/arc/types";
 import { validateHostModuleSpec } from "@elem-app/arc/types";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
+import { readdir, rmdir } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 
 import { DEFAULT_WORKER_ROLE } from "../constants.js";
 import {
@@ -92,10 +91,14 @@ import type {
   ArcRunView,
   BeginInput,
   DialogProjector,
+  FreezeRunResult,
   InstructionCoverage,
+  RemoveRunResult,
+  ResolvedDocumentSnapshot,
   ResolveHandshakeResult,
   RunFrontier,
   RunTransition,
+  RunViewFilter,
 } from "../types/host.js";
 import { parseArcManifest, type ArcManifest } from "../types/manifest.js";
 import {
@@ -103,11 +106,11 @@ import {
   stripBrief,
   type ActionReplayPosition,
   type ActionReplayStep,
+  type BareTriggerBrief,
   type CompatibleReplay,
   type FailedReplay,
   type JumpedReplay,
   type RegeneratedReplay,
-  type ReplayStep,
   type TriggerReplayStep,
 } from "../types/replay.js";
 import type { RoutineReport } from "../types/routine.js";
@@ -127,9 +130,13 @@ import {
   type HandshakeStoreRetention,
   type KeyedSerializerRetention,
 } from "../utils/retention-registry.js";
+import { createDocumentRuntime } from "./document-runtime.js";
 import { HandshakeStore } from "./handshake.js";
 import { audienceDeclaration } from "./host-module-declarations.js";
-import { ModuleExecution } from "./module-execution.js";
+import {
+  ModuleExecution,
+  type WaitForModuleAcknowledgments,
+} from "./module-execution.js";
 import {
   replayPrefixAt,
   requireReplayTarget,
@@ -306,16 +313,7 @@ type LiveArcSession =
 
 type TriggeringSession = Extract<LiveArcSession, { kind: "triggering" }>;
 
-type PlannedRunStartResult =
-  | { kind: "idle" }
-  | { kind: "invalid"; reason: string; unavailable?: boolean }
-  | Extract<ArcHostStep, { kind: "trigger" }>
-  | {
-      kind: "matched";
-      arcRunId: ArcRunId;
-      frontier: RunFrontier;
-      reactivationCount: number;
-    };
+type ActionStep = Extract<ArcHostStep, { kind: "action" }>;
 
 type PreparationOperation = {
   signal?: AbortSignal;
@@ -345,6 +343,8 @@ type ActionSession = {
   kind: "actioning";
   reactivationCount: number;
   generation: string;
+  signal: AbortSignal;
+  mayCreateState?: boolean;
   preparation?: Extract<LiveArcSession, { kind: "preparing" }>;
   admissionId?: string;
   frontier?: RunFrontier;
@@ -435,7 +435,11 @@ export class ArcHostService {
     ArcRunId,
     { execution: ActionSession; cleanup: Promise<void> }
   >();
+  /** A step owns its place in this queue through host-module submission. */
+  readonly #actionSteps = new KeyedSerializer<ArcRunId>();
+  /** Freeze shares this lock with the portions of a step that advance the run. */
   readonly #actionMutations = new KeyedSerializer<ArcRunId>();
+  readonly #moduleWaits = new Map<ArcRunId, WaitForModuleAcknowledgments>();
   readonly #frontierIds = new WeakMap<object, string>();
   readonly #moduleExecutions = new Map<ArcRunId, ModuleExecution>();
   #stopped = false;
@@ -537,9 +541,7 @@ export class ArcHostService {
     );
     const results = await Promise.allSettled(
       [...this.#moduleExecutions.keys()].map((arcRunId) =>
-        this.#actionMutations.run(arcRunId, () =>
-          this.#retireExecution(arcRunId),
-        ),
+        this.#runActionStep(arcRunId, () => this.#retireExecution(arcRunId)),
       ),
     );
     errors.push(
@@ -628,7 +630,7 @@ export class ArcHostService {
   async #openModuleExecution(
     arcRunId: ArcRunId,
     action: boolean,
-  ): Promise<void> {
+  ): Promise<ModuleExecution> {
     const previous = this.#moduleExecutions.get(arcRunId);
     if (previous) await previous.release();
     if (this.#stopped) throw new Error("The arc host has stopped.");
@@ -648,6 +650,7 @@ export class ArcHostService {
         throw new AdmissionCancelled();
       }
     }
+    return execution;
   }
 
   async #retireExecution(arcRunId: ArcRunId): Promise<void> {
@@ -691,10 +694,11 @@ export class ArcHostService {
     reactivationCount: number,
   ): Promise<ActionSession> {
     const previous = this.#liveSessions.get(arcRunKey(arcRunId));
-    await this.#openModuleExecution(arcRunId, true);
+    const execution = await this.#openModuleExecution(arcRunId, true);
     const session: ActionSession = {
       kind: "actioning",
       generation: randomUUID(),
+      signal: execution.controller.signal,
       reactivationCount,
       phase: { kind: "starting" },
       preparation: previous?.kind === "preparing" ? previous : undefined,
@@ -714,6 +718,80 @@ export class ArcHostService {
     await this.#retireExecution(arcRunId);
   }
 
+  /**
+   * Commit a durable run to removal and retire its execution. Drivers coordinate
+   * execution admission before freezing. Pass the observed view to detect a
+   * concurrent re-entry, or null when retrying an ID with no visible run.
+   */
+  async freezeRun(
+    arcRunId: ArcRunId,
+    expected?: Pick<
+      Extract<ArcRunView, { stage: "actioning" }>,
+      "lifecycle" | "reactivationCount" | "updatedAt" | "generation"
+    > | null,
+  ): Promise<FreezeRunResult> {
+    const key = arcRunKey(arcRunId);
+    // Two advances can have the same wall-clock timestamp. An overlapping
+    // handback still supersedes the observation used to authorize this freeze.
+    const observedFrontier =
+      this.#actionSession(arcRunId)?.frontier?.frontierId;
+    const outcome = (
+      state: ArcRunState | undefined,
+    ): FreezeRunResult["outcome"] | undefined => {
+      if (!state) return "missing";
+      if (state.frozen) return "frozen";
+      if (
+        expected === null ||
+        (expected &&
+          (state.lifecycle !== expected.lifecycle ||
+            state.reactivationCount !== expected.reactivationCount ||
+            state.updatedAt !== expected.updatedAt ||
+            this.#actionSession(arcRunId)?.generation !== expected.generation ||
+            this.#actionSession(arcRunId)?.frontier?.frontierId !==
+              observedFrontier))
+      )
+        return "changed";
+    };
+    const prior = outcome(await this.#store.getState(key));
+    if (prior === "missing" || prior === "changed")
+      return { outcome: prior, arcRunId };
+
+    return this.#actionMutations.run(arcRunId, () =>
+      this.#reentrySerializer.run(
+        arcRunId,
+        async (): Promise<FreezeRunResult> => {
+          const current = await this.#store.getState(key);
+          if (!current) return { outcome: "missing", arcRunId };
+          const result = outcome(current);
+          if (result) return { outcome: result, arcRunId };
+          await this.#store.putState(key, { ...current, frozen: true });
+          const session = this.#actionSession(arcRunId);
+          if (session)
+            void this.#retireAction(arcRunId, session).catch((error: unknown) =>
+              this.#logger.info("arc_host.cleanup.failed", {
+                arcRunId,
+                message: String(error),
+              }),
+            );
+          return { outcome: "frozen", arcRunId };
+        },
+      ),
+    );
+  }
+
+  /** Delete a frozen run's replay and then its durable state. */
+  async removeRun(arcRunId: ArcRunId): Promise<RemoveRunResult> {
+    return this.#reentrySerializer.run(arcRunId, async () => {
+      const key = arcRunKey(arcRunId);
+      const state = await this.#store.getState(key);
+      if (!state) return { outcome: "missing", arcRunId };
+      if (!state.frozen) return { outcome: "in-use", arcRunId };
+      await this.#replayStore?.deleteRunData(arcRunId);
+      await this.#store.deleteState(key);
+      return { outcome: "removed", arcRunId };
+    });
+  }
+
   /** Relinquish this execution while preserving its committed durable state. */
   releaseAction(arcRunId: ArcRunId, frontierId: string): Promise<void> {
     const retiring = this.#actionReleases.get(arcRunId);
@@ -723,12 +801,12 @@ export class ArcHostService {
     if (!execution || !frontierId.startsWith(`${execution.generation}:`))
       return Promise.resolve();
     this.#moduleExecutions.get(arcRunId)?.abort();
-    const cleanup = this.#actionMutations
-      .run(arcRunId, () => this.#retireAction(arcRunId, execution))
-      .finally(() => {
-        if (this.#actionReleases.get(arcRunId)?.cleanup === cleanup)
-          this.#actionReleases.delete(arcRunId);
-      });
+    const cleanup = this.#runActionStep(arcRunId, () =>
+      this.#retireAction(arcRunId, execution),
+    ).finally(() => {
+      if (this.#actionReleases.get(arcRunId)?.cleanup === cleanup)
+        this.#actionReleases.delete(arcRunId);
+    });
     this.#actionReleases.set(arcRunId, { execution, cleanup });
     return cleanup;
   }
@@ -928,12 +1006,50 @@ export class ArcHostService {
     }
   }
 
+  /** Keep ordinary steps ordered across submission. Freeze can take the run
+   * after the pending call commits and before the acknowledgment is applied. */
+  #runActionStep<T>(
+    arcRunId: ArcRunId,
+    task: () => Promise<T>,
+    reentry = false,
+  ): Promise<T> {
+    return this.#actionSteps.run(arcRunId, async () => {
+      const acquire = async () => {
+        const releaseAction = await this.#actionMutations.acquire(arcRunId);
+        if (!reentry) return releaseAction;
+        const releaseReentry = await this.#reentrySerializer.acquire(arcRunId);
+        return () => {
+          releaseReentry();
+          releaseAction();
+        };
+      };
+      let release = await acquire();
+      const waitForModule: WaitForModuleAcknowledgments = async (
+        submission,
+      ) => {
+        release();
+        try {
+          return await submission;
+        } finally {
+          release = await acquire();
+        }
+      };
+      this.#moduleWaits.set(arcRunId, waitForModule);
+      try {
+        return await task();
+      } finally {
+        this.#moduleWaits.delete(arcRunId);
+        release();
+      }
+    });
+  }
+
   #mutateAction(
     arcRunId: ArcRunId,
     frontierId: string,
     operation: () => Promise<RunFrontier>,
   ): Promise<Extract<ArcHostStep, { kind: "action" }>> {
-    return this.#actionMutations.run(arcRunId, async () => {
+    return this.#runActionStep(arcRunId, async () => {
       const session = this.#actionSession(arcRunId);
       if (!frontierId)
         throw new TypeError(
@@ -952,6 +1068,7 @@ export class ArcHostService {
         arcRunId,
         frontier,
         reactivationCount: session.reactivationCount,
+        signal: session.signal,
       };
     });
   }
@@ -1061,15 +1178,58 @@ export class ArcHostService {
     return documents;
   }
 
+  /** Detached declarations visible to a private draft, including modules it alone imports. */
+  captureHostModuleDeclarations(): ReadonlyMap<string, HostModuleSpec> {
+    return structuredClone(this.#hostModuleSpecs());
+  }
+
+  /** Capture detached published definitions for the selected roots and their imports. */
+  async captureDocumentSnapshot(
+    roots: readonly ArcRef[],
+  ): Promise<ResolvedDocumentSnapshot> {
+    const ids = new Map(this.#latestDocumentRecordIds);
+    const modules = this.#hostModuleSpecs();
+    const pending = roots.map((ref) => {
+      if (!this.#arcs.has(ref)) throw new Error(`Unknown Arc root: ${ref}.`);
+      return toArcRefParts(ref).source;
+    });
+    const documents = new Map<string, Document>();
+    const hostModules = new Map<string, HostModuleSpec>();
+    for (const source of pending) {
+      if (documents.has(source)) continue;
+      const id = ids.get(source);
+      const record = id && (await this.#store.getArcDocumentRecord(id));
+      if (!record) throw new Error(`Missing document for ${source}.`);
+      const document = structuredClone(record.document);
+      documents.set(source, document);
+      for (const binding of document.imports) pending.push(binding.source);
+      for (const binding of document.hostModules) {
+        const declaration = modules.get(binding.module);
+        if (!declaration)
+          throw new Error(`Missing host module ${binding.module}.`);
+        hostModules.set(binding.module, structuredClone(declaration));
+      }
+    }
+    return {
+      documents: [...documents].map(([source, document]) => ({
+        source,
+        document,
+      })),
+      hostModules,
+    };
+  }
+
   #buildRuntime(
     documents: ReadonlyMap<string, Document>,
     hostModules: ReadonlyMap<string, HostModuleSpec> = this.#hostModuleSpecs(),
   ): Runtime {
-    const runtime = new Runtime({ hostModules });
-    for (const [source, document] of documents) {
-      runtime.add(source, document);
-    }
-    return runtime.init();
+    return createDocumentRuntime({
+      documents: Array.from(documents, ([source, document]) => ({
+        source,
+        document,
+      })),
+      hostModules,
+    });
   }
 
   /**
@@ -1287,7 +1447,10 @@ export class ArcHostService {
   async getRunView(arcRunId: ArcRunId): Promise<ArcRunView | undefined> {
     const preparation = this.#readPreparationView(arcRunId);
     const state = await this.#store.getState(arcRunKey(arcRunId));
-    return state ? arcRunView(state) : preparation;
+    if (state?.frozen) return undefined;
+    return state
+      ? arcRunView(state, this.#actionSession(arcRunId)?.generation)
+      : preparation;
   }
 
   async getRunWorkspaceContext(arcRunId: ArcRunId): Promise<{
@@ -1309,10 +1472,11 @@ export class ArcHostService {
       };
     }
     if (live?.kind === "triggering") {
-      const root =
+      const roots =
         live.origin?.kind === "deflected"
-          ? live.origin.state.arcRef
-          : this.#rootForTriggerBrief(live.brief);
+          ? [live.origin.state.arcRef]
+          : [...new Set(this.#triggerRootGroups(live.brief).flat())];
+      const root = roots.length === 1 ? roots[0] : undefined;
       const bundle = root
         ? (await this.#sourceRecordForSnapshot(live.snapshotId, root)).manifest
             .bundle
@@ -1325,7 +1489,7 @@ export class ArcHostService {
     }
 
     const state = await this.#store.getState(arcRunKey(arcRunId));
-    if (!state) {
+    if (!state || state.frozen) {
       throw new Error(`Arc run ${arcRunId} has no workspace context.`);
     }
     const { manifest } = await this.#sourceRecordForSnapshot(
@@ -1396,18 +1560,36 @@ export class ArcHostService {
     return removed;
   }
 
-  /** List live preparation and persisted execution views, optionally by owner. */
-  async listRunViews(ownerPrincipal?: string): Promise<ArcRunView[]> {
-    const ids = new Set<ArcRunId>();
-    for await (const [, state] of this.#store.listStates())
-      ids.add(state.arcRunId);
-    for (const key of this.#liveSessions.keys())
-      ids.add(decodeURIComponent(key));
-    for (const handshake of this.#handshakes.listPending())
-      ids.add(handshake.triggerSelection.arcRunId);
+  /** List runs by owner and freeze status. Ordinary lists hide frozen runs. */
+  async listRunViews(
+    filter: RunViewFilter | string = {},
+  ): Promise<ArcRunView[]> {
+    const { ownerPrincipal, frozen = false } =
+      typeof filter === "string" ? { ownerPrincipal: filter } : filter;
     const runs: ArcRunView[] = [];
-    for (const id of ids) {
-      const view = await this.getRunView(id);
+    const liveIds = new Set<ArcRunId>();
+    const generations = new Map<ArcRunId, string>();
+    if (frozen !== true) {
+      for (const [key, session] of this.#liveSessions) {
+        const id = decodeURIComponent(key);
+        liveIds.add(id);
+        if (session.kind === "actioning")
+          generations.set(id, session.generation);
+      }
+      for (const handshake of this.#handshakes.listPending())
+        liveIds.add(handshake.triggerSelection.arcRunId);
+    }
+    for await (const [, state] of this.#store.listStates()) {
+      liveIds.delete(state.arcRunId);
+      if (
+        (frozen === "all" || Boolean(state.frozen) === frozen) &&
+        (ownerPrincipal === undefined ||
+          state.ownerPrincipal === ownerPrincipal)
+      )
+        runs.push(arcRunView(state, generations.get(state.arcRunId)));
+    }
+    for (const id of liveIds) {
+      const view = this.#readPreparationView(id);
       if (
         view &&
         (ownerPrincipal === undefined || view.ownerPrincipal === ownerPrincipal)
@@ -1495,9 +1677,9 @@ export class ArcHostService {
     if (this.#stopped) return [];
     if (input.arcRunId !== undefined) {
       const arcRunId = input.arcRunId;
-      return this.#actionMutations.run(arcRunId, async () => {
+      return this.#runActionStep(arcRunId, async () => {
         const state = await this.#store.getState(arcRunKey(arcRunId));
-        if (state && state.lifecycle !== "active") return [];
+        if (state && (state.frozen || state.lifecycle !== "active")) return [];
         const live = this.#liveSessions.get(arcRunKey(arcRunId));
         if (live?.kind === "triggering")
           return [
@@ -1526,6 +1708,7 @@ export class ArcHostService {
               arcRunId,
               frontier,
               reactivationCount: retained.reactivationCount,
+              signal: retained.signal,
             },
           ];
         }
@@ -1547,6 +1730,7 @@ export class ArcHostService {
               arcRunId,
               frontier,
               reactivationCount: session.reactivationCount,
+              signal: session.signal,
             },
           ];
         } catch (error) {
@@ -1675,6 +1859,7 @@ export class ArcHostService {
       for await (const [, state] of this.#store.listStates()) {
         if (request.signal?.aborted) throw new AdmissionCancelled();
         if (
+          state.frozen ||
           state.ownerPrincipal !== request.principal ||
           state.lifecycle !== "deflected" ||
           (request.arcRefs !== undefined &&
@@ -1997,12 +2182,7 @@ export class ArcHostService {
                   arcRef: group.arcRef,
                   reason: started.reason,
                 }
-              : {
-                  kind: "action",
-                  arcRunId: started.arcRunId,
-                  frontier: started.frontier,
-                  reactivationCount: started.reactivationCount,
-                },
+              : started,
           );
         }
       }
@@ -2330,78 +2510,81 @@ export class ArcHostService {
           (item) => item.arcRunId === choice.arcRunId,
         );
         if (reentrySelection) {
-          return this.#reentrySerializer.run(choice.arcRunId, async () => {
-            const state = await this.#store.getState(
-              arcRunKey(choice.arcRunId),
-            );
-            if (
-              !state ||
-              state.lifecycle !== "deflected" ||
-              state.ownerPrincipal !== handshake.principal ||
-              state.arcRef !== reentrySelection.arcRef ||
-              state.snapshotId !== reentrySelection.snapshotId ||
-              state.updatedAt !== reentrySelection.expectedUpdatedAt ||
-              state.reactivationCount + 1 !== reentrySelection.reactivationCount
-            ) {
-              return {
-                status: "invalid",
-                reason: `Run ${choice.arcRunId} changed after trigger planning.`,
-              };
-            }
-            if (
-              !this.#consumeHandshake(
-                handshake,
-                { kind: "reentry", arcRunId: choice.arcRunId },
-                operation,
+          return this.#runActionStep(
+            choice.arcRunId,
+            async () => {
+              const state = await this.#store.getState(
+                arcRunKey(choice.arcRunId),
+              );
+              if (
+                !state ||
+                state.frozen ||
+                state.lifecycle !== "deflected" ||
+                state.ownerPrincipal !== handshake.principal ||
+                state.arcRef !== reentrySelection.arcRef ||
+                state.snapshotId !== reentrySelection.snapshotId ||
+                state.updatedAt !== reentrySelection.expectedUpdatedAt ||
+                state.reactivationCount + 1 !==
+                  reentrySelection.reactivationCount
+              ) {
+                return {
+                  status: "invalid",
+                  reason: `Run ${choice.arcRunId} changed after trigger planning.`,
+                };
+              }
+              if (
+                !this.#consumeHandshake(
+                  handshake,
+                  { kind: "reentry", arcRunId: choice.arcRunId },
+                  operation,
+                )
               )
-            )
-              return { status: "missing" };
-            this.#claimPending(handshake.triggerSelection.arcRunId);
-            const frontier = await this.#activateDeflectedReentry(
+                return { status: "missing" };
+              this.#claimPending(handshake.triggerSelection.arcRunId);
+              const step = await this.#activateDeflectedReentry(
+                state,
+                reentrySelection,
+                opts.projectDialog,
+              );
+              return {
+                status: "ok",
+                step,
+              };
+            },
+            true,
+          );
+        }
+        return this.#reentrySerializer.run(choice.arcRunId, async () => {
+          const state = await this.#store.getState(arcRunKey(choice.arcRunId));
+          if (
+            !state ||
+            !this.#isRunChoiceCandidateState(
               state,
-              reentrySelection,
-              opts.projectDialog,
-            );
+              handshake.arcRef,
+              handshake.principal,
+            )
+          ) {
             return {
-              status: "ok",
-              step: {
-                kind: "action",
-                arcRunId: state.arcRunId,
-                frontier,
-                reactivationCount: reentrySelection.reactivationCount,
-              },
+              status: "invalid",
+              reason: `Run ${choice.arcRunId} cannot be advanced.`,
             };
-          });
-        }
-        const state = await this.#store.getState(arcRunKey(choice.arcRunId));
-        if (
-          !state ||
-          !this.#isRunChoiceCandidateState(
-            state,
-            handshake.arcRef,
-            handshake.principal,
+          }
+          if (
+            !this.#consumeHandshake(
+              handshake,
+              { kind: "join", arcRunId: choice.arcRunId },
+              operation,
+            )
           )
-        ) {
+            return { status: "missing" };
+          // Validated active run: worker hub publishes additive attachment without
+          // scheduling or mutating the selected run.
           return {
-            status: "invalid",
-            reason: `Run ${choice.arcRunId} cannot be advanced.`,
+            status: "joined",
+            arcRunId: choice.arcRunId,
+            reactivationCount: state.reactivationCount,
           };
-        }
-        if (
-          !this.#consumeHandshake(
-            handshake,
-            { kind: "join", arcRunId: choice.arcRunId },
-            operation,
-          )
-        )
-          return { status: "missing" };
-        // Validated active run: worker hub publishes additive attachment without
-        // scheduling or mutating the selected run.
-        return {
-          status: "joined",
-          arcRunId: choice.arcRunId,
-          reactivationCount: state.reactivationCount,
-        };
+        });
       }
 
       if (!(handshake.freshAvailable ?? requirement.freshAvailable)) {
@@ -2493,12 +2676,7 @@ export class ArcHostService {
     });
     return {
       status: "ok",
-      step: {
-        kind: "action",
-        arcRunId: started.arcRunId,
-        frontier: started.frontier,
-        reactivationCount: started.reactivationCount,
-      },
+      step: started,
     };
   }
 
@@ -2550,7 +2728,7 @@ export class ArcHostService {
       request: ActivationRequest;
     },
     recorder: RecordingRuntime,
-  ): Promise<Extract<PlannedRunStartResult, { kind: "trigger" }>> {
+  ): Promise<Extract<ArcHostStep, { kind: "trigger" }>> {
     const key = arcRunKey(arcRunId);
     const workspacePath = defaultRunWorkspaceRoot(this.#artifactRoot, arcRunId);
     const session: TriggeringSession = {
@@ -2589,7 +2767,9 @@ export class ArcHostService {
       ownerPrincipal: string;
       projectDialog: DialogProjector;
     },
-  ): Promise<Extract<PlannedRunStartResult, { kind: "matched" | "invalid" }>> {
+  ): Promise<
+    ActionStep | { kind: "invalid"; reason: string; unavailable?: boolean }
+  > {
     const preparing = this.#prepare(
       selection.arcRunId,
       opts.ownerPrincipal,
@@ -2619,34 +2799,30 @@ export class ArcHostService {
         arcRunKey(selection.arcRunId),
       );
       this.#claimPending(selection.arcRunId);
-      const frontier = await this.#activateMatchedRun(
-        selection.arcRunId,
-        {
-          arcRef: selection.arcRef,
-          deps: selection.deps,
-          snapshotId: selection.snapshotId,
-          traversals: selection.traversals,
-          reactivationCount: 0,
-          workspacePath,
-          contextIsolation: manifest.contextIsolation,
-          ownerPrincipal: opts.ownerPrincipal,
-          artifactPaths: existing?.artifactPaths ?? [],
-          hostModules: { calls: [] },
-        },
-        opts.projectDialog,
-        {
-          route: "fresh",
-          appendBegun: !existing,
-          triggerSteps: selection.triggerSteps,
-          assertAvailable: () => this.#assertFreshAvailable(selection),
-        },
+      return await this.#runActionStep(selection.arcRunId, () =>
+        this.#activateMatchedRun(
+          selection.arcRunId,
+          {
+            arcRef: selection.arcRef,
+            deps: selection.deps,
+            snapshotId: selection.snapshotId,
+            traversals: selection.traversals,
+            reactivationCount: 0,
+            workspacePath,
+            contextIsolation: manifest.contextIsolation,
+            ownerPrincipal: opts.ownerPrincipal,
+            artifactPaths: existing?.artifactPaths ?? [],
+            hostModules: { calls: [] },
+          },
+          opts.projectDialog,
+          {
+            route: "fresh",
+            appendBegun: !existing,
+            triggerSteps: selection.triggerSteps,
+            assertAvailable: () => this.#assertFreshAvailable(selection),
+          },
+        ),
       );
-      return {
-        kind: "matched",
-        arcRunId: selection.arcRunId,
-        frontier,
-        reactivationCount: 0,
-      };
     } catch (error) {
       if (!(error instanceof FreshActivationUnavailable)) throw error;
       return { kind: "invalid", reason: error.message, unavailable: true };
@@ -2655,23 +2831,17 @@ export class ArcHostService {
     }
   }
 
-  #rootForTriggerBrief(brief: TriggerBrief): ArcRef | undefined {
-    const roots = new Set<ArcRef>(brief.matchableArcs);
-    const addNodeRoot = (ref: NodeRef) => {
-      const parts = toNodeRefParts(ref);
-      roots.add(toArcRef(parts.source, parts.path[0] ?? ""));
+  #triggerRootGroups(brief: BareTriggerBrief): (readonly ArcRef[])[] {
+    const root = (item: { sourceRef: NodeRef }) => {
+      const { source, path } = toNodeRefParts(item.sourceRef);
+      return toArcRef(source, path[0] ?? "");
     };
-    for (const item of brief.judgments) {
-      addNodeRoot(item.sourceRef);
-    }
-    for (const item of brief.observations) {
-      addNodeRoot(item.sourceRef);
-    }
-    for (const item of brief.hostCalls) {
-      addNodeRoot(item.sourceRef);
-    }
-    if (roots.size !== 1) return undefined;
-    return [...roots][0]!;
+    return [
+      brief.matchableArcs,
+      brief.judgments.map(root),
+      brief.observations.map(root),
+      brief.hostCalls.map(root),
+    ];
   }
 
   async #activateMatchedRun(
@@ -2684,28 +2854,34 @@ export class ArcHostService {
       triggerSteps?: readonly TriggerReplayStep[];
       assertAvailable?: () => void;
     },
-  ): Promise<RunFrontier> {
-    return this.#actionMutations.run(arcRunId, async () => {
-      const session = await this.#newActionSession(
-        arcRunId,
-        activated.reactivationCount,
+  ): Promise<ActionStep> {
+    const session = await this.#newActionSession(
+      arcRunId,
+      activated.reactivationCount,
+    );
+    session.mayCreateState = opts.route === "fresh";
+    try {
+      const frontier = await this.#mutateActionLocked(arcRunId, () =>
+        this.#activateMatchedRunUnderMutation(
+          arcRunId,
+          activated,
+          projectDialog,
+          opts,
+        ),
       );
-      try {
-        return await this.#mutateActionLocked(arcRunId, () =>
-          this.#activateMatchedRunUnderMutation(
-            arcRunId,
-            activated,
-            projectDialog,
-            opts,
-          ),
-        );
-      } catch (error) {
-        await this.#retireAction(arcRunId, session);
-        throw error;
-      } finally {
-        session.preparation = undefined;
-      }
-    });
+      return {
+        kind: "action",
+        arcRunId,
+        frontier,
+        reactivationCount: session.reactivationCount,
+        signal: session.signal,
+      };
+    } catch (error) {
+      await this.#retireAction(arcRunId, session);
+      throw error;
+    } finally {
+      session.preparation = undefined;
+    }
   }
 
   async #activateMatchedRunUnderMutation(
@@ -2785,7 +2961,7 @@ export class ArcHostService {
     existing: ArcRunState,
     selection: PendingReentrySelection,
     projectDialog: DialogProjector,
-  ): Promise<RunFrontier> {
+  ): Promise<ActionStep> {
     await this.#replayStore?.truncateAfterReactivationCount(
       existing.arcRunId,
       existing.reactivationCount,
@@ -2819,7 +2995,7 @@ export class ArcHostService {
     const candidates: RunChoiceCandidate[] = [];
     for (const selection of selections) {
       const state = await this.#store.getState(arcRunKey(selection.arcRunId));
-      if (!state || state.lifecycle !== "deflected") continue;
+      if (!state || state.frozen || state.lifecycle !== "deflected") continue;
       candidates.push({
         arcRunId: state.arcRunId,
         arcRef: state.arcRef,
@@ -3243,7 +3419,7 @@ export class ArcHostService {
 
   async #stateFor(arcRunId: ArcRunId): Promise<ArcRunRuntimeState | undefined> {
     const existing = await this.#store.getState(arcRunKey(arcRunId));
-    if (!existing) return undefined;
+    if (!existing || existing.frozen) return undefined;
     assertHostModuleState(existing.hostModules);
     return {
       arcRef: existing.arcRef,
@@ -3385,18 +3561,68 @@ export class ArcHostService {
     return { status: "idle" };
   }
 
-  /**
-   * The arcs that participated in a recorded run's trigger resolution, read from
-   * its first trigger brief (which evaluates every candidate arc upfront).
-   */
-  #recordedTriggerDeps(steps: readonly ReplayStep[]): readonly ArcRef[] {
-    const firstBrief = steps.find((step) => step.kind === "trigger-brief");
-    return firstBrief?.kind === "trigger-brief" ? firstBrief.brief.deps : [];
+  /** Recover untargeted participants in the order observable in the recorded trigger episode. */
+  #recordedTriggerRoots(prefix: RegeneratedReplay): ArcRef[] | undefined {
+    if (
+      prefix.triggerSteps[0]?.kind === "trigger-start" &&
+      prefix.triggerSteps[0].arcRefs !== undefined
+    )
+      return undefined;
+    const predecessors = new Map<ArcRef, Set<ArcRef>>();
+    const remember = (ref: ArcRef) => {
+      if (!predecessors.has(ref)) predecessors.set(ref, new Set());
+    };
+    for (const step of prefix.triggerSteps) {
+      if (step.position.reactivationCount !== 0) break;
+      if (step.kind !== "trigger-brief") continue;
+      if (step.brief.matched) remember(step.brief.matched);
+      // Each kind of work preserves evaluation order within its own array.
+      // Later briefs can establish the order between roots that initially
+      // asked for different kinds of work.
+      for (const group of this.#triggerRootGroups(step.brief)) {
+        let previous: ArcRef | undefined;
+        for (const ref of group) {
+          remember(ref);
+          if (previous !== undefined && previous !== ref)
+            predecessors.get(ref)!.add(previous);
+          previous = ref;
+        }
+      }
+    }
+    for (const traversal of prefix.checkpoints[0]!.traversals)
+      remember(traversal.ref);
+
+    // Start in registry order where the recording leaves roots unordered.
+    // Emit recorded predecessors before their successor, including renamed
+    // roots that are no longer registered under their original ref.
+    const roots: ArcRef[] = [];
+    const pending: ArcRef[] = [];
+    for (const root of new Set([
+      ...this.#arcs.keys(),
+      ...predecessors.keys(),
+    ])) {
+      if (!predecessors.has(root)) continue;
+      pending.push(root);
+      while (pending.length) {
+        const ref = pending.at(-1)!;
+        const before = predecessors.get(ref);
+        const earlier = before?.values().next().value;
+        if (before && earlier !== undefined) {
+          before.delete(earlier);
+          pending.push(earlier);
+        } else {
+          pending.pop();
+          if (predecessors.delete(ref)) roots.push(ref);
+        }
+      }
+    }
+    return roots;
   }
 
   async #pinSnapshot(
     deps: readonly ArcRef[],
     recordIds: ReadonlyMap<string, string> = this.#latestDocumentRecordIds,
+    capturedModules?: ReadonlyMap<string, HostModuleSpec>,
   ): Promise<ArcDocumentSnapshotId> {
     const sources = new Set<string>();
     for (const dep of deps) sources.add(toArcRefParts(dep).source);
@@ -3416,7 +3642,10 @@ export class ArcHostService {
       }
       capturedDocuments.push(record.document);
     }
-    const hostModuleSpecs = this.#captureHostModuleSpecs(capturedDocuments);
+    const hostModuleSpecs = this.#captureHostModuleSpecs(
+      capturedDocuments,
+      capturedModules,
+    );
     const snapshotId = `arc-snapshot:${randomUUID()}`;
     await this.#store.putArcDocumentSnapshot({
       id: snapshotId,
@@ -3429,6 +3658,7 @@ export class ArcHostService {
 
   #captureHostModuleSpecs(
     documents: readonly Document[],
+    declarations = this.#hostModuleSpecs(),
   ): Readonly<Record<string, HostModuleSpec>> {
     const modules = new Set<string>();
     for (const document of documents) {
@@ -3436,13 +3666,13 @@ export class ArcHostService {
     }
     return Object.fromEntries(
       [...modules].sort().map((module) => {
-        const implementation = this.#hostModules.get(module);
-        if (!implementation) {
+        const declaration = declarations.get(module);
+        if (!declaration) {
           throw new Error(
             `Cannot snapshot unregistered host module ${JSON.stringify(module)}.`,
           );
         }
-        return [module, structuredClone(implementation.declaration)];
+        return [module, structuredClone(declaration)];
       }),
     );
   }
@@ -3712,14 +3942,9 @@ export class ArcHostService {
     const iso = createReplayIso();
     iso.arcs.set(sourceRun.arcRef, candidateArcRef);
     const recordIds = new Map(this.#latestDocumentRecordIds);
-    const triggerScopeDeps = this.#recordedTriggerDeps(steps).map(
-      (dep) => iso.arcs.get(dep) ?? dep,
-    );
-    let triggerRuntime = triggerScopeDeps.length
-      ? await this.#runtimeForSnapshot(
-          await this.#pinSnapshot(triggerScopeDeps, recordIds),
-        )
-      : this.#latestRuntime;
+    const participatingRoots = this.#recordedTriggerRoots(prefix);
+    let triggerRuntime = this.#latestRuntime;
+    const declarations = this.#hostModuleSpecs();
     let snapshotId: ArcDocumentSnapshotId | undefined;
     let snapshotRuntime: Runtime | undefined;
     let binding: { arcRef: ArcRef; deps: readonly ArcRef[] } | undefined;
@@ -3735,6 +3960,8 @@ export class ArcHostService {
       const episode = stageReplayIso(iso);
       const trigger = alignTriggerReplay({
         triggerRuntime,
+        participatingRoots:
+          reactivationCount === 0 ? participatingRoots : undefined,
         steps,
         candidateArcRef,
         iso: episode.iso,
@@ -3748,7 +3975,11 @@ export class ArcHostService {
         break;
       }
       if (!snapshotRuntime) {
-        snapshotId = await this.#pinSnapshot(trigger.deps, recordIds);
+        snapshotId = await this.#pinSnapshot(
+          trigger.deps,
+          recordIds,
+          declarations,
+        );
         snapshotRuntime = await this.#runtimeForSnapshot(snapshotId);
       }
       const action = alignActionReplay({
@@ -3807,7 +4038,7 @@ export class ArcHostService {
   async #captureReplaySource(
     arcRunId: ArcRunId,
   ): Promise<{ run: ArcRunState; prefix: RegeneratedReplay }> {
-    return this.#actionMutations.run(arcRunId, async () => {
+    return this.#runActionStep(arcRunId, async () => {
       const replayStore = this.#requireReplayStore();
       const run = await this.#requireRunState(arcRunId);
       const steps = await replayStore.listSteps(arcRunId);
@@ -3923,7 +4154,7 @@ export class ArcHostService {
 
   async #requireRunState(arcRunId: ArcRunId): Promise<ArcRunState> {
     const state = await this.#store.getState(arcRunKey(arcRunId));
-    if (!state) throw new Error(`Unknown Arc run ${arcRunId}.`);
+    if (!state || state.frozen) throw new Error(`Unknown Arc run ${arcRunId}.`);
     assertHostModuleState(state.hostModules);
     return state;
   }
@@ -4157,26 +4388,25 @@ export class ArcHostService {
             );
         continue;
       }
-      const failure = await this.#moduleExecutions
-        .get(arcRunId)!
-        .submit(
-          state.hostModules,
-          brief.hostCalls,
-          { arcRunId, arcRef: state.arcRef },
-          brief.traversals,
-          async (publications = []) => {
-            opts.deferStatePublish = false;
-            await recorder.captureHostModuleState(brief);
-            for (const publication of publications) {
-              this.#captureRunEvent(opts.events.staged, () => ({
-                kind: "host-module:call",
-                arcRunId,
-                ...publication,
-              }));
-            }
-            await publishState(state);
-          },
-        );
+      const failure = await this.#moduleExecutions.get(arcRunId)!.submit(
+        state.hostModules,
+        brief.hostCalls,
+        { arcRunId, arcRef: state.arcRef },
+        brief.traversals,
+        async (publications = []) => {
+          opts.deferStatePublish = false;
+          await recorder.captureHostModuleState(brief);
+          for (const publication of publications) {
+            this.#captureRunEvent(opts.events.staged, () => ({
+              kind: "host-module:call",
+              arcRunId,
+              ...publication,
+            }));
+          }
+          await publishState(state);
+        },
+        this.#moduleWaits.get(arcRunId),
+      );
 
       if (failure) {
         brief = await recorder.progress(
@@ -4798,6 +5028,11 @@ export class ArcHostService {
   ): Promise<void> {
     this.#moduleExecutions.get(arcRunId)?.assertOpen();
     const existing = await this.#store.getState(arcRunKey(arcRunId));
+    const session = this.#actionSession(arcRunId);
+    if (existing?.frozen)
+      throw new Error(`Cannot update frozen Arc run ${arcRunId}.`);
+    if (!existing && !session?.mayCreateState)
+      throw new Error(`Cannot update missing Arc run ${arcRunId}.`);
     const lifecycle = lifecycleFromTraversals(state.arcRef, state.traversals);
     const now = new Date().toISOString();
     await this.#store.putState(arcRunKey(arcRunId), {
@@ -4816,6 +5051,7 @@ export class ArcHostService {
       artifactPaths: [...state.artifactPaths],
       hostModules: structuredClone(state.hostModules),
     });
+    if (session) session.mayCreateState = false;
     if (events.start) {
       events.committed.push(events.start);
       events.start = undefined;
@@ -4876,6 +5112,7 @@ export class ArcHostService {
       arcRef: ArcRef;
       ownerPrincipal: string;
       lifecycle?: ArcRunLifecycle;
+      frozen?: true;
     },
     arcRef: ArcRef,
     ownerPrincipal: string,
@@ -4883,6 +5120,7 @@ export class ArcHostService {
     lifecycle: Extract<ArcRunLifecycle, "active" | "deflected">;
   } {
     return (
+      !state.frozen &&
       state.ownerPrincipal === ownerPrincipal &&
       state.arcRef === arcRef &&
       (state.lifecycle === "active" || state.lifecycle === "deflected")
@@ -5522,9 +5760,12 @@ function collectWorkerRolesFromDocument(
 }
 
 /** Project durable run state into the connector-facing read view. */
-function arcRunView(state: ArcRunState): ArcRunView {
+function arcRunView(state: ArcRunState, generation?: string): ArcRunView {
   return {
     stage: "actioning",
+    ...(state.frozen
+      ? { frozen: true as const }
+      : generation && { generation }),
     arcRunId: state.arcRunId,
     arcRef: state.arcRef,
     ownerPrincipal: state.ownerPrincipal,

@@ -28,10 +28,9 @@ import {
   type RoleWorker,
   type RoutineContext,
   type RoutineReport,
-  type RunFrontier,
   type Task,
 } from "../src/testing.js";
-import { observeSnapshotReads } from "./arc-host-helpers.js";
+import { observeSnapshotReads, type ActionStep } from "./arc-host-helpers.js";
 import { callOpenAiTool } from "./backend-helpers.js";
 import { makeControlledTime } from "./controlled-time.js";
 import {
@@ -1360,7 +1359,7 @@ function Main() {
     );
     const realBegin = arcHost.begin.bind(arcHost);
     const advanceInputs: unknown[] = [];
-    let syntheticFrontier: RunFrontier | undefined;
+    let syntheticStep: ActionStep | undefined;
     vi.spyOn(arcHost, "begin").mockImplementation(async (input) => {
       const steps = await realBegin(input);
       return steps.map((step) => {
@@ -1377,24 +1376,23 @@ function Main() {
           ],
           texts: ["Collect the outline.", "Draft the reply."],
         } satisfies InstructionTask;
-        syntheticFrontier = {
-          ...step.frontier,
-          tasks: [batched],
+        syntheticStep = {
+          ...step,
+          frontier: { ...step.frontier, tasks: [batched] },
         };
-        return { ...step, frontier: syntheticFrontier };
+        return syntheticStep;
       });
     });
     vi.spyOn(arcHost, "advanceAction").mockImplementation(
       async (arcRunId, _frontierId, input) => {
-        if (!syntheticFrontier) throw new Error("missing synthetic frontier");
+        if (!syntheticStep) throw new Error("missing synthetic step");
         const { projectDialog: _projectDialog, ...report } = input;
         advanceInputs.push(report);
         return {
-          kind: "action",
-          reactivationCount: 0,
+          ...syntheticStep,
           arcRunId,
           frontier: {
-            ...syntheticFrontier,
+            ...syntheticStep.frontier,
             outcome: "completed",
             canProgress: false,
             allowedMoves: [],
