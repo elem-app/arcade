@@ -28,9 +28,24 @@ export type RenderContext = {
   bundle?: Readonly<Record<string, string>>;
 };
 
+/** Destination used to render a logical artifact for a worker. */
 export type ArtifactPathRenderTarget =
   | { kind: "host" }
-  | { kind: "sandbox"; sandboxRoot: string };
+  | {
+      kind: "sandbox";
+      sandboxRoot: string;
+      /**
+       * Return the path the worker should see for a matched bundle.
+       * Arcade preserves a terminal `/.` as a trailing slash on the result.
+       *
+       * @param location - The value of `workspaceBundle[prefix]` for the longest matching prefix, passed verbatim.
+       * @param suffix - The relative path left after Arcade removes that prefix, with components joined by `/`.
+       * An empty string refers to the mount itself.
+       * @example With `{ "assets/": "/outer", "assets/deep/": "/inner" }` as the bundle map,
+       * `assets//deep/x` calls `renderBundlePath("/inner", "x")`.
+       */
+      renderBundlePath?: (location: string, suffix: string) => string;
+    };
 
 /**
  * Sandbox path the Arc workspace is rooted at. The OpenAI SDK backend roots the
@@ -63,38 +78,7 @@ export function sandboxBundleRoot(prefix: string): string {
 /** Renders Arc semantic text into the prompt-facing form used by Arcade workers. */
 export class SemanticTextRenderer {
   render(text: SemanticText, context: RenderContext): RenderedSemanticText {
-    if (typeof text === "string") {
-      return { text, artifactPaths: [], audienceReferences: [] };
-    }
-
-    const artifactPaths: string[] = [];
-    const audienceReferences: PromptAudienceReference[] = [];
-    const rendered = text
-      .map((part) => {
-        if (part.kind === "text") return part.value;
-        if (part.kind === "entity") {
-          const audience = audienceForEntity(part.name);
-          if (audience)
-            audienceReferences.push({ marker: part.name, audience });
-          return part.name;
-        }
-        if (part.kind === "hostVar") {
-          const marker = markerForHostVar(part);
-          const audience = audienceForHostVar(part);
-          if (audience) audienceReferences.push({ marker, audience });
-          return marker;
-        }
-        const artifactPath = pathFor(context, part.path);
-        artifactPaths.push(artifactPath);
-        return artifactPath;
-      })
-      .join("");
-
-    return {
-      text: rendered,
-      artifactPaths,
-      audienceReferences: uniqueAudienceReferences(audienceReferences),
-    };
+    return renderSemanticTextParts(text, context, { kind: "host" });
   }
 }
 
@@ -106,31 +90,14 @@ export function renderAgentSemanticText(
   },
   target: ArtifactPathRenderTarget,
 ): RenderedSemanticText {
-  const rendered = renderSemanticTextParts(text, {
-    workspacePath: context.workspacePath,
-    bundle: context.workspaceBundle,
-  });
-  if (target.kind === "host") return rendered;
-
-  return renderSemanticTextParts(text, {
-    workspacePath: context.workspacePath,
-    bundle: context.workspaceBundle,
-    mapPath: (resolved) => {
-      // Bundle artifacts are materialized under the reserved bundle prefix
-      // inside the workspace; project them there rather than onto the workspace
-      // root. The host bundle directory never reaches the model.
-      if (resolved.bundlePrefix !== undefined) {
-        return projectHostPathToSandbox(resolved.hostPath, {
-          hostRoot: resolved.hostRoot,
-          sandboxRoot: sandboxBundleRoot(resolved.bundlePrefix),
-        });
-      }
-      return projectHostPathToSandbox(resolved.hostPath, {
-        hostRoot: context.workspacePath,
-        sandboxRoot: target.sandboxRoot,
-      });
+  return renderSemanticTextParts(
+    text,
+    {
+      workspacePath: context.workspacePath,
+      bundle: context.workspaceBundle,
     },
-  });
+    target,
+  );
 }
 
 export function diagnosticSemanticText(text: SemanticText): string {
@@ -146,40 +113,58 @@ export function diagnosticSemanticText(text: SemanticText): string {
     .join("");
 }
 
-type ResolvedArtifactPath = {
-  hostPath: string;
-  hostRoot: string;
-  bundlePrefix?: string;
-};
-
-function pathFor(context: RenderContext, logicalPath: string): string {
-  return resolveArtifactPath(context, logicalPath).hostPath;
-}
-
-function resolveArtifactPath(
-  context: RenderContext,
+function renderArtifactPath(
   logicalPath: string,
-): ResolvedArtifactPath {
-  const segments = artifactPathSegments(logicalPath);
-  const bundled = resolveBundle(context.bundle, logicalPath);
-  if (bundled) {
-    return {
-      hostPath: join(bundled.base, ...bundled.rest),
-      hostRoot: bundled.base,
-      bundlePrefix: bundled.prefix,
-    };
+  context: RenderContext,
+  target: ArtifactPathRenderTarget,
+): string {
+  if (logicalPath.startsWith("/") || logicalPath.includes("\\")) {
+    throw new Error(`Arc artifact path must be relative: ${logicalPath}`);
   }
-  return {
-    hostPath: join(context.workspacePath, ...segments),
-    hostRoot: context.workspacePath,
-  };
+  const segments = logicalPath.split("/");
+  if (segments.includes("..")) {
+    throw new Error(
+      `Arc artifact path contains an invalid segment: ${logicalPath}`,
+    );
+  }
+  const relativePath = segments
+    .filter((part) => part !== "" && part !== ".")
+    .join("/");
+  const directory = logicalPath.endsWith("/.");
+  const trailingSlash = logicalPath.endsWith("/");
+  const lookup = relativePath + (directory || trailingSlash ? "/" : "");
+  const match = relativePath
+    ? resolveBundle(context.bundle, lookup)
+    : undefined;
+  if (match && target.kind === "sandbox" && target.renderBundlePath) {
+    const path = target.renderBundlePath(match.location, match.suffix);
+    return directory && !path.endsWith("/") ? path + "/" : path;
+  }
+  if (logicalPath.trim() === "")
+    throw new Error("Arc artifact path must be non-empty.");
+  if (trailingSlash)
+    throw new Error(
+      `Arc artifact path contains an invalid segment: ${logicalPath}`,
+    );
+  if (!relativePath)
+    return target.kind === "host" ? context.workspacePath : target.sandboxRoot;
+  const hostRoot = match?.location ?? context.workspacePath;
+  const hostPath = join(
+    hostRoot,
+    match?.suffix ?? relativePath,
+    directory ? sep : "",
+  );
+  if (target.kind === "host") return hostPath;
+  return projectHostPathToSandbox(hostPath, {
+    hostRoot,
+    sandboxRoot: match ? sandboxBundleRoot(match.prefix) : target.sandboxRoot,
+  });
 }
 
 function renderSemanticTextParts(
   text: SemanticText,
-  context: RenderContext & {
-    mapPath?: (resolved: ResolvedArtifactPath) => string;
-  },
+  context: RenderContext,
+  target: ArtifactPathRenderTarget,
 ): RenderedSemanticText {
   if (typeof text === "string") {
     return { text, artifactPaths: [], audienceReferences: [] };
@@ -201,10 +186,7 @@ function renderSemanticTextParts(
         if (audience) audienceReferences.push({ marker, audience });
         return marker;
       }
-      const resolved = resolveArtifactPath(context, part.path);
-      const artifactPath = context.mapPath
-        ? context.mapPath(resolved)
-        : resolved.hostPath;
+      const artifactPath = renderArtifactPath(part.path, context, target);
       artifactPaths.push(artifactPath);
       return artifactPath;
     })
@@ -263,14 +245,16 @@ function projectHostPathToSandbox(
       `OpenAI sandbox cannot render artifact outside mounted workspace: ${hostPath}`,
     );
   }
-  if (relativePath === "") return input.sandboxRoot;
-  return `${input.sandboxRoot}/${relativePath.split(sep).join("/")}`;
+  const path = relativePath
+    ? `${input.sandboxRoot}/${relativePath.split(sep).join("/")}`
+    : input.sandboxRoot;
+  return hostPath.endsWith(sep) && !path.endsWith("/") ? path + "/" : path;
 }
 
 function resolveBundle(
   bundle: Readonly<Record<string, string>> | undefined,
   logicalPath: string,
-): { prefix: string; base: string; rest: string[] } | undefined {
+) {
   if (!bundle) return undefined;
   let bestPrefix: string | undefined;
   for (const prefix of Object.keys(bundle)) {
@@ -280,29 +264,17 @@ function resolveBundle(
     }
   }
   if (bestPrefix === undefined) return undefined;
-  const base = bundle[bestPrefix]!;
-  const restPath = logicalPath.slice(bestPrefix.length);
-  if (restPath === "") return { prefix: bestPrefix, base, rest: [] };
-  const rest = restPath.split("/").filter((segment) => segment !== "");
-  return { prefix: bestPrefix, base, rest };
-}
-
-function artifactPathSegments(path: string): string[] {
-  if (path.trim() === "") {
-    throw new Error("Arc artifact path must be non-empty.");
-  }
-  if (path.startsWith("/") || path.includes("\\")) {
-    throw new Error(`Arc artifact path must be relative: ${path}`);
-  }
-  const segments = path.split("/");
-  if (
-    segments.some(
-      (segment) => segment === "" || segment === "." || segment === "..",
-    )
-  ) {
-    throw new Error(`Arc artifact path contains an invalid segment: ${path}`);
-  }
-  return segments;
+  const parts = logicalPath.slice(bestPrefix.length).split("/").filter(Boolean);
+  // Literal prefixes may end inside a component. Check the suffix before any destination joins it.
+  if (parts.includes(".."))
+    throw new Error(
+      `Arc bundle suffix contains a parent component: ${logicalPath}`,
+    );
+  return {
+    prefix: bestPrefix,
+    location: bundle[bestPrefix]!,
+    suffix: parts.join("/"),
+  };
 }
 
 function hostPathEscapesRoot(relativePath: string): boolean {

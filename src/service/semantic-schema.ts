@@ -129,6 +129,8 @@ function observationValueSchema(
   meta: ObservationMeta,
 ): Record<string, unknown> {
   switch (meta.type) {
+    case "artifact":
+      return closedObject({ $path: { type: "string" } });
     case "union":
       return {
         anyOf: meta.members.map(scalarObservationValueSchema),

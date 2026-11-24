@@ -1,13 +1,25 @@
 import type {
+  ActionBrief,
   ArcRef,
   ArcTraversalSet,
   Dialog,
   NodeRef,
   NodeState,
+  Runtime,
+  TerminalBrief,
+  TriggerBrief,
 } from "@elem-app/arc/runtime";
-import { deserialize, serialize } from "node:v8";
 
-import type { ReplayCheckpoint, ReplayStep } from "../types/replay.js";
+import type {
+  HostModuleEffect,
+  HostModuleState,
+} from "../types/host-module.js";
+import type {
+  ActionReportStep,
+  ReplayCheckpoint,
+  ReplayStep,
+  TriggerReportStep,
+} from "../types/replay.js";
 import type {
   SimulationChoice,
   SimulationId,
@@ -16,6 +28,9 @@ import type {
   SimulationPathChoice,
   SimulationPathId,
 } from "../types/simulation.js";
+
+import { captureCalls } from "./host-call-recording.js";
+import { advanceHostModuleState } from "./replay-state.js";
 
 /** A retained choice with its submitted answer and consultation key for comparing paths. */
 export type AnswerRecord = SimulationPathChoice & {
@@ -26,20 +41,68 @@ export type AnswerRecord = SimulationPathChoice & {
 /** The shared prefix and the two observed leaves reached by varying its input. */
 export type Fork = { prefix: Prefix; left: Prefix; right: Prefix };
 
-export type StoredCheckpoint = Omit<ReplayCheckpoint, "traversals"> & {
-  traversals: Buffer;
+/** A runtime-issued brief and its modeled host state at a single tape position. */
+export type TapeState = {
+  brief: TriggerBrief | ActionBrief | TerminalBrief;
+  host: HostModuleState;
 };
 
-/** Capture the replay state without retaining a second live traversal tree. */
-export function storeCheckpoint(
-  position: ReplayCheckpoint["position"],
-  traversals: ArcTraversalSet,
-  hostModules: ReplayCheckpoint["hostModules"],
-): StoredCheckpoint {
-  return {
-    ...structuredClone({ position, hostModules }),
-    traversals: serialize(traversals),
-  };
+/** Capture modeled calls after the runtime produces a new brief. */
+export function captureState(
+  arcRef: ArcRef,
+  brief: TapeState["brief"],
+  previous: HostModuleState,
+  effect?: HostModuleEffect,
+): TapeState {
+  const { hostModules: host, effectAdmitted } = advanceHostModuleState(
+    previous,
+    brief,
+    effect,
+  );
+  if (effect && !effectAdmitted)
+    throw new Error("Simulator host resolution was rejected.");
+  if ("hostCalls" in brief && brief.hostCalls.length) {
+    let sequence = host.calls.length;
+    host.calls.push(
+      ...captureCalls(
+        "canProgress" in brief ? "action" : "trigger",
+        host,
+        brief.hostCalls,
+        brief.traversals,
+        { arcRef },
+        () => `sim-call-${++sequence}`,
+        true,
+      ),
+    );
+  }
+  return { brief, host };
+}
+
+/** Apply a recorded report without choosing any new inputs. */
+export function progressTape(
+  runtime: Runtime,
+  arcRef: ArcRef,
+  state: TapeState,
+  step: ActionReportStep | TriggerReportStep,
+): TapeState {
+  let next: TapeState["brief"];
+  if (step.kind === "trigger-report" && !("canProgress" in state.brief))
+    next = runtime.progressTrigger(state.brief, step.report, step.dialog);
+  else if (
+    step.kind === "action-report" &&
+    "canProgress" in state.brief &&
+    state.brief.canProgress
+  )
+    next = runtime.progress(state.brief, step.report, step.dialog);
+  else throw new Error("Report does not belong to the current frontier.");
+  const invalid = next.issues.find(
+    (i) => i.kind === "invalid-item" || i.kind === "invalid-report",
+  );
+  if (invalid)
+    throw new TypeError(
+      `Invalid simulation report at ${step.position.stage}:${step.position.index}: ${JSON.stringify(invalid)}`,
+    );
+  return captureState(arcRef, next, state.host, step.moduleEffect);
 }
 
 /** One shared prefix ending at an actual runtime output. */
@@ -47,8 +110,9 @@ export type Prefix = {
   id: SimulationPathId;
   parent?: Prefix;
   steps: ReplayStep[];
-  checkpoints: StoredCheckpoint[];
-  triggerTraversals?: ArcTraversalSet;
+  checkpoint?: TapeState;
+  /** Host invocation identities for comparisons at this output. */
+  hostCallIds?: Record<string, string>;
   nodeStates: [NodeRef, NodeState | null][];
   answers: AnswerRecord[];
   depth: number;
@@ -121,8 +185,33 @@ export function history(prefix: Prefix): Prefix[] {
   return nodes.reverse();
 }
 
+/** Restore a saved position from the nearest checkpoint on its branch. */
+export function restorePosition(
+  runtime: Runtime,
+  arcRef: ArcRef,
+  prefix: Prefix,
+): TapeState {
+  const reports: (ActionReportStep | TriggerReportStep)[] = [];
+  let node = prefix;
+  while (!node.checkpoint) {
+    const step = node.steps[0];
+    if (
+      !node.parent ||
+      (step?.kind !== "action-report" && step?.kind !== "trigger-report")
+    )
+      throw new Error("Missing simulation checkpoint.");
+    reports.push(step);
+    node = node.parent;
+  }
+  let state: TapeState = node.checkpoint;
+  for (let i = reports.length - 1; i >= 0; i--)
+    state = progressTape(runtime, arcRef, state, reports[i]!);
+  return state;
+}
+
 /** Materialize detached replay records, traversal state and ordered JSONL for one path. */
 export function readPath(
+  runtime: Runtime,
   simulationId: SimulationId,
   arcRef: ArcRef,
   prefix: Prefix,
@@ -130,17 +219,37 @@ export function readPath(
   const nodes = history(prefix);
   const lines: string[] = [];
   const checkpoints: ReplayCheckpoint[] = [];
+  let state: TapeState | undefined;
   let finalTraversals: ArcTraversalSet = [];
   for (const node of nodes) {
-    if (node.triggerTraversals) finalTraversals = node.triggerTraversals;
-    for (const { position, hostModules, traversals } of node.checkpoints) {
-      finalTraversals = deserialize(traversals) as ArcTraversalSet;
-      checkpoints.push({
-        ...structuredClone({ position, hostModules }),
-        traversals: finalTraversals,
-      });
-    }
+    const previous = state;
+    const first = node.steps[0]!;
+    if (node.checkpoint) state = node.checkpoint;
+    else if (
+      previous &&
+      (first.kind === "trigger-report" || first.kind === "action-report")
+    )
+      state = progressTape(runtime, arcRef, previous, first);
+    else throw new Error("Missing simulation checkpoint.");
+    finalTraversals = state.brief.traversals;
     for (const step of node.steps) {
+      if (step.kind === "action-brief" || step.kind === "terminal-brief") {
+        if (step.position.index === 1 && previous)
+          checkpoints.push(
+            structuredClone({
+              position: { ...step.position, index: 0 },
+              traversals: previous.brief.traversals,
+              hostModules: previous.host,
+            }),
+          );
+        checkpoints.push(
+          structuredClone({
+            position: step.position,
+            traversals: finalTraversals,
+            hostModules: state.host,
+          }),
+        );
+      }
       const base = {
         kind: step.kind,
         position: step.position,
@@ -172,9 +281,8 @@ export function readPath(
       ),
     }),
     checkpoints,
-    finalTraversals: prefix.triggerTraversals
-      ? structuredClone(finalTraversals)
-      : finalTraversals,
+    finalTraversals:
+      checkpoints.at(-1)?.traversals ?? structuredClone(finalTraversals),
     traceJsonl: lines.join("\n") + "\n",
   };
 }

@@ -9,7 +9,6 @@ import {
   InMemoryReplayStore,
   JsonFileReplayStore,
   positionKey,
-  type ActionReplayPosition,
   type ArcRunId,
   type ReplayCheckpoint,
   type ReplayStep,
@@ -20,7 +19,7 @@ const RUN: ArcRunId = "arc-run:replay-store-test";
 
 function actionBriefStep(
   index: number,
-  active = "node:s:A",
+  active: `node:${string}` = "node:s:A",
   reactivationCount = 0,
 ): ReplayStep {
   return {
@@ -37,7 +36,7 @@ function actionBriefStep(
       instructions: [],
       allowedMoves: ["proceed"],
     },
-  } as unknown as ReplayStep;
+  };
 }
 
 function triggerBriefStep(index: number): ReplayStep {
@@ -54,7 +53,7 @@ function triggerBriefStep(index: number): ReplayStep {
       hostCalls: [],
       matchableArcs: [],
     },
-  } as unknown as ReplayStep;
+  };
 }
 
 function terminalBriefStep(index: number): ReplayStep {
@@ -68,7 +67,7 @@ function terminalBriefStep(index: number): ReplayStep {
       outcome: "covered",
       issues: [],
     },
-  } as unknown as ReplayStep;
+  };
 }
 
 function checkpoint(index: number, reactivationCount = 0): ReplayCheckpoint {
@@ -126,19 +125,13 @@ async function exercise(store: ReplayStore): Promise<void> {
     }),
   ).toBeUndefined();
 
+  const retainedSteps = await store.listSteps(RUN);
+  const retainedCheckpoints = await store.listCheckpoints(RUN);
   await store.appendStep(RUN, actionBriefStep(1, "node:s:LATER", 1));
   await store.putCheckpoint(RUN, checkpoint(0, 1));
   await store.truncateAfterReactivationCount(RUN, 0);
-  expect(
-    (await store.listSteps(RUN)).every(
-      (step) => step.position.reactivationCount === 0,
-    ),
-  ).toBe(true);
-  expect(
-    (await store.listCheckpoints(RUN)).every(
-      (entry) => entry.position.reactivationCount === 0,
-    ),
-  ).toBe(true);
+  expect(await store.listSteps(RUN)).toEqual(retainedSteps);
+  expect(await store.listCheckpoints(RUN)).toEqual(retainedCheckpoints);
 }
 
 describe("ReplayStore implementations", () => {
@@ -157,7 +150,17 @@ describe("ReplayStore implementations", () => {
 
   it("JsonFileReplayStore round-trips steps and checkpoints in order", async () => {
     const dir = await mkdtemp(join(tmpdir(), "arcade-replay-store-"));
-    await exercise(new JsonFileReplayStore({ dir }));
+    try {
+      const store = new JsonFileReplayStore({ dir });
+      await exercise(store);
+      const reopened = new JsonFileReplayStore({ dir });
+      expect(await reopened.listSteps(RUN)).toEqual(await store.listSteps(RUN));
+      expect(await reopened.listCheckpoints(RUN)).toEqual(
+        await store.listCheckpoints(RUN),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("keys stage-aware: trigger and action at the same index do not collide", async () => {
@@ -213,15 +216,6 @@ describe("ReplayStore implementations", () => {
     await expect(store.appendStep(RUN, terminalBriefStep(1))).rejects.toThrow(
       /conflict/,
     );
-  });
-
-  it("getCheckpoint only accepts action positions (compile-time)", () => {
-    const position: ActionReplayPosition = {
-      stage: "action",
-      index: 0,
-      reactivationCount: 0,
-    };
-    expect(position.stage).toBe("action");
   });
 });
 

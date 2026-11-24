@@ -209,6 +209,48 @@ describe("DiscoveryService.registerArcsFromDirectory", () => {
     );
   });
 
+  it("rejects ambiguous and non-file Arc sources before registering any bundle", async () => {
+    const { discovery, registerArcs } = makeDiscoveryWithStubHost();
+    const dir = await makeArcsDir();
+    await writeArc(dir, "valid");
+    const duplicate = await writeArc(dir, "ambiguous");
+    await writeFile(join(duplicate, "second.arc.js"), GREET_ARC);
+    await expect(discovery.registerArcsFromDirectory(dir)).rejects.toThrow(
+      /multiple \*\.arc\.js files/,
+    );
+    expect(registerArcs).not.toHaveBeenCalled();
+
+    const other = await makeArcsDir();
+    await mkdir(join(other, "bad", "directory.arc.js"), { recursive: true });
+    await expect(discovery.registerArcsFromDirectory(other)).rejects.toThrow(
+      /is not a file/,
+    );
+    expect(registerArcs).not.toHaveBeenCalled();
+  });
+
+  it("resolves an absolute bundle path and rejects a file target", async () => {
+    const { discovery, registerArcs } = makeDiscoveryWithStubHost();
+    const dir = await makeArcsDir();
+    const mount = await makeArcsDir();
+    const arcDir = await writeArc(dir, "mounted", {
+      manifest: { bundle: { "docs/": mount } },
+    });
+    await writeFile(join(dir, "ignored.txt"), "not a bundle");
+    await expect(discovery.registerArcsFromDirectory(dir)).resolves.toBe(1);
+    expect(registerArcs.mock.calls[0]![0][0].manifest.bundle).toEqual({
+      "docs/": mount,
+    });
+
+    await writeFile(
+      join(arcDir, "arcade.json"),
+      JSON.stringify({ bundle: { "docs/": join(dir, "ignored.txt") } }),
+    );
+    await expect(discovery.registerArcsFromDirectory(dir)).rejects.toThrow(
+      /not an existing directory/,
+    );
+    expect(registerArcs).toHaveBeenCalledTimes(1);
+  });
+
   it("returns no arcs when the arcs directory is missing", async () => {
     const dir = await makeArcsDir();
     const { discovery, registerArc, registerArcs } =
@@ -219,6 +261,17 @@ describe("DiscoveryService.registerArcsFromDirectory", () => {
     ).resolves.toBe(0);
     expect(registerArc).not.toHaveBeenCalled();
     expect(registerArcs).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid upsert source name before registration", async () => {
+    const { discovery, registerArc } = makeDiscoveryWithStubHost();
+    const root = await makeArcsDir();
+    for (const source of ["", ".", "..", "a/b", "a\\b"]) {
+      await expect(
+        discovery.upsertArcFromDirectory(root, source),
+      ).rejects.toThrow(/Invalid Arc source directory name/);
+    }
+    expect(registerArc).not.toHaveBeenCalled();
   });
 
   it("upserts only the named source and ignores unrelated bundles", async () => {
@@ -268,6 +321,9 @@ describe("DiscoveryService.registerArcsFromDirectory", () => {
     // snapshot, so the replacement cannot rewrite work already in flight.
     const reentered = await beginView(arcHost, first.arcRunId, dialog);
     expect(reentered.snapshotId).toBe(first.frontier.snapshotId);
+    expect(reentered.tasks).toMatchObject([
+      { kind: "instruction", texts: ["Welcome the user."] },
+    ]);
 
     // A fresh activation is planned against the replacement instead, and gets
     // its own snapshot.
@@ -281,6 +337,21 @@ describe("DiscoveryService.registerArcsFromDirectory", () => {
 });
 
 describe("DiscoveryService.discoverArcadeWorkspaces", () => {
+  it("rejects invalid workspace discovery paths and ignores a non-directory arcsDir", async () => {
+    const { discovery } = makeDiscoveryWithStubHost();
+    const root = await makeArcsDir();
+    await writeFile(join(root, "arcs"), "ordinary file");
+    await expect(
+      discovery.discoverArcadeWorkspaces(root, "arcs"),
+    ).resolves.toEqual([]);
+    await expect(
+      discovery.discoverArcadeWorkspaces("relative", "arcs"),
+    ).rejects.toThrow(/absolute working roots/);
+    await expect(
+      discovery.discoverArcadeWorkspaces(root, join(root, "arcs")),
+    ).rejects.toThrow(/relative arcsDir/);
+  });
+
   it("finds a workspace at the working root", async () => {
     const root = await makeArcsDir();
     await mkdir(join(root, ".arcade", "arcs"), { recursive: true });
@@ -308,72 +379,6 @@ describe("DiscoveryService.discoverArcadeWorkspaces", () => {
       discovery.discoverArcadeWorkspaces([root, nested, root], ".arcade/arcs"),
     ).resolves.toEqual([root, nested]);
   });
-
-  // Retained for when descendant traversal is re-enabled.
-  /*
-  it("finds nested workspaces", async () => {
-    const root = await makeArcsDir();
-    const nested = join(root, "clients", "alice");
-    await mkdir(join(nested, ".arcade", "arcs"), { recursive: true });
-    const { discovery } = makeDiscoveryWithStubHost();
-
-    const workspaces = await discovery.discoverArcadeWorkspaces(
-      root,
-      ".arcade/arcs",
-    );
-
-    expect(workspaces).toEqual([nested]);
-  });
-
-  it("skips ignored heavy directories", async () => {
-    const root = await makeArcsDir();
-    const app = join(root, "app");
-    await mkdir(join(app, ".arcade", "arcs"), { recursive: true });
-    await mkdir(join(root, "node_modules", "pkg", ".arcade", "arcs"), {
-      recursive: true,
-    });
-    await mkdir(join(root, "dist", "fixture", ".arcade", "arcs"), {
-      recursive: true,
-    });
-    const { discovery } = makeDiscoveryWithStubHost();
-
-    const workspaces = await discovery.discoverArcadeWorkspaces(
-      root,
-      ".arcade/arcs",
-    );
-
-    expect(workspaces).toEqual([app]);
-  });
-
-  it("excludes Arcade runtime, eval, and benchmark output trees from workspace discovery", async () => {
-    const root = await makeArcsDir();
-    const app = join(root, "apps", "project");
-    await mkdir(join(app, ".arcade", "arcs"), { recursive: true });
-    for (const name of [
-      ".arcade-data",
-      ".arcade-artifacts",
-      ".arcade-diagnostics",
-      ".arcademachine-data",
-      ".eval-results",
-      ".cache",
-    ]) {
-      for (const parent of [root, app]) {
-        await mkdir(join(parent, name, ".arcade", "arcs"), {
-          recursive: true,
-        });
-        await mkdir(join(parent, name, "run", "workspace", ".arcade", "arcs"), {
-          recursive: true,
-        });
-      }
-    }
-    const { discovery } = makeDiscoveryWithStubHost();
-
-    await expect(
-      discovery.discoverArcadeWorkspaces(root, ".arcade/arcs"),
-    ).resolves.toEqual([app]);
-  });
-
-  */
 
   it("discovers explicitly supplied working roots inside excluded output trees", async () => {
     const root = await makeArcsDir();

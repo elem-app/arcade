@@ -13,5 +13,5 @@
     "forceConsistentCasingInFileNames": true
   },
   "include": ["src/**/*", "__tests__/**/*", "examples/**/*", "eval/**/*"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "__tests__/fixtures/package-consumer.mts"]
 }

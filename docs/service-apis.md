@@ -623,32 +623,13 @@ The package also exports task renderers, stock instruction and semantic prompt b
 
 ## Branch Simulation
 
-Use `arcade.simulator` to explore a registered Arc from its trigger. The simulator models external answers, assumes instructions are applied, and supplies host return values without dispatching workers or executing host operations. For an unregistered draft, construct `new SimulatorService({ captureSnapshot })`. The callback returns the parsed documents for the requested roots and their imports in `documents`, with the host module declarations in `hostModules`.
-
 ### `simulator.simulate(options)`
 
 ```ts
 simulate(options: SimulationOptions): Promise<SimulationResult>
 ```
 
-Simulates the Arc identified by `arcRef`, starting at its trigger. Pass a fixed `Dialog` in `dialog` to use the same conversation at every step. To choose the conversation based on earlier answers, pass a callback `(context: SimulationContext) => Dialog`. Its `context.choices` contains the answers already submitted on the current path.
-
-By default, the simulator tries different judgment answers, observation values, and host call results. Each entry in `result.comparisons` describes two paths from the same point in the Arc.
-
-- `decisions` shows which inputs received different answers and the answer on each path.
-- `left.work` and `right.work` list the instructions and host calls that followed on each path, in order. Each instruction has an `instruction` object with its `text`, `mode`, optional `guidance`, and effective `hostParams`.
-- `left.outcome` and `right.outcome` show how each path ended, for example `{ kind: "covered" }` or `{ kind: "deflected" }`.
-
-```ts
-import { formatSimulationReport } from "arcade";
-
-const result = await simulator.simulate({ arcRef, dialog });
-try {
-  console.log(formatSimulationReport(result, "Draft review", 4096));
-} finally {
-  await simulator.release(result.id);
-}
-```
+Explores an Arc from its trigger under modeled inputs and returns path comparisons, scenario results and coverage. Supply `arcRef` and `dialog`; see the [Simulation API reference](./simulation.md) for options, related types, limits and draft setup.
 
 ### `simulator.getPath(id)`
 

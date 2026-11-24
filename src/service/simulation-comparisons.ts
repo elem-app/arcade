@@ -69,16 +69,17 @@ function answer(record: AnswerRecord, leaf: Prefix): ComparisonEvidence {
 function work(
   records: readonly {
     steps: readonly ReplayStep[];
-    checkpoints: readonly Pick<ReplayCheckpoint, "position" | "hostModules">[];
+    checkpoints?: readonly Pick<ReplayCheckpoint, "position" | "hostModules">[];
+    hostCallIds?: Readonly<Record<string, string>>;
   }[],
   pathId: SimulationPathId,
 ): ComparisonEvidence[] {
   const evidence: ComparisonEvidence[] = [];
   const calls = new Set<string>(),
     pending = new Map<string, ComparisonEvidence>();
-  for (const { steps, checkpoints } of records) {
+  for (const { steps, checkpoints, hostCallIds } of records) {
     const hosts = new Map(
-      checkpoints.map((c) => [positionKey(c.position), c.hostModules]),
+      checkpoints?.map((c) => [positionKey(c.position), c.hostModules]),
     );
     for (const step of steps) {
       if (step.kind === "action-report") {
@@ -119,8 +120,9 @@ function work(
             .slice()
             .reverse()
             .find((r) => r.runtimeCallId === item.id);
-          if (!record || calls.has(record.call.hostCallId)) continue;
-          calls.add(record.call.hostCallId);
+          const id = hostCallIds?.[item.id] ?? record?.call.hostCallId;
+          if (!id || calls.has(id)) continue;
+          calls.add(id);
           evidence.push({
             pathId,
             position: step.position,
@@ -359,11 +361,59 @@ export function formatSimulationReport(
     [...new Set(unexplored.map((u) => u.reason))].join(", ") || "none";
   const summary = `Domains ${completeness.domains}. Exploration ${completeness.exploration}. ${result.paths.length} paths. Submitted ${exercised}/${generated} generated answers at reached inputs. Exclusions: ${result.exclusions.reduce((sum, e) => sum + e.count, 0)}. Limits: ${limits}.`;
   let omitted = result.comparisons.length;
+  const diagnosticDetails = result.preferenceDiagnostics
+    .filter((d) => d.status !== "available")
+    .sort(
+      (a, b) =>
+        Number(a.status === "not-reached") - Number(b.status === "not-reached"),
+    );
+  let omittedDiagnostics = diagnosticDetails.length;
+  const diagnosticSummary = result.preferenceDiagnostics.length
+    ? `Preference availability: ${["available", "unavailable", "not-reached"].map((status) => `${result.preferenceDiagnostics.filter((d) => d.status === status).length} ${status}`).join(", ")}.`
+    : undefined;
   const chunks = [
     source,
     `Dialog ${result.model.dialog}. Instruction application assumed. Host calls use modeled returns.`,
   ];
-  const tail = () => [summary, `${omitted} comparisons omitted.`].join("\n");
+  const expectation = result.expectation;
+  if (expectation) {
+    const { cell, equals } = expectation.onCompletion;
+    const expected = `${cell} = ${JSON.stringify(equals)}`;
+    if (expectation.status === "witnessed") {
+      const answers = expectation.answers.map(
+        (a) =>
+          `${a.cell} = ${JSON.stringify(a.answer)} [${a.position.stage} ${a.position.index}]`,
+      );
+      chunks.push(
+        [
+          `Expected outcome witnessed. Path ${expectation.pathId} covered in ${expectation.reports} reports.`,
+          ...answers,
+          `Terminal root ${cell} = ${JSON.stringify(expectation.actual)} (expected ${JSON.stringify(equals)}).`,
+        ].join("\n"),
+      );
+    } else {
+      const choices = expectation.prefer
+        .map((p) => `${p.cell} = ${JSON.stringify(p.answer)}`)
+        .join(", ");
+      const reached = choices
+        ? ` Preferred answers ${expectation.preferencesReached ? "reached" : "not reached"} together: ${choices}.`
+        : "";
+      chunks.push(
+        `Expected outcome not witnessed. Expected terminal root ${expected}.${reached}`,
+      );
+    }
+  }
+  const tail = () =>
+    [
+      summary,
+      ...(diagnosticSummary
+        ? [
+            diagnosticSummary,
+            `${omittedDiagnostics} preference diagnostics omitted.`,
+          ]
+        : []),
+      `${omitted} comparisons omitted.`,
+    ].join("\n");
   let used = Buffer.byteLength([...chunks, tail()].join("\n\n"));
   if (used > maxBytes)
     throw new RangeError("Report budget cannot hold the simulation summary.");
@@ -378,6 +428,15 @@ export function formatSimulationReport(
     const params = e.instruction?.hostParams;
     return `[${e.position.stage} ${e.position.index}] ${e.excerpt}${params === undefined ? "" : " hostParams=" + JSON.stringify(params)}${e.application ? " (" + e.application + ")" : ""}`;
   };
+  for (const diagnostic of diagnosticDetails) {
+    const answer = `${diagnostic.cell} = ${JSON.stringify(diagnostic.answer)}`;
+    const evidence = diagnostic.evidence;
+    const detail =
+      diagnostic.status === "not-reached"
+        ? `Preferred observation not reached: ${answer}. Inspect the trigger, preceding decisions and exploration limits.`
+        : `Preferred answer unavailable: ${answer}. It was absent from every eligible candidate domain inspected. Check the observation type and supply concrete examples through values.${evidence ? ` [${evidence.position.stage} ${evidence.position.index}] ${evidence.site.sourceRef}; prefix ${evidence.prefixId}. Candidate generation ${evidence.truncated ? "was truncated" : "was not truncated"} at this input.` : ""}`;
+    if (add(detail)) omittedDiagnostics--;
+  }
   for (const c of result.comparisons) {
     const earlier = c.decisions.flatMap((d) => {
       const prompt = question(d.input) + " → ";

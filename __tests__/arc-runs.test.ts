@@ -10,7 +10,7 @@ import {
 import { hmd } from "@elem-app/arc/host-utils";
 import { parse } from "@elem-app/arc/parser";
 import { Runtime, toArcRef } from "@elem-app/arc/runtime";
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_WORKER_ROLE,
@@ -31,6 +31,7 @@ import {
   beginActivatedView,
   beginActivation,
   beginView,
+  collectArcRunStates,
   expectSoleDriver,
   expectSoleHandshake,
   expectSoleTrigger,
@@ -859,18 +860,36 @@ function Stock() {
   });
 
   it("returns idle when no registered Arc triggers for the dialog", async () => {
-    const arcHost = await makeArcHost();
-    const dialog: Dialog = {
-      cursor: { user: 0, self: 0 },
-      lastTurns: [{ role: "user", message: "hello" }],
-    };
-
-    const turn = await arcHost.begin({
-      arcRunId: ARC_RUN_ID,
-      projectDialog: projectorFor(dialog),
-    });
-
-    expect(turn).toEqual([]);
+    const store = new InMemoryArcHostStore();
+    const arcHost = await createTestArcHost({ store });
+    await arcHost.registerArc(
+      "greeting",
+      parse(`"arc"; function Greet() {
+      this.trigger = () => Dialog.lastUserMessage == "hello";
+      $instruct("Reply.");
+    }`),
+    );
+    const project = (message: string) =>
+      projectorFor({
+        cursor: { user: 1, self: 0 },
+        lastTurns: [{ role: "user", message }],
+      });
+    await expect(
+      arcHost.begin({
+        principal: ALICE_OWNER,
+        projectDialog: project("goodbye"),
+      }),
+    ).resolves.toEqual([]);
+    await expect(collectArcRunStates(store)).resolves.toEqual([]);
+    const matched = expectSoleDriver(
+      await arcHost.begin({
+        principal: ALICE_OWNER,
+        projectDialog: project("hello"),
+      }),
+    );
+    await expect(collectArcRunStates(store)).resolves.toEqual([
+      matched.arcRunId,
+    ]);
   });
 
   it("begins an instruction from caller-provided dialog and commits coverage", async () => {
@@ -1548,8 +1567,8 @@ function Main() {
     );
   });
 
-  it("returns idle when beginning a run without state or trigger match", async () => {
-    const arcHost = await makeArcHost();
+  it("returns idle for a missing targeted run even when a registered trigger matches", async () => {
+    const arcHost = await makeArcHostWithSource("greeting", GREET_SOURCE);
     const dialog: Dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
 
     const begun = await arcHost.begin({
@@ -2092,8 +2111,10 @@ function Main() {
         projectDialog: projectorFor(secondDialog),
       },
     );
-    expect(resolved.status).toBe("ok");
-    if (resolved.status !== "ok" || resolved.step.kind !== "action") return;
+    assert(
+      resolved.status === "ok" && resolved.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
     expect(resolved.step.arcRunId).toBe(first.arcRunId);
     const reenteredFrontier = resolved.step.frontier;
     const restartedRoot = reenteredFrontier.traversals.find(
@@ -2314,8 +2335,10 @@ function Main() {
       { runChoice: { action: "join", arcRunId: first.arcRunId } },
       { projectDialog: projectorFor(oldDialog) },
     );
-    expect(reentered.status).toBe("ok");
-    if (reentered.status !== "ok" || reentered.step.kind !== "action") return;
+    assert(
+      reentered.status === "ok" && reentered.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
     expect(reentered.step.arcRunId).toBe(first.arcRunId);
     await expect(store.getState(arcRunKey(first.arcRunId))).resolves.toEqual(
       expect.objectContaining({ snapshotId: first.frontier.snapshotId }),
@@ -2361,8 +2384,10 @@ function Main() {
       { runChoice: { action: "join", arcRunId: existing.arcRunId } },
       { projectDialog: projectorFor(dialog) },
     );
-    expect(reentered.status).toBe("ok");
-    if (reentered.status !== "ok" || reentered.step.kind !== "action") return;
+    assert(
+      reentered.status === "ok" && reentered.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
     expect(reentered.step.arcRunId).toBe(existing.arcRunId);
     expect(reentered.step.frontier.snapshotId).toBe(originalSnapshot);
   });

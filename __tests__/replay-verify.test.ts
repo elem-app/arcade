@@ -13,7 +13,7 @@ import { catchSegKey } from "@elem-app/arc/types";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { assert, describe, expect, it } from "vitest";
 
 import {
   alignActionReplay,
@@ -910,9 +910,10 @@ describe("handshake-activated runs are trigger-replayable", () => {
       { workspace },
       { projectDialog: async () => dialog },
     );
-    expect(resolved.status).toBe("ok");
-    if (resolved.status !== "ok") return;
-    if (resolved.step.kind !== "action") return;
+    assert(
+      resolved.status === "ok" && resolved.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
 
     // The trigger stream was buffered before the handshake and flushed under the
     // activated run id — so the run is trigger-replayable end-to-end.

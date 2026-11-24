@@ -5,7 +5,7 @@ import { createTestArcHost, workEventsFor } from "./work-event-fixtures.js";
 
 import { parse } from "@elem-app/arc/parser";
 import { toArcRef } from "@elem-app/arc/runtime";
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, vi } from "vitest";
 
 import {
   HandshakeStore,
@@ -648,8 +648,10 @@ function Main() {
         projectDialog: projectorFor(dialog),
       },
     );
-    expect(resolved.status).toBe("ok");
-    if (resolved.status !== "ok" || resolved.step.kind !== "action") return;
+    assert(
+      resolved.status === "ok" && resolved.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
     const firstRunId = resolved.step.arcRunId;
 
     const again = await beginActivation(arcHost, dialog, {
@@ -700,8 +702,10 @@ function Main() {
         projectDialog: projectorFor(dialog),
       },
     );
-    expect(fresh.status).toBe("ok");
-    if (fresh.status !== "ok" || fresh.step.kind !== "action") return;
+    assert(
+      fresh.status === "ok" && fresh.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
     expect(fresh.step.arcRunId).not.toBe(firstRunId);
     await expect(store.getState(arcRunKey(firstRunId))).resolves.toEqual(
       expect.objectContaining({
@@ -758,8 +762,10 @@ function Main() {
         projectDialog: projectorFor(dialog),
       },
     );
-    expect(fresh.status).toBe("ok");
-    if (fresh.status !== "ok" || fresh.step.kind !== "action") return;
+    assert(
+      fresh.status === "ok" && fresh.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
     expect(fresh.step.arcRunId).not.toBe(firstRunId);
     await expect(
       store.getState(arcRunKey(fresh.step.arcRunId)),
@@ -934,8 +940,10 @@ function Stock() {
         projectDialog: projectorFor(dialog),
       },
     );
-    expect(resolved.status).toBe("ok");
-    if (resolved.status !== "ok" || resolved.step.kind !== "action") return;
+    assert(
+      resolved.status === "ok" && resolved.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
     expect(resolved.step.arcRunId).not.toBe(trig.arcRunId);
     expect(resolved.step.frontier.arcRef).toBe(
       toArcRef("stock-research", "Stock"),
@@ -1017,8 +1025,10 @@ function StockResearch() {
         projectDialog: projectorFor(dialog),
       },
     );
-    expect(resolved.status).toBe("ok");
-    if (resolved.status !== "ok" || resolved.step.kind !== "action") return;
+    assert(
+      resolved.status === "ok" && resolved.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
     expect(resolved.step.arcRunId).not.toBe(trig.arcRunId);
     expect(resolved.step.frontier.status).toBe("ready");
     const resolvedDriver = new StepDriver(arcHost, resolved.step);
@@ -1206,8 +1216,10 @@ function Main() {
       { runChoice: { action: "fresh" } },
       { projectDialog: projectorFor(dialog) },
     );
-    expect(second.status).toBe("ok");
-    if (second.status !== "ok" || second.step.kind !== "action") return;
+    assert(
+      second.status === "ok" && second.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
 
     const thirdChoice = expectSoleHandshake(
       await beginActivation(arcHost, dialog, {
@@ -1346,8 +1358,10 @@ function ChoiceA() {
         projectDialog: projectorFor(activeDialog),
       },
     );
-    expect(fresh.status).toBe("ok");
-    if (fresh.status !== "ok" || fresh.step.kind !== "action") return;
+    assert(
+      fresh.status === "ok" && fresh.step.kind === "action",
+      "Expected resolution to return an action step.",
+    );
     const activeRunId = fresh.step.arcRunId;
 
     await arcHost.registerArc(
@@ -1401,8 +1415,10 @@ function ChoiceB() {
         projectDialog: projectorFor(activeDialog),
       },
     );
-    expect(accepted.status).toBe("ok");
-    if (accepted.status !== "ok" || accepted.step.kind !== "handshake") return;
+    assert(
+      accepted.status === "ok" && accepted.step.kind === "handshake",
+      "Expected resolution to return a handshake step.",
+    );
     expect(accepted.step.requirement).toMatchObject({
       kind: "run-choice",
       freshAvailable: true,
@@ -1422,6 +1438,28 @@ function ChoiceB() {
         { projectDialog: projectorFor(activeDialog) },
       ),
     ).toMatchObject({ status: "joined", arcRunId: activeRunId });
+  });
+
+  it("activates a single matching Arc directly under choose policy", async () => {
+    const store = new InMemoryArcHostStore();
+    const arcHost = await createTestArcHost({ store });
+    await arcHost.registerArc("only", parse(GREET_SOURCE));
+    await arcHost.registerArc(
+      "other",
+      parse('"arc"; function Other() { this.trigger = () => false; }'),
+    );
+    const step = expectSoleDriver(
+      await arcHost.begin({
+        principal: ALICE_OWNER,
+        activationPolicy: "choose",
+        projectDialog: projectorFor({
+          cursor: { user: 0, self: 0 },
+          lastTurns: [],
+        }),
+      }),
+    );
+    expect(step.frontier.arcRef).toBe(toArcRef("only", "Greet"));
+    expect(await collectArcRunStates(store)).toEqual([step.arcRunId]);
   });
 
   it("declines an arc choice without disturbing its siblings", async () => {

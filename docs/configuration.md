@@ -101,7 +101,7 @@ Each immediate subdirectory is one Arc bundle. The subdirectory name becomes the
 - `contextIsolation`:
   - `role` (default): action nodes using the same worker role may reuse one managed-agent context within the run.
   - `node`: every action node owns a separate managed-agent context, even when another node designates the same worker role.
-- `bundle`: longest-prefix map from logical artifact path prefix to a directory. Values are relative to the manifest directory unless absolute. Matched logical paths resolve into the bundle directory; unmatched paths resolve under the run workspace.
+- `bundle`: longest-prefix map from logical artifact path prefix to a directory. Values are relative to the manifest directory unless absolute. For lookup, repeated internal slashes count as one separator. For example, with `assets/` and `assets/deep/` mounted, `assets//deep/x` resolves to `x` in the deeper mount. Unmatched paths resolve under the run workspace.
 
 The activating root bundle's `contextIsolation` value is captured when a fresh run starts and is the isolation floor for all nodes reached by that run, including imported nodes. An imported bundle's manifest does not replace that floor. Replacing a manifest affects later fresh runs; existing runs retain the policy stored with their pinned snapshot.
 

@@ -143,6 +143,10 @@ export type {
   RoutineSignal,
 } from "./types/routine.js";
 export type * from "./types/simulation.js";
+export {
+  SimulationExpectationSchema,
+  SimulationPreferencesSchema,
+} from "./types/simulation.js";
 export type {
   InstructionTask,
   SemanticTask,

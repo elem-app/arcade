@@ -1,12 +1,14 @@
-import type { ArcRef } from "@elem-app/arc/runtime";
+import type { ArcRef, Runtime } from "@elem-app/arc/runtime";
 import { randomUUID } from "node:crypto";
 
-import type {
-  SimulationId,
-  SimulationLimits,
-  SimulationOptions,
-  SimulationPathId,
-  SimulatorServiceOptions,
+import {
+  SimulationExpectationSchema,
+  SimulationPreferencesSchema,
+  type SimulationId,
+  type SimulationLimits,
+  type SimulationOptions,
+  type SimulationPathId,
+  type SimulatorServiceOptions,
 } from "../types/simulation.js";
 import { SimulationDriver } from "./simulation-driver.js";
 import { readPath, type Prefix } from "./simulation-trace.js";
@@ -19,10 +21,11 @@ const defaults: SimulationLimits = {
   maxValuesPerInput: 32,
   maxArrayLength: 3,
   maxPendingPrefixes: 2048,
-  maxRecordBytes: 64 * 1024 * 1024,
+  maxRecordBytes: 32 * 1024 * 1024,
 };
 
 type RetainedSimulation = {
+  runtime: Runtime;
   id: SimulationId;
   arcRef: ArcRef;
   prefixes: ReadonlyMap<SimulationPathId, Prefix>;
@@ -56,6 +59,8 @@ export class SimulatorService {
         throw new RangeError(`Invalid simulation limit ${key}.`);
     const fixed = {
       ...options,
+      prefer: SimulationPreferencesSchema.optional().parse(options.prefer),
+      expect: SimulationExpectationSchema.optional().parse(options.expect),
       dialog:
         typeof options.dialog === "function"
           ? options.dialog
@@ -89,6 +94,7 @@ export class SimulatorService {
     this.#controller.signal.throwIfAborted();
     this.#runs.set(id, {
       id,
+      runtime: run.runtime,
       prefixes: run.prefixes,
       arcRef: options.arcRef,
     });
@@ -99,7 +105,7 @@ export class SimulatorService {
     const run = this.#runs.get(id.split("/")[0] as SimulationId);
     const prefix = run?.prefixes.get(id);
     if (!run || !prefix) throw new Error("Unknown simulation path.");
-    return readPath(run.id, run.arcRef, prefix);
+    return readPath(run.runtime, run.id, run.arcRef, prefix);
   }
   /** Release all records and identifiers belonging to this simulation. */
   async release(id: SimulationId) {

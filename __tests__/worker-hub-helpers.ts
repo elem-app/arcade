@@ -352,6 +352,8 @@ export function lifecycleReader(
 
 function exampleObservationValue(meta: ObservationMeta): ObservedValue {
   switch (meta.type) {
+    case "artifact":
+      return { $path: "." };
     case "union":
       return exampleScalarObservationValue(meta.members[0]!);
     case "array":

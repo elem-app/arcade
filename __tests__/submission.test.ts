@@ -138,6 +138,7 @@ describe("Inbound submission and messaging", () => {
       const next = await reader.next();
       if (next.kind !== "handshake-required")
         throw new Error("Expected workspace.");
+      expect(next.requirement.kind).toBe("workspace");
       expect(next.arcRunId).toBe(first.arcRunId);
       expect(next.handshakeId).not.toBe(first.handshakeId);
       expect(Date.parse(next.expiresAt)).toBe(Date.now() + 86_400_000);
@@ -2129,6 +2130,7 @@ function Main() {
         reason: "Inbound activation requires metadata.principal.",
       },
     ]);
+    await expect(arcHost.listRunViews()).resolves.toEqual([]);
   });
 
   it("allows different Arc runs to dispatch handler work concurrently", async () => {

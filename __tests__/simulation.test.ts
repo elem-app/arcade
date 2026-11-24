@@ -1,5 +1,6 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 
+import { SimulationDriver } from "../src/service/simulation-driver.js";
 import { encodeLine, recordBytes } from "../src/service/simulation-trace.js";
 import { formatSimulationReport, SimulatorService } from "../src/testing.js";
 import { dialog, fixture } from "./simulation-helpers.js";
@@ -320,7 +321,7 @@ it("sim.comparisons lets pending alternatives advance while a path repeats a dec
 
 it("sim.comparisons keeps a recurring judgment stable and explores its alternative", async () => {
   const { run, simulator } = fixture(`"arc"; function Main(){
-    this.trigger=()=>true;
+    this.trigger=()=>true; this.catchDeflection=()=>false;
     let count=Num(); count.$set(0);
     $enterLoop(newcopy(Step),{resolveWhen:()=>count == 2});
     function Step(){
@@ -419,6 +420,97 @@ it("sim.loop retains continued and resolved paths at the bound", async () => {
       (s) => s.kind === "action-report" && s.report.instructions,
     ),
   ).toHaveLength(2);
+});
+
+it("sim.deflection revisits only judgments whose deflection can reach a catch", async () => {
+  for (const reviewCatches of [false, true]) {
+    const { run, simulator } = fixture(`"arc"; function Main(){
+      this.trigger=()=>true;
+      this.deflectWhen=()=>judge("Cancel?");
+      $instruct("Draft.");
+      $enter(newcopy(Review));
+      function Review(){ ${reviewCatches ? "this.catchDeflection=()=>false;" : ""} $instruct("Review."); }
+      function Sibling(){this.catchDeflection=()=>true;}
+    }`);
+    const result = await run({ limits: { maxPaths: reviewCatches ? 2 : 1 } });
+    const paths = await Promise.all(
+      result.paths.map(async (leaf) => {
+        const path = await simulator.getPath(leaf.id);
+        const answers = path.steps.flatMap((s) =>
+          s.kind === "action-report"
+            ? Object.values(s.report.judgments ?? {})
+            : [],
+        );
+        return [answers, leaf.outcome.kind];
+      }),
+    );
+    expect(paths).toEqual(
+      reviewCatches
+        ? [
+            [[false, false], "covered"],
+            [[false, true], "deflected"],
+          ]
+        : [[[false, false], "covered"]],
+    );
+    expect(result.exclusions.map((e) => e.count)).toEqual(
+      reviewCatches ? [1] : [1, 1],
+    );
+    expect(result.unexplored).toEqual([]);
+  }
+});
+
+it("sim.deflection follows imported callers and preserves explicit and exhaustive answers", async () => {
+  const worker =
+    '"arc"; function Review(){ $instruct("Review.", {deflectWhen:()=>!judge("Continue?")}); }';
+  const main = (catches: boolean) =>
+    fixture(
+      `"arc"; import { Review } from "worker";
+    function Main(){this.trigger=()=>true; ${catches ? "this.catchDeflection=()=>{};" : ""} $enter(Review);}`,
+      { worker },
+    );
+  const { run } = main(false);
+  expect((await run()).paths.map((p) => p.outcome.kind)).toEqual(["covered"]);
+  const outcomes = ["deflected", "covered"];
+  expect((await main(true).run()).paths.map((p) => p.outcome.kind)).toEqual(
+    outcomes,
+  );
+  expect(
+    (await run({ exploration: "exhaustive" })).paths.map((p) => p.outcome.kind),
+  ).toEqual(outcomes);
+  expect(
+    (
+      await run({
+        values: () => ({ mode: "extend", label: "cancel", values: [false] }),
+      })
+    ).paths.map((p) => p.outcome.kind),
+  ).toEqual(outcomes);
+});
+
+it("sim.deflection keeps independent resolution choices and forced deflections", async () => {
+  const { run, simulator } = fixture(`"arc"; function Main(){
+    this.trigger=()=>true;
+    $instructLoop("Revise.",{deflectWhen:()=>!judge("Continue?"),resolveWhen:()=>judge("Done?")});
+    $instruct("Stop.",{deflectWhen:()=>true});
+  }`);
+  const result = await run({ limits: { maxReportsPerPath: 12 } });
+  const observed = new Set<string>();
+  for (const leaf of result.paths) {
+    const path = await simulator.getPath(leaf.id);
+    const applied = path.steps.flatMap((step) =>
+      step.kind === "action-brief"
+        ? step.brief.instructions
+            .filter((i) => i.phase === "apply")
+            .map((i) => i.text)
+        : [],
+    );
+    if (applied.filter((text) => text === "Revise.").length > 1)
+      observed.add("repeated");
+    if (leaf.outcome.kind === "deflected") {
+      expect(applied.at(-1)).toBe("Stop.");
+      observed.add("finished");
+    }
+  }
+  expect(observed).toEqual(new Set(["repeated", "finished"]));
 });
 
 it("sim.deflection records acknowledgement catch and effects", async () => {
@@ -570,6 +662,23 @@ it("sim.comparisons revisits a group when unknown retains a different value", as
       seen.add(seed.value);
   }
   expect([...seen].sort()).toEqual([false, true]);
+});
+
+it("sim.dialog preserves a fixed dialog on every handback", async () => {
+  const { run, simulator } = fixture(`"arc"; function Main() {
+    this.trigger = () => judge("enter");
+    $instruct("Finish.");
+  }`);
+  const fixed = { ...dialog, view: "audit-view" };
+  const result = await run({ dialog: fixed, exploration: "exhaustive" });
+  const paths = await Promise.all(
+    result.paths.map((leaf) => simulator.getPath(leaf.id)),
+  );
+  const steps = paths.flatMap((path) => path.steps);
+  expect(steps.map((step) => step.kind)).toEqual(
+    expect.arrayContaining(["trigger-report", "action-report"]),
+  );
+  for (const step of steps) expect(step.dialog).toEqual(fixed);
 });
 
 it("sim.dialog records caller-controlled progression", async () => {
@@ -886,6 +995,20 @@ it("sim.limits accounts for distinct exclusion reasons within the record budget"
   expect((await simulator.getPath(prefixId)).outcome.kind).toBe("limit");
 });
 
+it("sim.limits finishes an admitted path when its next alternative exceeds the candidate budget", async () => {
+  const { run } = fixture(
+    '"arc";function Main(){this.trigger=()=>true;if(judge("Publish?")){$instruct("Publish.");}}',
+  );
+  const result = await run({ limits: { maxCandidateCombinations: 1 } });
+  expect(result.paths.map((p) => p.outcome.kind)).toEqual(["covered"]);
+  expect(result.unexplored).toEqual([
+    {
+      prefixId: result.coverage.inputs[0]!.prefixId,
+      reason: "maxCandidateCombinations",
+    },
+  ]);
+});
+
 it("sim.limits charges each constrained tuple once at its frontier", async () => {
   const { run } = fixture(
     '"arc";function Main(){this.trigger=()=>true;let a=Bool();let b=Bool();$observeOrAsk({a,b});}',
@@ -1004,7 +1127,7 @@ it("sim.host enumerates declared returns when ignored", async () => {
   ]);
 });
 
-it("sim.audit exposes paths without invoking replay", async () => {
+it("sim.audit materializes detached paths from recorded reports", async () => {
   const { run, simulator } = fixture(
     `"arc";function Main(){this.trigger=()=>true;$instruct("First\\nline");let answer=Bool();$observeOrAsk(answer);}`,
   );
@@ -1071,6 +1194,59 @@ it("sim.audit exposes paths without invoking replay", async () => {
     expect(
       JSON.parse(retained.traceJsonl.split("\n")[0]!).dialog.lastTurns,
     ).toEqual([]);
+  }
+});
+
+it("sim.audit revisits branches between 32-report checkpoints", async () => {
+  const instructions = Array.from(
+    { length: 35 },
+    (_, i) => `$instruct("Step ${i}");`,
+  ).join("\n");
+  const { run, simulator } =
+    fixture(`"arc";import Inventory from "host:inventory";
+    function Main(){this.trigger=()=>true;
+      ${instructions}
+      if(Inventory.available(1)){$instruct("Available");}else{$instruct("Unavailable");}
+      ${instructions}
+    }`);
+  const nextDialog = vi.fn(() => dialog);
+  const runDriver = vi.spyOn(SimulationDriver.prototype, "run");
+  try {
+    const result = await run({ exploration: "exhaustive", dialog: nextDialog });
+    expect(result.limits.maxRecordBytes).toBe(32 * 1024 * 1024);
+    expect(result.paths.map((p) => p.outcome.kind)).toEqual([
+      "covered",
+      "covered",
+    ]);
+    const driver = runDriver.mock.contexts[0] as SimulationDriver;
+    const anchors = [...driver.prefixes.values()]
+      .filter((p) => p.checkpoint)
+      .map((p) => p.steps.at(-1)!.position);
+    expect(
+      anchors.filter((p) => p.stage === "action").map((p) => p.index),
+    ).toEqual([1, 33, 65, 65]);
+    expect(
+      anchors.filter((p) => p.stage === "trigger").map((p) => p.index),
+    ).toEqual([1]);
+    const consultations = nextDialog.mock.calls.length;
+    for (const [i, summary] of result.paths.entries()) {
+      const path = await simulator.getPath(summary.id);
+      const last = path.checkpoints.at(-1)!;
+      expect(path.checkpoints.length).toBe(last.position.index + 1);
+      expect(last.hostModules.calls[0]!.effects[0]!.hostCallOutcome).toEqual({
+        kind: "resolution",
+        value: Boolean(i),
+      });
+      const instructions = path.steps.flatMap((step) =>
+        step.kind === "action-brief"
+          ? step.brief.instructions.map((instruction) => instruction.text)
+          : [],
+      );
+      expect(instructions).toContain(i ? "Available" : "Unavailable");
+    }
+    expect(nextDialog).toHaveBeenCalledTimes(consultations);
+  } finally {
+    runDriver.mockRestore();
   }
 });
 
@@ -1141,11 +1317,19 @@ it("sim.entry records trigger match and no-match paths", async () => {
     `"arc";function Main(){this.trigger=()=>judge("start?");$instruct("Apply");}`,
   );
   const result = await run();
+  expect(result.paths.map((leaf) => leaf.outcome.kind).sort()).toEqual([
+    "covered",
+    "not-matched",
+  ]);
   for (const leaf of result.paths) {
     const path = await simulator.getPath(leaf.id);
-    if (leaf.outcome.kind === "not-matched")
+    expect(path.steps.map((step) => step.kind)).toContain("trigger-report");
+    if (leaf.outcome.kind === "not-matched") {
       expect(path.checkpoints).toHaveLength(0);
-    else
+      expect(path.steps.some((step) => step.kind.startsWith("action-"))).toBe(
+        false,
+      );
+    } else
       expect(path.checkpoints[0]?.position).toMatchObject({
         stage: "action",
         index: 0,

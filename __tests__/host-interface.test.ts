@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { parse } from "@elem-app/arc/parser";
-import { toNodeRef } from "@elem-app/arc/runtime";
-import { describe, expect, it } from "vitest";
+import { Runtime, toNodeRef } from "@elem-app/arc/runtime";
+import { describe, expect, it, vi } from "vitest";
 import { modelReportContract } from "../src/service/semantic-schema.js";
 import type { HostCall } from "../src/types/host-module.js";
 import {
@@ -845,63 +845,53 @@ function Main() {
     },
   );
 
-  // Arc's current scheduler does not manufacture multi-instruction frontiers.
-  // Keep this host-level partial-coverage case dormant with the optimization.
-  it.skip("commits only the covered instructions from a batched task", async () => {
-    const arcHost = await makeArcHostWithSource(
-      "partial-instruction-coverage",
-      `
-"arc";
-
-function Main() {
-  this.trigger = () => {
-    return true;
-  };
-  this.hostParams = {
-    workerRole: "worker",
-  };
-
-  $instruct(\`A.\`);
-  $instruct(\`B.\`);
-}
-`,
+  it("forwards only applied IDs from a supplied instruction batch", async () => {
+    const host = await makeArcHostWithSource(
+      "coverage",
+      `"arc"; function Main() {
+      this.trigger = () => true;
+      $instruct("Apply.");
+    }`,
     );
-    const dialog: Dialog = {
-      cursor: { user: 0, self: 0 },
-      lastTurns: [{ role: "user", message: "start" }],
-    };
-    const driver = await beginActivatedDriver(arcHost, dialog);
-    const batch = driver.frontier.tasks.find(
-      (task) => task.kind === "instruction",
-    );
-    if (batch?.kind !== "instruction") throw new Error("expected instruction");
-    expect(batch.texts).toEqual(["A.", "B."]);
-    expect(batch.briefIds).toHaveLength(2);
-
-    const partial = await advanceView(driver, dialog, {
-      reports: [],
-      instructionCoverage: { [batch.briefIds[1]!]: "applied" },
-    });
-    expect(partial.briefs.instructions.map((item) => item.text)).toEqual([
-      "A.",
-    ]);
-
-    const unreported = await advanceView(driver, dialog, {
-      instructionCoverage: {},
-      reports: [],
-    });
-    expect(unreported.briefs.instructions).toEqual(partial.briefs.instructions);
-
-    const remaining = unreported.tasks.find(
-      (task) => task.kind === "instruction",
-    );
-    if (remaining?.kind !== "instruction")
-      throw new Error("expected instruction");
-    const completed = await advanceView(driver, dialog, {
-      reports: [],
-      instructionCoverage: { [remaining.briefIds[0]!]: "applied" },
-    });
-    expect(completed.status).toBe("completed");
+    const start = Runtime.prototype.start;
+    const supplied = vi
+      .spyOn(Runtime.prototype, "start")
+      .mockImplementation(function (this: Runtime, ...args) {
+        const next = start.apply(this, args);
+        const item = next.canProgress && next.instructions[0];
+        if (item) {
+          const sibling = {
+            ...item,
+            id: item.id + ":sibling",
+            text: "Leave pending.",
+          };
+          next.instructions.unshift(sibling);
+        }
+        return next;
+      });
+    const boundary = vi.spyOn(Runtime.prototype, "progress");
+    try {
+      const driver = await beginActivatedDriver(host, snapshotDialog);
+      const task = driver.frontier.tasks[0];
+      if (task?.kind !== "instruction")
+        throw new Error("Expected an instruction batch.");
+      expect(task.texts).toEqual(["Leave pending.", "Apply."]);
+      const [pending, applied] = task.briefIds;
+      if (!pending || !applied)
+        throw new Error("Expected two instruction IDs.");
+      await advanceView(driver, snapshotDialog, {
+        reports: [],
+        instructionCoverage: { [pending]: "ignored", [applied]: "applied" },
+      });
+      expect(boundary.mock.calls.at(-1)?.[1]).toEqual({
+        move: "proceed",
+        instructions: { [applied]: { status: "applied" } },
+      });
+    } finally {
+      supplied.mockRestore();
+      boundary.mockRestore();
+      await host.stop();
+    }
   });
 
   it("commits instruction deflection evidence without application coverage", async () => {
@@ -1718,130 +1708,73 @@ function Main() {
     ]);
   });
 
-  // This mixed-phase fixture requires Arc to batch two instruction owners.
-  // The batch-shaped host code remains covered independently of Arc scheduling.
-  it.skip("keeps postcheck instruction context when a later instruction is applying", async () => {
-    // Both loops share one resolveWhen shape (so they batch) over the same
-    // cell. Answering only the second loop's observation completes its hook
-    // false — it re-emits in `apply` — while the first loop's own observation
-    // stays pending and keeps it in `postcheck`: one frontier, mixed phases.
-    const arcHost = await makeArcHostWithSource(
-      "mixed-instruction-phases",
-      `
-"arc";
-
-function Main() {
-  this.trigger = () => {
-    return true;
-  };
-  this.hostParams = {
-    workerRole: "worker",
-  };
-
-  let done = Bool();
-  done.observing = \`is the old task done\`;
-
-  $instructLoop(\`Finish old task.\`, {
-    resolveWhen: () => {
-      $observe(done);
-      return done == true;
-    },
-  });
-
-  $instructLoop(\`Start new task.\`, {
-    resolveWhen: () => {
-      $observe(done);
-      return done == true;
-    },
-  });
-}
-`,
+  it("dispatches apply work alongside the correct postcheck owner", async () => {
+    const host = await makeArcHostWithSource(
+      "mixed",
+      `"arc"; function Main() {
+      this.trigger = () => true;
+      $instructLoop("Review.", { resolveWhen: () => judge("Finished?") });
+    }`,
     );
-    const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
-    const driver = await beginActivatedDriver(arcHost, dialog);
-    const begun = driver.frontier;
-    const instructionTask = begun.tasks.find(
-      (task) => task.kind === "instruction",
-    );
-
-    expect(instructionTask).toEqual(
-      expect.objectContaining({
-        kind: "instruction",
-        role: "worker",
-        texts: ["Finish old task.", "Start new task."],
-      }),
-    );
-    const startInstructionBrief = begun.briefs.instructions.find(
-      (item) => item.text === "Start new task.",
-    );
-    const startDoneObservationId =
-      startInstructionBrief?.postcheck?.observationIds[0];
-    expect(startDoneObservationId).toBeDefined();
-
-    const nextDialog = { cursor: { user: 1, self: 0 }, lastTurns: [] };
-    const next = await advanceView(driver, nextDialog, {
-      instructionCoverage: {
-        ...Object.fromEntries(
-          instructionTask!.briefIds.map((id) => [id, "applied" as const]),
-        ),
-      },
-      reports: [
-        {
-          outcome: "completed",
-          semantic: {
-            observations: {
-              [startDoneObservationId!]: {
-                status: "resolved",
-                value: false,
-              },
-            },
-          },
-        },
-      ],
-    });
-    const oldInstructionBrief = next.briefs.instructions.find(
-      (item) => item.text === "Finish old task.",
-    );
-    const oldDoneObservationId =
-      oldInstructionBrief?.postcheck?.observationIds[0];
-    const semanticTask = next.tasks.find(
-      (task) =>
-        task.kind === "semantic" &&
-        task.requests.some(
-          (request) => request.briefId === oldDoneObservationId,
-        ),
-    );
-
-    expect(oldDoneObservationId).toBeDefined();
-    expect(next.briefs.instructions).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          text: "Finish old task.",
-          phase: "postcheck",
-        }),
-        expect.objectContaining({
-          text: "Start new task.",
-          phase: "apply",
-        }),
-      ]),
-    );
-    expect(next.tasks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          kind: "instruction",
-          texts: ["Start new task."],
-        }),
-      ]),
-    );
-    expect(semanticTask).toEqual(
-      expect.objectContaining({
-        kind: "semantic",
-        activeInstruction: expect.objectContaining({
-          texts: ["Finish old task."],
-          phase: "postcheck",
-        }),
-      }),
-    );
+    const driver = await beginActivatedDriver(host, snapshotDialog);
+    const initial = driver.frontier.tasks[0];
+    if (initial?.kind !== "instruction")
+      throw new Error("Expected an instruction.");
+    const id = initial.briefIds[0];
+    const progress = Runtime.prototype.progress;
+    const boundary = vi
+      .spyOn(Runtime.prototype, "progress")
+      .mockImplementation(function (this: Runtime, ...args) {
+        const next = progress.apply(this, args);
+        const owner =
+          next.canProgress &&
+          next.instructions.find((item) => item.phase === "postcheck");
+        if (owner) {
+          next.instructions.push({
+            ...owner,
+            id: id + ":apply",
+            phase: "apply",
+            text: "New work.",
+            postcheck: undefined,
+          });
+        }
+        return next;
+      });
+    try {
+      const updated = { ...snapshotDialog, view: "updated" };
+      const next = await advanceView(driver, updated, {
+        reports: [],
+        instructionCoverage: { [id]: "applied" },
+      });
+      expect(next.tasks).toHaveLength(2);
+      expect(next.tasks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "instruction",
+            briefIds: [id + ":apply"],
+            texts: ["New work."],
+          }),
+          expect.objectContaining({
+            kind: "semantic",
+            dialog: updated,
+            activeInstruction: expect.objectContaining({
+              phase: "postcheck",
+              briefIds: [id],
+              texts: ["Review."],
+            }),
+            requests: [
+              expect.objectContaining({
+                kind: "judgment",
+                briefId: next.briefs.judgments[0]?.id,
+              }),
+            ],
+          }),
+        ]),
+      );
+    } finally {
+      boundary.mockRestore();
+      await host.stop();
+    }
   });
 
   it("routes an instruction without worker-role metadata to the default worker", async () => {
@@ -2194,4 +2127,45 @@ it("commits schema-validated Union answers through the Arcade adapter into Arc",
       texts: ["Choice none; hours 9,none"],
     }),
   );
+});
+
+it("commits a schema-validated workspace Artifact through the Arcade adapter", async () => {
+  const host = await makeArcHostWithSource(
+    "observed-path",
+    `
+    "arc"; function Main() {
+      this.trigger = () => true;
+      let directory = Artifact({observing: "Which directory?"});
+      $observe(directory);
+      $instruct(\`List \${directory}\`);
+    }
+  `,
+  );
+  const dialog = { cursor: { user: 0, self: 0 }, lastTurns: [] };
+  const driver = await beginActivatedDriver(host, dialog);
+  const task = driver.frontier.tasks[0];
+  if (task?.kind !== "semantic") throw new Error("Expected semantic task");
+  const id = driver.frontier.briefs.observations[0]!.id;
+  const contract = modelReportContract(task, true);
+  const result = (value: unknown) => ({
+    report: {
+      outcome: "completed",
+      semantic: { observations: { [id]: { status: "resolved", value } } },
+    },
+  });
+  for (const value of [".", {}, { $path: ".", extra: true }])
+    expect(() => contract.parse(result(value))).toThrow();
+  const view = await advanceView(driver, dialog, {
+    instructionCoverage: {},
+    reports: [contract.parse(result({ $path: "." }))],
+  });
+  expect(view.tasks[0]).toMatchObject({
+    kind: "instruction",
+    texts: [
+      [
+        { kind: "text", value: "List " },
+        { kind: "artifact", path: "." },
+      ],
+    ],
+  });
 });

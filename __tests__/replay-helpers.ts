@@ -70,6 +70,7 @@ export const answeringWorker: RoleWorker = async (task) => {
 };
 
 function firstAdmissibleValue(meta: ObservationMeta): ObservedValue {
+  if (meta.type === "artifact") return { $path: "." };
   if (meta.type === "union")
     return firstAdmissibleScalarValue(meta.members[0]!);
   if (meta.type === "array")

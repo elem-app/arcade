@@ -6,6 +6,7 @@ import {
   type ActionReport,
   type ArcRef,
   type Dialog,
+  type NodeRef,
   type TerminalBrief,
   type TriggerBrief,
   type TriggerReport,
@@ -22,7 +23,6 @@ import { isDeepStrictEqual } from "node:util";
 import {
   hostCallTraversal,
   type HostModuleEffect,
-  type HostModuleState,
 } from "../types/host-module.js";
 import type { ResolvedDocumentSnapshot } from "../types/host.js";
 import type {
@@ -41,32 +41,34 @@ import type {
   SimulationOptions,
   SimulationOutcome,
   SimulationPathId,
+  SimulationPreferenceDiagnostic,
   SimulationResult,
+  SimulationWitnessAnswer,
 } from "../types/simulation.js";
 import { createDocumentRuntime } from "./document-runtime.js";
-import { captureCalls } from "./host-call-recording.js";
 import {
   recordActionOutput,
   recordReport,
   recordTriggerOutput,
   recordTriggerStart,
 } from "./replay-recording.js";
-import { advanceHostModuleState } from "./replay-state.js";
 import {
   behaviorSignature,
   compareForks,
   sortComparisons,
 } from "./simulation-comparisons.js";
 import {
+  captureState,
   emptyDialog,
   encodeLine,
   history,
+  progressTape,
   recordBytes,
-  storeCheckpoint,
+  restorePosition,
   type AnswerRecord,
   type Fork,
   type Prefix,
-  type StoredCheckpoint,
+  type TapeState,
 } from "./simulation-trace.js";
 import {
   generateDomain,
@@ -76,19 +78,20 @@ import {
 } from "./simulation-values.js";
 
 type Brief = TriggerBrief | ActionBrief | TerminalBrief;
-type Cursor = {
-  brief: Brief;
+type Cursor = TapeState & {
+  preferenceAnswers: readonly SimulationWitnessAnswer[];
   prefix: Prefix;
   work: readonly number[];
   dialog: Dialog;
   position: ReplayPosition;
-  host: HostModuleState;
 };
 type ChoiceDomain = Domain & {
+  preferredIndex: number;
   key: string;
   siteKey: string;
   occurrence: number;
   base: number;
+  uncaughtDeflectingAnswer?: boolean;
   exercised: Set<number>;
   coverage: SimulationCoverage["inputs"][number];
 };
@@ -104,12 +107,15 @@ type Scenario = {
   targets: Map<string, SimulationChoice["answer"]>;
 };
 type Task = {
+  preferenceAnswers: readonly SimulationWitnessAnswer[];
+  preferenceRank?: number;
   remaining?: bigint;
   /** Admission at this prefix, shared with simplification reruns. Null marks an excluded tuple. */
   examinedRows?: Map<string, AnswerRecord[] | null>;
-  cursor: Cursor;
+  prefix: Prefix;
+  position: ReplayPosition;
+  work: readonly number[];
   rows: Generator<Proposal>;
-  context: SimulationContext;
   domains: ChoiceDomain[];
   dialog: Dialog;
   scenario: Scenario;
@@ -123,7 +129,12 @@ type Group = {
   shared: Set<string>;
   first: boolean;
 };
-type Proposal = { row: number[]; target?: string; pair?: string };
+type Proposal = {
+  row: number[];
+  target?: string;
+  pair?: string;
+  admitted?: AnswerRecord[];
+};
 type Limit = keyof SimulationLimits;
 class BudgetReached {
   constructor(readonly limit: Limit) {}
@@ -132,6 +143,15 @@ class BudgetReached {
 function rootNode(arc: ArcRef) {
   const { source, identifier } = toArcRefParts(arc);
   return toNodeRef(source, [identifier]);
+}
+
+function resolvedObservation(
+  input: SimulationInput,
+  answer: SimulationChoice["answer"],
+) {
+  if (input.kind !== "observation") return;
+  const observation = answer as ObservationReport;
+  return observation.status === "resolved" ? observation.value : undefined;
 }
 
 function inputs(
@@ -272,6 +292,41 @@ function automatic(
     return { report: { move: "proceed" }, origin: "host-proceed" };
 }
 
+/** Choose the baseline answer before varying individual inputs or grouped pairs. */
+function preferredAnswer(
+  domain: Domain,
+  position: ReplayPosition,
+  reference: SimulationChoice["answer"] | undefined,
+  previous: AnswerRecord | undefined,
+): number {
+  const { input, candidates } = domain;
+  const indexOf = (answer: SimulationChoice["answer"] | undefined) =>
+    candidates.findIndex((candidate) =>
+      isDeepStrictEqual(candidate.answer, answer),
+    );
+  const referenceIndex = indexOf(reference);
+  if (referenceIndex >= 0) return referenceIndex;
+  let base = 0;
+  if (input.kind === "judgment" && position.stage === "trigger")
+    base = Math.max(0, indexOf(true));
+  else if (input.kind === "observation")
+    base = Math.max(
+      0,
+      candidates.findIndex((c) => c.provenance !== "unknown"),
+    );
+  if (reference === undefined && previous) {
+    const prior = indexOf(previous.choice.answer);
+    if (input.kind === "judgment" && prior >= 0) return prior;
+    if (input.kind !== "judgment" && prior === base) {
+      const alternative = candidates.findIndex(
+        (c, i) => i !== prior && c.provenance !== "unknown",
+      );
+      if (alternative >= 0) return alternative;
+    }
+  }
+  return base;
+}
+
 function rowPairs(row: number[]) {
   const pairs: string[] = [];
   for (let i = 0; i < row.length; i++)
@@ -282,11 +337,21 @@ function rowPairs(row: number[]) {
 
 /** Drive isolated continuations through one captured runtime. */
 export class SimulationDriver {
+  readonly #preferred: ReadonlyMap<
+    string,
+    NonNullable<SimulationOptions["prefer"]>[number]["answer"]
+  >;
+  readonly #preferenceDiagnostics: ReadonlyMap<
+    string,
+    SimulationPreferenceDiagnostic
+  >;
   /** Shared prefixes available for path lookup after exploration. */
   readonly prefixes = new Map<SimulationPathId, Prefix>();
   /** Path summaries, comparisons and coverage accumulated by this run. */
   readonly result: SimulationResult;
-  readonly #runtime: Runtime;
+  /** Captured runtime that owns this recording and its checkpoint briefs. */
+  readonly runtime: Runtime;
+  readonly #declaresCatch = new Map<NodeRef, boolean>();
   readonly #queue: Task[] = [];
   readonly #scheduledSites = new Set<string>();
   readonly #workIds = new Map<string, number>();
@@ -310,9 +375,26 @@ export class SimulationDriver {
     private readonly limits: SimulationLimits,
     private readonly signal: AbortSignal,
   ) {
-    this.#runtime = createDocumentRuntime(snapshot);
+    this.runtime = createDocumentRuntime(snapshot);
+    const prefer = options.prefer ?? [];
+    this.#preferred = new Map(prefer.map(({ cell, answer }) => [cell, answer]));
+    const preferenceDiagnostics: SimulationPreferenceDiagnostic[] = prefer.map(
+      ({ cell, answer }) => ({ cell, answer, status: "not-reached" }),
+    );
+    this.#preferenceDiagnostics = new Map(
+      preferenceDiagnostics.map((diagnostic) => [diagnostic.cell, diagnostic]),
+    );
     this.result = {
       id,
+      preferenceDiagnostics,
+      ...(options.expect && {
+        expectation: {
+          ...options.expect,
+          prefer,
+          status: "not-witnessed" as const,
+          preferencesReached: !prefer.length,
+        },
+      }),
       paths: [],
       comparisons: [],
       coverage: { inputs: [], groups: [], nodes: [] },
@@ -333,16 +415,49 @@ export class SimulationDriver {
     this.#bytes = recordBytes({
       documents: snapshot.documents,
       hostModules: [...snapshot.hostModules],
+      ...(prefer.length && { prefer }),
+      preferenceDiagnostics,
+      ...(options.expect && { expect: options.expect }),
     });
     if (this.#bytes >= limits.maxRecordBytes)
       throw new RangeError("Snapshot exceeds maxRecordBytes.");
   }
 
-  #charge(value: object, binaryBytes = 0) {
-    const size = recordBytes(value) + binaryBytes;
+  #charge(value: object) {
+    const size = recordBytes(value);
     if (this.#bytes + size > this.limits.maxRecordBytes - this.#reviewReserve)
       throw new BudgetReached("maxRecordBytes");
     this.#bytes += size;
+  }
+
+  /** Only the first resolved observation for a preferred cell identifies the scenario. */
+  #preferenceAnswers(
+    prior: readonly SimulationWitnessAnswer[],
+    choices: readonly Pick<SimulationChoice, "input" | "answer">[],
+    position: ReplayPosition,
+  ) {
+    let answers = prior;
+    for (const { input, answer } of choices) {
+      if (
+        input.kind !== "observation" ||
+        !this.#preferred.has(input.cell) ||
+        answers.some((entry) => entry.cell === input.cell)
+      )
+        continue;
+      const value = resolvedObservation(input, answer);
+      if (value !== undefined)
+        answers = [...answers, { cell: input.cell, answer: value, position }];
+    }
+    return answers;
+  }
+
+  #preferenceRank(answers: readonly SimulationWitnessAnswer[]) {
+    const matches = answers.filter(({ cell, answer }) =>
+      isDeepStrictEqual(this.#preferred.get(cell), answer),
+    ).length;
+    return matches === answers.length
+      ? matches
+      : matches - this.#preferred.size - 1;
   }
 
   #spendPairWork(units: number) {
@@ -406,40 +521,40 @@ export class SimulationDriver {
   }
 
   #save(
-    brief: Brief,
+    state: TapeState,
     dialog: Dialog,
     position: ReplayPosition,
-    host: HostModuleState,
     steps: ReplayStep[],
-    checkpoints: StoredCheckpoint[],
     parent?: Cursor,
     answers: AnswerRecord[] = [],
     report = false,
   ): Cursor {
-    const stage = position.stage;
-    const work = this.#workRoute(parent?.work ?? [], brief, stage);
-    if ("hostCalls" in brief) {
-      let sequence = host.calls.length;
-      host.calls.push(
-        ...captureCalls(
-          stage,
-          host,
-          brief.hostCalls,
-          brief.traversals,
-          { arcRef: this.options.arcRef },
-          () => `sim-call-${++sequence}`,
-          true,
-        ),
-      );
-    }
+    const { brief, host } = state;
+    const priorAnswers = parent?.preferenceAnswers ?? [];
+    const preferenceAnswers =
+      parent && answers.length && priorAnswers.length < this.#preferred.size
+        ? this.#preferenceAnswers(
+            priorAnswers,
+            answers.map((record) => record.choice),
+            parent.position,
+          )
+        : priorAnswers;
+    const work = this.#workRoute(parent?.work ?? [], brief, position.stage);
+    const checkpoint = (position.index - 1) % 32 === 0 ? state : undefined;
+    let hostCallIds: Record<string, string> | undefined;
     if ("canProgress" in brief && position.stage === "action") {
       steps.push(recordActionOutput(position, brief, dialog));
-      checkpoints.push(storeCheckpoint(position, brief.traversals, host));
+      if (brief.canProgress && brief.hostCalls.length) {
+        const calls = [...host.calls].reverse();
+        hostCallIds = Object.fromEntries(
+          brief.hostCalls.map((item) => [
+            item.id,
+            calls.find((r) => r.runtimeCallId === item.id)!.call.hostCallId,
+          ]),
+        );
+      }
     } else if (!("canProgress" in brief) && position.stage === "trigger")
       steps.push(recordTriggerOutput(position, brief, dialog, host));
-    const triggerTraversals = checkpoints.length
-      ? undefined
-      : structuredClone(brief.traversals);
     const nodeStates: Prefix["nodeStates"] = [];
     const seen = new Set<string>();
     const pending: Traversal[] = [...brief.traversals];
@@ -455,27 +570,19 @@ export class SimulationDriver {
       }
       pending.push(...t.ownedChildren, ...t.ephemeralChildren);
     }
-    this.#charge(
-      {
-        steps,
-        checkpoints: checkpoints.map(({ position, hostModules }) => ({
-          position,
-          hostModules,
-        })),
-        ...(triggerTraversals && { triggerTraversals }),
-        nodeStates,
-        answers,
-      },
-      checkpoints.reduce(
-        (bytes, checkpoint) => bytes + checkpoint.traversals.length,
-        0,
-      ),
-    );
+    this.#charge({
+      steps,
+      ...(checkpoint && { checkpoint }),
+      ...(hostCallIds && { hostCallIds }),
+      nodeStates,
+      answers,
+      ...(preferenceAnswers !== priorAnswers && { preferenceAnswers }),
+    });
     const prefix: Prefix = {
       parent: parent?.prefix,
       steps,
-      checkpoints,
-      triggerTraversals,
+      checkpoint,
+      hostCallIds,
       nodeStates,
       answers,
       depth: (parent?.prefix.depth ?? 0) + Number(report),
@@ -483,7 +590,15 @@ export class SimulationDriver {
       outcome: { kind: "prefix" },
     };
     this.prefixes.set(prefix.id, prefix);
-    return { brief, dialog, position, host, prefix, work };
+    const expectation = this.result.expectation;
+    if (
+      expectation?.status === "not-witnessed" &&
+      !expectation.preferencesReached &&
+      preferenceAnswers.length === this.#preferred.size &&
+      this.#preferenceRank(preferenceAnswers) === this.#preferred.size
+    )
+      expectation.preferencesReached = true;
+    return { brief, dialog, position, host, prefix, work, preferenceAnswers };
   }
 
   #advance(
@@ -496,7 +611,7 @@ export class SimulationDriver {
       throw new BudgetReached("maxTotalReports");
     this.#totalReports++;
     const { position, brief } = cursor;
-    let step: ReplayStep, next: Brief;
+    let step: ActionReportStep | TriggerReportStep;
     const effect = hand.effect;
     if (position.stage === "trigger" && !("canProgress" in brief)) {
       step = recordReport({
@@ -507,7 +622,6 @@ export class SimulationDriver {
         report: hand.report,
         ...(effect && { moduleEffect: effect }),
       });
-      next = this.#runtime.progressTrigger(brief, step.report, dialog);
     } else if (
       position.stage === "action" &&
       "canProgress" in brief &&
@@ -522,25 +636,12 @@ export class SimulationDriver {
         report: hand.report,
         ...(effect && { moduleEffect: effect }),
       });
-      next = this.#runtime.progress(brief, step.report, dialog);
     } else throw new Error("Report does not belong to the current frontier.");
-    const invalid = next.issues.find(
-      (i) => i.kind === "invalid-item" || i.kind === "invalid-report",
-    );
-    if (invalid)
-      throw new TypeError(
-        `Invalid simulation report at ${position.stage}:${position.index}: ${JSON.stringify(invalid)}`,
-      );
-    const projected = advanceHostModuleState(cursor.host, next, effect);
-    if (effect && !projected.effectAdmitted)
-      throw new Error("Simulator host resolution was rejected.");
     return this.#save(
-      next,
+      progressTape(this.runtime, this.options.arcRef, cursor, step),
       dialog,
       { ...position, index: position.index + 1 },
-      projected.hostModules,
       [step],
-      [],
       cursor,
       answers,
       true,
@@ -549,6 +650,30 @@ export class SimulationDriver {
 
   #finish(cursor: Cursor, outcome: SimulationOutcome, scenario: Scenario) {
     const prefix = cursor.prefix;
+    const expectation = this.result.expectation;
+    if (
+      outcome.kind === "covered" &&
+      expectation?.status === "not-witnessed" &&
+      this.#preferenceRank(cursor.preferenceAnswers) === this.#preferred.size
+    ) {
+      const root = cursor.brief.traversals.find(
+        (item) => item.ref === this.options.arcRef,
+      );
+      const { cell, equals } = expectation.onCompletion;
+      const actual =
+        root && Object.hasOwn(root.cells, cell) ? root.cells[cell] : undefined;
+      if (actual !== undefined && isDeepStrictEqual(actual, equals)) {
+        this.result.expectation = {
+          onCompletion: expectation.onCompletion,
+          prefer: expectation.prefer,
+          status: "witnessed",
+          pathId: prefix.id,
+          reports: prefix.depth,
+          actual,
+          answers: cursor.preferenceAnswers,
+        };
+      }
+    }
     prefix.outcome = outcome;
     scenario.leaf = prefix;
     (this.result.paths as SimulationResult["paths"][number][]).push({
@@ -595,6 +720,67 @@ export class SimulationDriver {
     this.signal.throwIfAborted();
   }
 
+  /** Follow actual entries, including imported arcs and anonymous copies. */
+  #canCatch(brief: ActionBrief): boolean {
+    let ref: NodeRef | undefined = brief.active;
+    while (ref) {
+      let catches = this.#declaresCatch.get(ref);
+      if (catches === undefined) {
+        catches = this.runtime.nodeForRef(ref)?.catchDeflection !== undefined;
+        this.#declaresCatch.set(ref, catches);
+      }
+      if (catches) return true;
+      ref = hostCallTraversal(brief.traversals, ref)?.enteredBy?.callerRef;
+    }
+    return false;
+  }
+
+  /** Let Arc evaluate the judgment in isolation from the instruction's other open checks. */
+  #uncaughtDeflectingAnswer(
+    cursor: Cursor,
+    domain: Domain,
+    dialog: Dialog,
+  ): boolean | undefined {
+    const { brief } = cursor;
+    const { input } = domain;
+    if (
+      this.options.exploration === "exhaustive" ||
+      input.kind !== "judgment" ||
+      !domain.candidates.some((c) => c.provenance === "generated") ||
+      !("canProgress" in brief) ||
+      !brief.canProgress ||
+      !brief.instructions.some((i) =>
+        i.postcheck?.judgmentIds.includes(input.site.briefId),
+      ) ||
+      this.#canCatch(brief)
+    )
+      return;
+
+    const segment = brief.traversals.find((t) => t.activeFrame)?.activeFrame
+      ?.activeSeg;
+    if (segment?.kind !== "resolveWhen" && segment?.kind !== "deflectWhen")
+      return;
+    const deflects = (answer: boolean) => {
+      const next = this.runtime.progress(
+        brief,
+        {
+          move: "proceed",
+          judgments: { [input.site.briefId]: answer },
+        },
+        dialog,
+      );
+      if (!next.canProgress || next.deflection?.origin !== brief.active)
+        return false;
+      const owner = next.traversals.find((t) => t.activeFrame)?.activeFrame
+        ?.activeSeg;
+      return owner?.kind === segment.kind && owner.owner === segment.owner;
+    };
+    const onFalse = deflects(false);
+    const onTrue = deflects(true);
+    // A forced deflection is authored behavior even in a catchless node.
+    return onFalse === onTrue ? undefined : onTrue;
+  }
+
   #domains(
     cursor: Cursor,
     context: SimulationContext,
@@ -633,6 +819,20 @@ export class SimulationDriver {
         this.options,
         this.limits,
       );
+      const preferred =
+        input.kind === "observation" &&
+        !cursor.preferenceAnswers.some((entry) => entry.cell === input.cell)
+          ? this.#preferred.get(input.cell)
+          : undefined;
+      const preferredIndex =
+        preferred === undefined
+          ? -1
+          : domain.candidates.findIndex((candidate) =>
+              isDeepStrictEqual(
+                resolvedObservation(input, candidate.answer),
+                preferred,
+              ),
+            );
       const ranks = [
         "finite-complete",
         "sampled",
@@ -654,43 +854,29 @@ export class SimulationDriver {
         truncated: domain.truncated,
         gaps: domain.missing ? ["No concrete candidate."] : [],
       };
-      this.#charge({ coverage, domain });
-      (this.result.coverage.inputs as (typeof coverage)[]).push(coverage);
-      const ref = scenario.reference?.targets.get(key);
-      let base = domain.candidates.findIndex((c) =>
-        isDeepStrictEqual(c.answer, ref),
-      );
-      if (
-        base < 0 &&
-        input.kind === "judgment" &&
-        cursor.position.stage === "trigger"
-      )
-        base = domain.candidates.findIndex((c) => c.answer === true);
-      if (base < 0 && input.kind === "observation")
-        base = domain.candidates.findIndex((c) => c.provenance !== "unknown");
-      if (base < 0) base = 0;
-      if (ref === undefined && visits.length) {
-        const previous = visits.at(-1)!;
-        if (input.kind === "judgment") {
-          const same = domain.candidates.findIndex((c) =>
-            isDeepStrictEqual(c.answer, previous.choice.answer),
-          );
-          if (same >= 0) base = same;
-        } else if (
-          domain.candidates.length > 1 &&
-          isDeepStrictEqual(
-            previous.choice.answer,
-            domain.candidates[base]?.answer,
-          )
-        ) {
-          const alternative = domain.candidates.findIndex(
-            (c) =>
-              c.provenance !== "unknown" &&
-              !isDeepStrictEqual(c.answer, previous.choice.answer),
-          );
-          if (alternative >= 0) base = alternative;
+      this.#charge({
+        coverage,
+        domain,
+        ...(this.#preferred.size && { preferredIndex }),
+      });
+      if (input.kind === "observation" && preferred !== undefined) {
+        const diagnostic = this.#preferenceDiagnostics.get(input.cell)!;
+        const status = preferredIndex >= 0 ? "available" : "unavailable";
+        if (diagnostic.status !== "available" && diagnostic.status !== status) {
+          const update = {
+            status,
+            evidence: {
+              prefixId: cursor.prefix.id,
+              position: cursor.position,
+              site: input.site,
+              truncated: domain.truncated,
+            },
+          };
+          this.#charge(update);
+          Object.assign(diagnostic, update);
         }
       }
+      (this.result.coverage.inputs as (typeof coverage)[]).push(coverage);
       return {
         ...domain,
         siteKey: encodeLine({
@@ -700,7 +886,21 @@ export class SimulationDriver {
         }),
         key,
         occurrence,
-        base,
+        preferredIndex,
+        base:
+          !scenario.trial && preferredIndex >= 0
+            ? preferredIndex
+            : preferredAnswer(
+                domain,
+                cursor.position,
+                scenario.reference?.targets.get(key),
+                visits.at(-1),
+              ),
+        uncaughtDeflectingAnswer: this.#uncaughtDeflectingAnswer(
+          cursor,
+          domain,
+          dialog,
+        ),
         coverage,
         exercised: new Set<number>(),
       };
@@ -714,7 +914,15 @@ export class SimulationDriver {
   ): Generator<Proposal> {
     const sizes = domains.map((d) => d.candidates.length);
     if (this.options.exploration === "exhaustive") {
-      for (const row of product(sizes)) yield { row };
+      for (const row of product(sizes)) {
+        // Visit the preferred index first while retaining the original candidate indices.
+        for (const [i, domain] of domains.entries()) {
+          const preferred = domain.preferredIndex;
+          if (preferred > 0 && row[i]! <= preferred)
+            row[i] = row[i] === 0 ? preferred : row[i]! - 1;
+        }
+        yield { row };
+      }
       return;
     }
     const base = domains.map((d) => d.base);
@@ -805,8 +1013,9 @@ export class SimulationDriver {
 
   async #nextProposal(task: Task): Promise<Proposal | undefined> {
     for (;;) {
-      const item = task.pending
-        ? { done: false, value: task.pending }
+      const reserved = task.pending;
+      const item = reserved
+        ? { done: false, value: reserved }
         : task.rows.next();
       task.pending = undefined;
       if (item.done) break;
@@ -815,7 +1024,8 @@ export class SimulationDriver {
       if (proposal.target && this.#targets.has(proposal.target)) continue;
       if (proposal.pair && task.group?.shared.has(proposal.pair)) continue;
       const known = task.examinedRows?.get(proposal.row.join(","));
-      if (known === null || (known && !task.scenario.trial)) continue;
+      if (known === null || (known && !reserved && !task.scenario.trial))
+        continue;
       return proposal;
     }
     if (task.examinedRows && !task.scenario.trial) {
@@ -833,12 +1043,14 @@ export class SimulationDriver {
 
   async #take(
     task: Task,
+    cursor: Cursor,
   ): Promise<{ records: AnswerRecord[]; proposal: Proposal } | undefined> {
+    let context: SimulationContext | undefined;
     for (;;) {
       const proposal = await this.#nextProposal(task);
       if (!proposal) return;
       const rowKey = proposal.row.join(",");
-      const previous = task.examinedRows?.get(rowKey);
+      const previous = proposal.admitted ?? task.examinedRows?.get(rowKey);
       if (previous) return { records: previous, proposal };
       if (this.#attempts >= this.limits.maxCandidateCombinations)
         throw new BudgetReached("maxCandidateCombinations");
@@ -853,26 +1065,35 @@ export class SimulationDriver {
           occurrence: d.occurrence,
           answer: candidate.answer,
         };
-        const decision = this.options.accept?.(
-          structuredClone(choice),
-          structuredClone({
-            ...task.context,
-            choices: [...task.context.choices, ...records.map((a) => a.choice)],
-          }),
-        );
-        if (decision && !decision.accept) {
+        let decision;
+        if (this.options.accept) {
+          context ??= this.#context(cursor);
+          decision = this.options.accept(
+            structuredClone(choice),
+            structuredClone({
+              ...context,
+              choices: [...context.choices, ...records.map((a) => a.choice)],
+            }),
+          );
+        }
+        const reason =
+          decision && !decision.accept
+            ? decision.reason
+            : candidate.provenance === "generated" &&
+                candidate.answer === d.uncaughtDeflectingAnswer
+              ? "Generated instruction deflection has no catch on the active caller chain."
+              : undefined;
+        if (reason !== undefined) {
           const exclusions = this.result
             .exclusions as SimulationResult["exclusions"][number][];
           const found = exclusions.find(
-            (e) =>
-              e.prefixId === task.cursor.prefix.id &&
-              e.reason === decision.reason,
+            (e) => e.prefixId === task.prefix.id && e.reason === reason,
           );
           if (found) found.count++;
           else {
             const exclusion = {
-              prefixId: task.cursor.prefix.id,
-              reason: decision.reason,
+              prefixId: task.prefix.id,
+              reason,
               count: 1,
             };
             this.#charge(exclusion);
@@ -884,7 +1105,7 @@ export class SimulationDriver {
         records.push({
           key: d.key,
           choice,
-          position: task.cursor.position,
+          position: task.position,
           site: d.input.site,
           occurrence: d.occurrence,
           candidateIndex: index,
@@ -897,26 +1118,47 @@ export class SimulationDriver {
     }
   }
 
-  async #branch(task: Task, scenario: Scenario): Promise<Cursor | undefined> {
-    const next = await this.#take(task);
+  #restore(task: Task): Cursor {
+    const state = restorePosition(
+      this.runtime,
+      this.options.arcRef,
+      task.prefix,
+    );
+    return {
+      ...state,
+      prefix: task.prefix,
+      position: task.position,
+      work: task.work,
+      preferenceAnswers: task.preferenceAnswers,
+      dialog: task.prefix.steps.at(-1)!.dialog,
+    };
+  }
+
+  async #branch(
+    task: Task,
+    scenario: Scenario,
+    cursor: Cursor,
+  ): Promise<Cursor | undefined> {
+    const next = await this.#take(task, cursor);
     if (!next) return;
-    return this.#submit(task, scenario, next);
+    return this.#submit(task, scenario, next, cursor);
   }
 
   #submit(
     task: Task,
     scenario: Scenario,
     selected: { records: AnswerRecord[]; proposal: Proposal },
+    parent: Cursor,
   ) {
     const { records, proposal } = selected;
     const pairs = task.group ? rowPairs(proposal.row) : [];
     if (proposal.target) this.#charge({ target: proposal.target });
     for (const p of pairs)
       if (!task.group!.pairs.has(p))
-        this.#charge({ pair: p, prefix: task.cursor.prefix.id });
+        this.#charge({ pair: p, prefix: task.prefix.id });
     const cursor = this.#advance(
-      task.cursor,
-      handback(task.cursor, records),
+      parent,
+      handback(parent, records),
       task.dialog,
       records,
     );
@@ -967,19 +1209,12 @@ export class SimulationDriver {
           brief.matched === this.options.arcRef
         ) {
           const dialog = this.#dialog(this.#context(cursor));
-          const seed = storeCheckpoint(
-            { stage: "action", index: 0, reactivationCount: 0 },
-            brief.traversals,
-            cursor.host,
-          );
-          const next = this.#runtime.start(brief.traversals, dialog);
+          const next = this.runtime.start(brief.traversals, dialog);
           cursor = this.#save(
-            next,
+            captureState(this.options.arcRef, next, cursor.host),
             dialog,
-            { ...seed.position, index: 1 },
-            advanceHostModuleState(cursor.host, next).hostModules,
+            { stage: "action", reactivationCount: 0, index: 1 },
             [],
-            [seed],
             cursor,
           );
           continue;
@@ -1080,10 +1315,12 @@ export class SimulationDriver {
           ? this.#trialRow(domains, scenario.targets)
           : this.#rows(domains, cursor.work, group);
         const task: Task = {
-          cursor,
+          prefix: cursor.prefix,
+          preferenceAnswers: cursor.preferenceAnswers,
+          work: cursor.work,
+          position: cursor.position,
           scenario,
           domains,
-          context,
           dialog,
           rows,
           group,
@@ -1108,14 +1345,13 @@ export class SimulationDriver {
           this.#retainable(task, true)
         ) {
           // Yield a revisited decision so a looping path cannot exhaust the budget alone.
-          task.queuedAs = "continuation";
-          this.#queue.push(task);
+          await this.#enqueue(task, cursor, true);
           return;
         }
-        const child = await this.#branch(task, scenario);
+        const child = await this.#branch(task, scenario, cursor);
         if (!child) return;
         remaining = task.remaining;
-        if (!scenario.trial) await this.#enqueue(task);
+        if (!scenario.trial) await this.#enqueue(task, cursor);
         cursor = child;
         remaining = undefined;
       }
@@ -1132,12 +1368,9 @@ export class SimulationDriver {
   }
 
   #retainable(task: Task, prioritizeExploration: boolean) {
-    const queued = new Set(this.#queue.map((t) => t.cursor.prefix));
+    const queued = new Set(this.#queue.map((t) => t.prefix));
     const held = new Set([...this.#trialFrontiers.keys(), ...queued]);
-    if (
-      held.has(task.cursor.prefix) ||
-      held.size < this.limits.maxPendingPrefixes
-    )
+    if (held.has(task.prefix) || held.size < this.limits.maxPendingPrefixes)
       return true;
     if (prioritizeExploration)
       for (const prefix of this.#trialFrontiers.keys()) {
@@ -1149,15 +1382,45 @@ export class SimulationDriver {
     return false;
   }
 
-  async #enqueue(task: Task) {
-    task.pending = await this.#nextProposal(task);
-    if (!task.pending) return;
-    if (!this.#retainable(task, true)) {
-      this.#gap(task.cursor.prefix, "maxPendingPrefixes", task.remaining);
+  async #enqueue(task: Task, cursor: Cursor, continuation = false) {
+    try {
+      task.pending =
+        this.options.exploration === "exhaustive"
+          ? await this.#nextProposal(task)
+          : (await this.#take(task, cursor))?.proposal;
+      if (
+        task.pending &&
+        this.#preferred.size &&
+        this.result.expectation?.status !== "witnessed"
+      ) {
+        const row = task.pending.row;
+        const choices = task.domains.map((domain, i) => ({
+          input: domain.input,
+          answer: domain.candidates[row[i]!]!.answer,
+        }));
+        const preferenceRank = this.#preferenceRank(
+          this.#preferenceAnswers(
+            task.preferenceAnswers,
+            choices,
+            task.position,
+          ),
+        );
+        if (task.preferenceRank === undefined) this.#charge({ preferenceRank });
+        task.preferenceRank = preferenceRank;
+      }
+    } catch (error) {
+      if (!(error instanceof BudgetReached) || continuation) throw error;
+      // The child is already admitted. Only its pending sibling hit this limit.
+      this.#gap(task.prefix, error.limit, task.remaining);
       return;
     }
-    task.queuedAs = undefined;
-    if (this.options.exploration !== "exhaustive") {
+    if (!task.pending) return;
+    if (!this.#retainable(task, true)) {
+      this.#gap(task.prefix, "maxPendingPrefixes", task.remaining);
+      return;
+    }
+    task.queuedAs = continuation ? "continuation" : undefined;
+    if (!continuation && this.options.exploration !== "exhaustive") {
       for (const [i, d] of task.domains.entries()) {
         if (
           task.pending.row[i] !== d.base &&
@@ -1172,11 +1435,29 @@ export class SimulationDriver {
   }
 
   #dequeue(): Task {
-    if (this.options.exploration === "exhaustive") return this.#queue.pop()!;
+    const ranked =
+      this.#preferred.size > 0 &&
+      this.result.expectation?.status !== "witnessed";
+    const best = ranked
+      ? this.#queue.reduce(
+          (max, task) => Math.max(max, task.preferenceRank!),
+          -Infinity,
+        )
+      : undefined;
+    const eligible = (task: Task) => !ranked || task.preferenceRank === best;
+    if (this.options.exploration === "exhaustive") {
+      let index = this.#queue.length - 1;
+      while (!eligible(this.#queue[index]!)) index--;
+      return this.#queue.splice(index, 1)[0]!;
+    }
     if (this.#preferNewSite) {
       // The latest newly reached decision gets one early turn, then the oldest task runs.
       let index = this.#queue.length - 1;
-      while (index >= 0 && this.#queue[index]!.queuedAs !== "first-alternative")
+      while (
+        index >= 0 &&
+        (!eligible(this.#queue[index]!) ||
+          this.#queue[index]!.queuedAs !== "first-alternative")
+      )
         index--;
       if (index >= 0) {
         this.#preferNewSite = false;
@@ -1184,7 +1465,7 @@ export class SimulationDriver {
       }
     }
     this.#preferNewSite = true;
-    return this.#queue.shift()!;
+    return this.#queue.splice(this.#queue.findIndex(eligible), 1)[0]!;
   }
 
   *#trialRow(
@@ -1278,7 +1559,11 @@ export class SimulationDriver {
             pending: undefined,
             rows: this.#trialRow(owner.domains, targets),
           };
-          const next = await this.#branch(trial, scenario);
+          const next = await this.#branch(
+            trial,
+            scenario,
+            this.#restore(trial),
+          );
           if (!next) continue;
           await this.#walk(next, scenario);
           if (scenario.leaf?.outcome.kind === "limit")
@@ -1311,16 +1596,14 @@ export class SimulationDriver {
     const arc = this.options.arcRef,
       position = { stage: "trigger" as const, index: 0, reactivationCount: 0 };
     const dialog = this.#dialog(this.#context());
-    const initial = this.#runtime.startTrigger([], dialog, { arcRefs: [arc] });
+    const initial = this.runtime.startTrigger([], dialog, { arcRefs: [arc] });
     let cursor: Cursor;
     try {
       cursor = this.#save(
-        initial,
+        captureState(arc, initial, { calls: [] }),
         dialog,
         { ...position, index: 1 },
-        { calls: [] },
         [recordTriggerStart(position, dialog, [arc])],
-        [],
       );
     } catch (error) {
       if (error instanceof BudgetReached)
@@ -1344,23 +1627,36 @@ export class SimulationDriver {
               reference: task.scenario,
             };
       try {
+        const cursor = this.#restore(task);
         // Discard already-covered work before attributing a path limit.
-        const selected = await this.#take(task);
+        const pending = task.pending;
+        const selected = await this.#take(task, cursor);
         if (!selected) continue;
         if (this.result.paths.length >= this.limits.maxPaths)
           throw new BudgetReached("maxPaths");
-        const next = this.#submit(task, scenario, selected);
-        await this.#enqueue(task);
+        // Coverage or admission can skip the ranked row. Schedule its replacement on its own merits.
+        if (
+          task.preferenceRank !== undefined &&
+          this.result.expectation?.status !== "witnessed" &&
+          selected.proposal !== pending
+        ) {
+          task.pending = selected.proposal;
+          task.pending.admitted = selected.records;
+          await this.#enqueue(task, cursor, task.queuedAs === "continuation");
+          continue;
+        }
+        const next = this.#submit(task, scenario, selected, cursor);
+        await this.#enqueue(task, cursor);
         await this.#walk(next, scenario);
       } catch (error) {
         if (!(error instanceof BudgetReached)) throw error;
         this.#stop = error.limit;
-        this.#gap(task.cursor.prefix, error.limit, task.remaining);
+        this.#gap(task.prefix, error.limit, task.remaining);
       }
     }
     if (this.#stop)
       for (const task of this.#queue)
-        this.#gap(task.cursor.prefix, this.#stop, task.remaining);
+        this.#gap(task.prefix, this.#stop, task.remaining);
     this.#queue.length = 0;
     this.#reviewReserve = 0;
     const reviews = [];

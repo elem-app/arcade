@@ -154,7 +154,7 @@ describe("service-to-provider context propagation", () => {
     // provider input. A trigger turn is a volatile correlation, so it is matched
     // by its captured invocation, not joined to the activated run by arcRunId.
     expect(triggerRun).toHaveBeenCalledTimes(1);
-    expect(triggerInput?.prompt).toContain(inboundFact);
+    expect(occurrences(triggerInput?.prompt ?? "", inboundFact)).toBe(1);
     expect(triggerInput?.prompt).toContain(triggerText);
     expect(triggerInput?.prompt).not.toContain(triggerGuidance);
     expect(triggerInput?.prompt).not.toContain(actionGuidance);
@@ -172,10 +172,14 @@ describe("service-to-provider context propagation", () => {
     expect(instructionRoutine.role).toBe("writer");
     const task = instructionRoutine.task as InstructionTask;
     expect(task.kind).toBe("instruction");
-    const dialogHasInbound = task.dialog.lastTurns.some(
-      (turn) => turn.role === "user" && turn.message.includes(inboundFact),
-    );
-    expect(dialogHasInbound).toBe(true);
+    expect(
+      task.dialog.lastTurns
+        .filter((turn) => turn.role === "user")
+        .map((turn) => turn.message),
+    ).toContain(submittedContent);
+    expect(
+      occurrences(JSON.stringify(task.dialog.lastTurns), inboundFact),
+    ).toBe(1);
     const structuredInstruction = JSON.stringify(task.texts);
     expect(structuredInstruction).toContain(actionText);
     expect(structuredInstruction).not.toContain(inboundFact);
@@ -187,7 +191,7 @@ describe("service-to-provider context propagation", () => {
     // path, and audience mapping, with no previous-response chaining.
     expect(instructionRun).toHaveBeenCalledTimes(1);
     const prompt = instructionInput?.prompt ?? "";
-    expect(prompt).toContain(inboundFact);
+    expect(occurrences(prompt, inboundFact)).toBe(1);
     expect(prompt).toContain(actionText);
     expect(prompt).toContain("<guidance>");
     expect(prompt).toContain(actionGuidance);

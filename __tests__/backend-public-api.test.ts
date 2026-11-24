@@ -2,22 +2,15 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import ts from "typescript";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
-import * as backendsApi from "../src/backends.js";
 import {
   createClaudeSdkBackend,
   createClaudeSdkTstBackend,
   createOpenAiSdkBackend,
   createOpenAiSdkTstBackend,
-  createSecretResolver,
-  type ClaudeSdkBackendOptions,
-  type ClaudeSdkTstBackendOptions,
-  type ContinuityIdentity,
-  type OpenAiSdkBackendOptions,
-  type OpenAiSdkTstBackendOptions,
-  type PiAgentBackendOptions,
 } from "../src/backends.js";
 import {
   AgentRoutineReportSchema,
@@ -39,68 +32,32 @@ import {
   WorkerSlotKindSchema,
   WorkerSlotSchema,
   type AgentRoutineReport,
-  type BackendName,
   type InstructionTask,
-  type RawWorkerSlot,
   type RoutineContext,
-  type RoutineInput,
   type SemanticTask,
   type WorkerHost,
   type WorkerSlot,
 } from "../src/index.js";
 
 describe("backend authoring public API", () => {
-  it("exports the backend-authoring surface from the package root", () => {
+  it("keeps stock backend implementations outside the package root dependency graph", () => {
+    const graph = sourceModuleGraph();
+    const reachable = new Set([resolve(SOURCE_ROOT, "index.ts")]);
+    for (const file of reachable) {
+      for (const dependency of graph.get(file) ?? []) reachable.add(dependency);
+    }
+    const stockFactories = graph
+      .get(resolve(SOURCE_ROOT, "backends.ts"))!
+      .filter((file) => file.endsWith("-backend.ts"));
+    expect(stockFactories.map(sourceRelativePath).sort()).toEqual([
+      "backends/claude-sdk-backend.ts",
+      "backends/claude-sdk-tst-backend.ts",
+      "backends/openai-sdk-backend.ts",
+      "backends/openai-sdk-tst-backend.ts",
+      "backends/pi-agent-backend.ts",
+    ]);
+    expect(stockFactories.filter((file) => reachable.has(file))).toEqual([]);
     expect(existsSync(resolve(SOURCE_ROOT, "backend.ts"))).toBe(false);
-    expect(
-      readFileSync(resolve(SOURCE_ROOT, "index.ts"), "utf8"),
-    ).not.toContain('"./backends/');
-  });
-
-  it("exports only the intended built-in backend runtime surface", () => {
-    expect(Object.keys(backendsApi).sort()).toEqual(
-      [
-        "createClaudeSdkBackend",
-        "createClaudeSdkTstBackend",
-        "createOpenAiSdkBackend",
-        "createOpenAiSdkTstBackend",
-        "createPiAgentBackend",
-        "createSecretResolver",
-      ].sort(),
-    );
-
-    const options = {
-      claude: {} satisfies ClaudeSdkBackendOptions,
-      claudeTst: {} satisfies ClaudeSdkTstBackendOptions,
-      openAi: {} satisfies OpenAiSdkBackendOptions,
-      openAiTst: {} satisfies OpenAiSdkTstBackendOptions,
-      piAgent: {} satisfies PiAgentBackendOptions,
-    };
-    const identity: ContinuityIdentity = {
-      schema: 1,
-      provider: "provider",
-      endpoint: "https://provider.example",
-      credentialScope: "deployment",
-    };
-
-    expect(options).toEqual({
-      claude: {},
-      claudeTst: {},
-      openAi: {},
-      openAiTst: {},
-      piAgent: {},
-    });
-    expect(identity.schema).toBe(1);
-    expect(createSecretResolver(undefined)).toBeUndefined();
-    const packageJson = JSON.parse(
-      readFileSync(resolve(SOURCE_ROOT, "../package.json"), "utf8"),
-    ) as {
-      exports: Record<string, { types: string; default: string }>;
-    };
-    expect(packageJson.exports["./backends"]).toEqual({
-      types: "./dist/backends.d.ts",
-      default: "./dist/backends.js",
-    });
   });
 
   it("does not retain an aggregate internal types barrel", () => {
@@ -131,66 +88,6 @@ describe("backend authoring public API", () => {
         .map(sourceRelativePath)
         .filter((path) => /^(types|service)\/simulat/.test(path)),
     ).toEqual([]);
-  });
-
-  it("exposes only hub-owned resume deliveries to custom backends", () => {
-    const contexts: RoutineContext[] = [
-      routineContext(),
-      { ...routineContext(), routineResume: { delivery: "fresh-start" } },
-      { ...routineContext(), routineResume: { delivery: "continue" } },
-    ];
-    const invalidContinuationText = {
-      ...routineContext(),
-      routineResume: {
-        delivery: "continue",
-        // @ts-expect-error Continuation carries no connector text.
-        message: "Continue",
-      },
-    } satisfies RoutineContext;
-    const invalidNative = {
-      ...routineContext(),
-      routineResume: {
-        // @ts-expect-error Native provider continuation is adapter-private.
-        delivery: "native",
-      },
-    } satisfies RoutineContext;
-    const invalidSessionMessage = {
-      ...routineContext(),
-      routineResume: {
-        // @ts-expect-error Claude live-session delivery is adapter-private.
-        delivery: "session-message",
-        message: "Continue",
-      },
-    } satisfies RoutineContext;
-
-    expect(contexts).toHaveLength(3);
-    void invalidNative;
-    void invalidSessionMessage;
-    void invalidContinuationText;
-  });
-
-  it("keeps stock transport injection seams on the testing surface", () => {
-    const claude = {
-      // @ts-expect-error SDK query injection is not a production factory option.
-      query: undefined,
-    } satisfies ClaudeSdkBackendOptions;
-    const claudeTst = {
-      // @ts-expect-error SDK query injection is not a production factory option.
-      query: undefined,
-    } satisfies ClaudeSdkTstBackendOptions;
-    const openAi = {
-      // @ts-expect-error SDK runner injection is not a production factory option.
-      run: undefined,
-    } satisfies OpenAiSdkBackendOptions;
-    const openAiTst = {
-      // @ts-expect-error SDK runner injection is not a production factory option.
-      run: undefined,
-    } satisfies OpenAiSdkTstBackendOptions;
-
-    void claude;
-    void claudeTst;
-    void openAi;
-    void openAiTst;
   });
 
   it("parses semantic backend output structurally without task-aware validation", async () => {
@@ -239,11 +136,6 @@ describe("backend authoring public API", () => {
     const task = instructionTask();
     task.guidance = ["Use primary sources."];
     const context = routineContext();
-    const input = undefined as unknown as RoutineInput;
-    const backendName: BackendName = "custom-agent";
-
-    expect(input).toBeUndefined();
-    expect(backendName).toBe("custom-agent");
     expect(buildInstructionSystemPrompt(task)).toContain("Role: researcher");
     expect(buildInstructionSystemPrompt(task)).toContain(
       "Apply the work item's standing guidance",
@@ -329,37 +221,6 @@ describe("backend authoring public API", () => {
     expect(() => createWorkerSlotSchema({ role: z.string() })).toThrow(
       'Worker slot schema field "role" is reserved by Arcade.',
     );
-  });
-
-  it("separates raw declarations from complete worker binding identities", () => {
-    const raw = {
-      backend: "custom-agent",
-      flavor: "sour",
-    } satisfies RawWorkerSlot;
-    const complete = {
-      ...raw,
-      kind: "default",
-    } satisfies WorkerSlot;
-
-    const rawWithKind: RawWorkerSlot = {
-      backend: "custom-agent",
-      // @ts-expect-error worker hub, not configuration, supplies binding identity.
-      kind: "default",
-    };
-    // @ts-expect-error Only role worker bindings carry a role field.
-    const defaultWithRole: WorkerSlot = {
-      backend: "custom-agent",
-      kind: "default",
-      role: "researcher",
-    };
-
-    expect(complete).toEqual({
-      backend: "custom-agent",
-      flavor: "sour",
-      kind: "default",
-    });
-    void rawWithKind;
-    void defaultWithRole;
   });
 
   it("exports shared Zod contracts for raw worker config and complete bindings", () => {
@@ -740,18 +601,16 @@ function sourceModuleGraph(): Map<string, string[]> {
   const graph = new Map<string, string[]>();
   for (const file of files) {
     const dependencies: string[] = [];
-    for (const match of readFileSync(file, "utf8").matchAll(
-      /\bfrom\s+["'](\.[^"']+)["']/g,
-    )) {
-      const specifier = match[1];
-      if (specifier === undefined) continue;
+    const imports = ts.preProcessFile(readFileSync(file, "utf8")).importedFiles;
+    for (const { fileName: specifier } of imports) {
+      if (!specifier.startsWith(".")) continue;
       const dependency = resolve(
         dirname(file),
         specifier.replace(/\.js$/, ".ts"),
       );
       if (fileSet.has(dependency)) dependencies.push(dependency);
     }
-    graph.set(file, dependencies);
+    graph.set(file, [...new Set(dependencies)]);
   }
 
   return graph;

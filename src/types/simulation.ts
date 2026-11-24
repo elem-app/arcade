@@ -18,9 +18,78 @@ import type {
   RuntimeIssue,
   SemanticText,
 } from "@elem-app/arc/types";
+import { z } from "zod";
 
 import type { ResolvedDocumentSnapshot } from "./host.js";
+import { JsonValueSchema } from "./json.js";
 import type { ReplayPosition, ReplayRecording } from "./replay.js";
+
+type SimulationLiteral =
+  | string
+  | number
+  | boolean
+  | readonly SimulationLiteral[]
+  | { readonly [key: string]: SimulationLiteral };
+
+// Check Arc's stricter carrier rules on the original, JSON-validated input.
+function hasSimulationCarriers(value: unknown): boolean {
+  if (value === null) return false;
+  if (typeof value !== "object") return true;
+  if (Array.isArray(value) && Object.getPrototypeOf(value) !== Array.prototype)
+    return false;
+  return Object.values(value).every(hasSimulationCarriers);
+}
+
+const literal = z.unknown().transform((input, ctx) => {
+  const parsed = JsonValueSchema.safeParse(input);
+  if (parsed.success && hasSimulationCarriers(input))
+    return parsed.data as SimulationLiteral;
+  ctx.addIssue({
+    code: "custom",
+    message: parsed.success
+      ? "Simulation values require ordinary arrays and cannot contain null."
+      : parsed.error.issues[0]!.message,
+  });
+  return z.NEVER;
+});
+const cell = z
+  .string()
+  .refine((name) => name.trim().length > 0, "A cell name is required.");
+
+/** First resolved observation answers an inspector wants the simulation to try. */
+export const SimulationPreferencesSchema = z
+  .array(z.strictObject({ cell, answer: literal }))
+  .refine(
+    (items) => new Set(items.map((item) => item.cell)).size === items.length,
+    "Specify a single preference per cell.",
+  );
+
+/** Predicate checked on the selected root when a path completes. */
+export const SimulationExpectationSchema = z.strictObject({
+  onCompletion: z.strictObject({ cell, equals: literal }),
+});
+
+/** One actual observation used as evidence for the inspected scenario. */
+export type SimulationWitnessAnswer = {
+  cell: string;
+  answer: ObservedValue;
+  position: ReplayPosition;
+};
+
+/** Availability of a preferred first answer in the candidate domains inspected during exploration. */
+export type SimulationPreferenceDiagnostic = {
+  cell: string;
+  answer: SimulationLiteral;
+  /** Available means a candidate existed, independently of acceptance or a completed witness. */
+  status: "not-reached" | "unavailable" | "available";
+  /** A representative eligible domain; absent when no eligible observation was inspected. */
+  evidence?: {
+    prefixId: SimulationPathId;
+    position: ReplayPosition;
+    site: SimulationSite;
+    truncated: boolean;
+  };
+};
 
 /** Definition capture and retention capacity for one simulator service. */
 export type SimulatorServiceOptions = {
@@ -44,6 +113,10 @@ export type SimulationOptions = {
   arcRef: ArcRef;
   /** Defaults to `"comparisons"`. Use `"exhaustive"` to try every allowed combination of generated answers within the limits. */
   exploration?: "comparisons" | "exhaustive";
+  /** Prefer eligible observations and pending variations consistent with these first answers. */
+  prefer?: readonly z.infer<typeof SimulationPreferencesSchema>[number][];
+  /** Check the selected root's cell on a covered path with the requested answers. */
+  expect?: z.infer<typeof SimulationExpectationSchema>;
   /** Supply a fixed Dialog or compute the next one from committed path history. */
   dialog: Dialog | ((context: SimulationContext) => Dialog);
   /** Extend or replace the generated examples for the current input. Return `undefined` to use the defaults. */
@@ -218,6 +291,22 @@ export type SimulationComparison = {
 /** Path summaries, comparisons, coverage and unexplored work for one completed simulation. */
 export type SimulationResult = {
   id: SimulationId;
+  /** One diagnostic per preference, even when no terminal expectation was supplied. */
+  preferenceDiagnostics: readonly SimulationPreferenceDiagnostic[];
+  /** Verdict for the inspector's requested scenario, when an expectation was supplied. */
+  expectation?: {
+    prefer: NonNullable<SimulationOptions["prefer"]>;
+    onCompletion: NonNullable<SimulationOptions["expect"]>["onCompletion"];
+  } & (
+    | { status: "not-witnessed"; preferencesReached: boolean }
+    | {
+        status: "witnessed";
+        pathId: SimulationPathId;
+        reports: number;
+        answers: readonly SimulationWitnessAnswer[];
+        actual: CellValue;
+      }
+  );
   paths: readonly SimulationPathSummary[];
   comparisons: readonly SimulationComparison[];
   coverage: SimulationCoverage;
@@ -251,7 +340,7 @@ export type SimulationResult = {
 
 /**
  * Per-run ceilings for exploration, candidate generation and retained evidence.
- * The recording budget includes checkpoint buffers. Materializing a path as JSONL can produce a larger trace.
+ * The recording budget includes the recorded steps and sparse checkpoints. Materializing a path as JSONL can produce a larger trace.
  */
 export type SimulationLimits = {
   maxPaths: number; // 1_000 finished paths.
@@ -261,5 +350,5 @@ export type SimulationLimits = {
   maxValuesPerInput: number; // 32 concrete values; unknown is additional.
   maxArrayLength: number; // 3.
   maxPendingPrefixes: number; // 2_048 retained frontiers and pending variations.
-  maxRecordBytes: number; // 64 * 1024 * 1024 serialized-data bytes.
+  maxRecordBytes: number; // 32 * 1024 * 1024 serialized-data bytes.
 };

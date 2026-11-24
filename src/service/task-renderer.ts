@@ -10,6 +10,7 @@
  */
 
 import type {
+  ArtifactObservationMeta,
   DialogTurn,
   ObservationMeta,
   ScalarObservationMeta,
@@ -71,11 +72,13 @@ export type RenderedObservationGroupFieldForPrompt = {
  * every struct field question rendered to text.
  */
 export type RenderedObservationMetaForPrompt =
+  | ArtifactObservationMeta
   | ScalarObservationMeta
   | UnionObservationMeta
   | {
       type: "array";
       element:
+        | ArtifactObservationMeta
         | ScalarObservationMeta
         | UnionObservationMeta
         | RenderedStructObservationMetaForPrompt;

@@ -2,7 +2,7 @@ import { getEventListeners } from "node:events";
 
 import { parse } from "@elem-app/arc/parser";
 import { toArcRef } from "@elem-app/arc/runtime";
-import { describe, expect, expectTypeOf, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ModuleExecution } from "../src/service/module-execution.js";
 
 import {
@@ -11,7 +11,6 @@ import {
   probeRetention,
   type AdvanceActionInput,
   type AdvanceTriggerInput,
-  type ArcHostService,
   type ArcHostStep,
   type Dialog,
 } from "../src/testing.js";
@@ -223,54 +222,6 @@ describe("Explicit trigger control", () => {
       spy.mockRestore();
       await host.stop();
     }
-  });
-
-  it("keeps the exact advancement and release type contract", () => {
-    expectTypeOf<Parameters<ArcHostService["advanceTrigger"]>>().toEqualTypeOf<
-      [string, AdvanceTriggerInput]
-    >();
-    expectTypeOf<Parameters<ArcHostService["advanceAction"]>>().toEqualTypeOf<
-      [string, string, AdvanceActionInput]
-    >();
-    expectTypeOf<ReturnType<ArcHostService["advanceTrigger"]>>().toEqualTypeOf<
-      Promise<ArcHostStep[]>
-    >();
-    expectTypeOf<ReturnType<ArcHostService["advanceAction"]>>().toEqualTypeOf<
-      Promise<ArcHostStep>
-    >();
-    expectTypeOf<Parameters<ArcHostService["releaseTrigger"]>>().toEqualTypeOf<
-      [string]
-    >();
-    expectTypeOf<Parameters<ArcHostService["releaseAction"]>>().toEqualTypeOf<
-      [string, string]
-    >();
-    expectTypeOf<ReturnType<ArcHostService["releaseTrigger"]>>().toEqualTypeOf<
-      Promise<void>
-    >();
-    expectTypeOf<ReturnType<ArcHostService["releaseAction"]>>().toEqualTypeOf<
-      Promise<void>
-    >();
-    const accepts = (_input: AdvanceTriggerInput) => {};
-    const skip = {
-      skip: { frontierId: "frontier" },
-      dialog,
-      projectDialog: request.projectDialog,
-    };
-    accepts(skip);
-    accepts({ reports: [], projectDialog: request.projectDialog });
-    // @ts-expect-error Skip cannot carry feedback.
-    accepts({ ...skip, reports: [] });
-    // @ts-expect-error Skip requires the exact current frontier identity.
-    accepts({ ...skip, skip: {} });
-    // @ts-expect-error Skip is an object, not a boolean flag.
-    accepts({ ...skip, skip: true });
-    // @ts-expect-error Abandonment is a separate release operation.
-    accepts({ ...skip, abandon: {} });
-    // @ts-expect-error Release is a separate operation.
-    accepts({ ...skip, release: {} });
-    const acceptsAction = (_input: AdvanceActionInput) => {};
-    // @ts-expect-error Skip requires a trigger step.
-    acceptsAction(skip);
   });
 
   it.each(["success", "failure"] as const)(

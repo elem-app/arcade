@@ -123,7 +123,7 @@ describe("SemanticTextRenderer", () => {
     const workspace = new SemanticTextRenderer();
 
     const rendered = workspace.render(
-      [{ kind: "artifact", path: "a/b/c.md" }],
+      [{ kind: "artifact", path: "a//b/c.md" }],
       {
         workspacePath,
         bundle: { "a/": outer, "a/b/": inner },
@@ -131,6 +131,98 @@ describe("SemanticTextRenderer", () => {
     );
 
     expect(rendered.artifactPaths).toEqual([join(inner, "c.md")]);
+  });
+
+  it("renders dot components under the workspace and longest matching bundle", () => {
+    const context = {
+      workspacePath: "/host/work",
+      workspaceBundle: { "assets/": "/outer", "assets/deep/": "/inner" },
+    };
+    for (const [path, host, sandbox] of [
+      [".", "/host/work", "/workspace"],
+      ["./.", "/host/work", "/workspace"],
+      ["./.config/./x", "/host/work/.config/x", "/workspace/.config/x"],
+      [
+        "./assets/./deep/input",
+        "/inner/input",
+        "/workspace/.arcade-bundles/assets/deep/input",
+      ],
+      ["assets/deep/.", "/inner/", "/workspace/.arcade-bundles/assets/deep/"],
+      ["reports/.", "/host/work/reports/", "/workspace/reports/"],
+    ] as const) {
+      const text = [{ kind: "artifact" as const, path }];
+      expect(
+        renderAgentSemanticText(text, context, { kind: "host" }).text,
+      ).toBe(host);
+      expect(
+        renderAgentSemanticText(text, context, {
+          kind: "sandbox",
+          sandboxRoot: "/workspace",
+        }).text,
+      ).toBe(sandbox);
+    }
+    expect(
+      renderAgentSemanticText(
+        [{ kind: "artifact", path: "./." }],
+        { workspacePath: "/", workspaceBundle: { "": "/catch-all" } },
+        { kind: "sandbox", sandboxRoot: "." },
+      ).text,
+    ).toBe(".");
+  });
+
+  it("selects the bundle before projecting a repeated-separator path for the worker", () => {
+    const context = {
+      workspacePath: "/host/work",
+      workspaceBundle: {
+        "assets/": "/outer",
+        "assets/deep/": "/inner",
+        manual: "/manual",
+      },
+    };
+    const text = [{ kind: "artifact" as const, path: "assets//deep/x" }];
+    expect(renderAgentSemanticText(text, context, { kind: "host" }).text).toBe(
+      "/inner/x",
+    );
+    expect(
+      renderAgentSemanticText(text, context, {
+        kind: "sandbox",
+        sandboxRoot: "/workspace",
+      }).text,
+    ).toBe("/workspace/.arcade-bundles/assets/deep/x");
+    const custom = renderAgentSemanticText(text, context, {
+      kind: "sandbox",
+      sandboxRoot: ".",
+      renderBundlePath(location, suffix) {
+        expect([location, suffix]).toEqual(["/inner", "x"]);
+        return "/client/x";
+      },
+    });
+    expect(custom.artifactPaths).toEqual(["/client/x"]);
+    for (const destination of ["/client/inner", "/client/inner/"]) {
+      const rendered = renderAgentSemanticText(
+        [{ kind: "artifact", path: "assets//deep/." }],
+        context,
+        {
+          kind: "sandbox",
+          sandboxRoot: ".",
+          renderBundlePath(location, suffix) {
+            expect([location, suffix]).toEqual(["/inner", ""]);
+            return destination;
+          },
+        },
+      );
+      expect(rendered.text).toBe("/client/inner/");
+    }
+    const hostPath = (path: string) =>
+      renderAgentSemanticText([{ kind: "artifact", path }], context, {
+        kind: "host",
+      }).text;
+    expect(hostPath("reports///q3.md")).toBe("/host/work/reports/q3.md");
+    expect(hostPath("manual//index")).toBe("/manual/index");
+    expect(hostPath("assets//deep/.")).toBe("/inner/");
+    expect(() => hostPath("assets//deep/")).toThrow();
+    expect(() => hostPath("assets//../x")).toThrow();
+    expect(() => hostPath("manual../x")).toThrow();
   });
 
   it("rejects unsafe artifact paths", async () => {

@@ -177,7 +177,6 @@ console.log(JSON.stringify(summary));
 
   it("registers unique case ids and disjoint smoke/extended plans", () => {
     const cases = listEvalCases();
-    expect(cases).toHaveLength(41);
     expect(new Set(cases.map((item) => item.id)).size).toBe(cases.length);
     for (const id of [
       "struct-trigger-observation",
@@ -196,21 +195,23 @@ console.log(JSON.stringify(summary));
       cases,
     );
     const all = planEvalExecutions(invocation(), cases);
-    expect(smoke.executions).toHaveLength(19);
-    expect(extended.executions).toHaveLength(58);
-    expect(all.executions).toHaveLength(77);
-    const smokeIds = new Set(
-      smoke.executions.map((execution) => execution.caseId),
-    );
-    expect(
-      extended.executions.some((execution) => smokeIds.has(execution.caseId)),
-    ).toBe(false);
-    expect(
-      new Set([
-        ...smoke.executions.map((execution) => execution.caseId),
-        ...extended.executions.map((execution) => execution.caseId),
-      ]),
-    ).toEqual(new Set(all.executions.map((execution) => execution.caseId)));
+    for (const [profile, plan] of [
+      ["smoke", smoke],
+      ["extended", extended],
+      [undefined, all],
+    ] as const) {
+      const selected = cases.filter(
+        (item) => profile === undefined || item.profile === profile,
+      );
+      const expected = selected.flatMap((item) =>
+        Object.keys(item.executions).map((target) => target + "/" + item.id),
+      );
+      expect(
+        plan.executions
+          .map((execution) => execution.target + "/" + execution.caseId)
+          .sort(),
+      ).toEqual(expected.sort());
+    }
     for (const target of invocation().targets) {
       expect(
         smoke.executions.some((execution) => execution.target === target),
@@ -229,23 +230,50 @@ console.log(JSON.stringify(summary));
       }),
       cases,
     );
-    expect(repeated.executions).toHaveLength(6);
-    expect(() =>
-      planEvalExecutions(
-        invocation({
-          profile: "smoke",
-          targets: ["openai-sdk"],
-          cases: ["claude-artifact-handoff"],
-        }),
-        cases,
+    expect(
+      repeated.executions.map(({ target, caseId, repetition }) => [
+        target,
+        caseId,
+        repetition,
+      ]),
+    ).toEqual(
+      ["claude-sdk", "openai-sdk"].flatMap((target) =>
+        [1, 2, 3].map((n) => [target, "user-request-fidelity", n]),
       ),
-    ).toThrow();
+    );
+    const limited = [fakeCase("one-target", "claude-sdk", async () => {})];
+    for (const [selection, reason] of [
+      [{ cases: ["not-registered"] }, /unknown eval case/i],
+      [{ cases: ["one-target"], profile: "smoke" }, /not part of profile/i],
+      [
+        { cases: ["one-target"], targets: ["openai-sdk"] },
+        /does not apply to targets/i,
+      ],
+      [{ targets: ["openai-sdk"] }, /zero executions/i],
+    ] as const) {
+      expect(() => planEvalExecutions(invocation(selection), limited)).toThrow(
+        reason,
+      );
+    }
+    const incompatible = fakeCase(
+      "needs-instructions",
+      "openai-sdk-tst",
+      async () => {},
+    );
+    incompatible.executions["openai-sdk-tst"] = {
+      ...incompatible.executions["openai-sdk-tst"]!,
+      requires: ["instruction-work"],
+    };
+    expect(() => planEvalExecutions(invocation(), [incompatible])).toThrow(
+      /unsupported capabilities: instruction-work/,
+    );
   });
 
   it("dry-run writes the exact manifest without preflighting a target", async () => {
     const output = await tempOutput();
     let preflighted = false;
-    const cases = [fakeCase("dry-run-case", "claude-sdk", async () => {})];
+    const execute = vi.fn(async () => {});
+    const cases = [fakeCase("dry-run-case", "claude-sdk", execute)];
     const invocationValue = invocation({ output, dryRun: true });
     const plan = planEvalExecutions(invocationValue, cases);
     const targets = fakeTargets({
@@ -259,11 +287,24 @@ console.log(JSON.stringify(summary));
       targets,
     });
     expect(preflighted).toBe(false);
+    expect(execute).not.toHaveBeenCalled();
     expect(summary.dryRun).toBe(true);
     expect(summary.results).toHaveLength(0);
     expect(
       JSON.parse(await readFile(summary.manifestPath, "utf8")),
-    ).toMatchObject({ dryRun: true, plan: [{ caseId: "dry-run-case" }] });
+    ).toMatchObject({
+      dryRun: true,
+      plan: [
+        {
+          caseId: "dry-run-case",
+          target: "claude-sdk",
+          repetition: 1,
+          timeoutMs: 1_000,
+        },
+      ],
+      targets: invocationValue.targets,
+      repetitions: 1,
+    });
     await access(summaryPath);
   });
 
